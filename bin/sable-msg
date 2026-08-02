@@ -4,9 +4,10 @@
 Scoped to the LEAD<->MANAGER conversation (Lincoln <-> Optimus/Tarzan), plus
 bead-addressed delivery to a specific WORKER pane (SABLE-6izz, via --bead).
 Workers are otherwise never messaged directly — they are spawned per-bead with
-their instructions and report via the bead pool. The message IS the turn: we
-type a single line into the recipient's claude prompt and submit it. No inbox,
-no injection hook.
+their instructions and report via the bead pool. A default message is a
+durable file-queue record plus a count-only wake; its original body bytes never
+enter the recipient's composer. Only the explicit ``--interrupt`` override
+turns a message body into a directly submitted pane turn.
 
 The recipient pane is found via the role->pane registry, which is just tmux's
 own per-pane user-option `@sable_role` (self-cleaning: dead panes vanish from
@@ -18,23 +19,22 @@ tagged @sable_role=worker — the default role-only lookup used for manager
 names never consults @sable_bead, so a manager send can never accidentally
 land on a worker pane even if some tag is stale.
 
-Delivery is VERIFIED, not assumed (SABLE-bq93): tmux accepting a paste only
-proves the bytes were injected, not that the recipient's TUI actually accepted
-them as a submitted turn — a booting pane or an Escape hitting a
-blocking gate can silently swallow them (the same boot / dropped-Enter race
-documented as SABLE-91m3 and guarded against in sable-spawn-worker). We reuse
-its idle-wait + submit-retry helpers (sable_pane_lib) here: --interrupt sends
-Escape ONCE then waits for the pane to go IDLE (empty composer prompt AND no
-turn still running) before typing — waiting only for the prompt to reappear
-raced the interrupted turn's redraw and dropped the message (SABLE-m6is);
-submission is retried until the framed message is visible in the pane and no
-longer sitting in the input box. Only then do we print `delivered`; on
-genuine immediate-delivery failure we atomically enqueue the payload in the
-host-global inbox.  A fresh host-drainer heartbeat makes that durable queue a
-successful delivery state.  Until a complete drain sweep is actually observed,
-the existing for-<role> fallback remains loud and the send remains non-zero —
-source landing alone never silently retires the backstop (SABLE-m4kyf.5/albyd).
-If the queue itself fails, the fallback remains loud as well.  Set
+DEFAULT DELIVERY implements the operator-locked wake/payload split (SABLE-1el7e):
+the original body bytes are atomically enqueued BEFORE any pane write, then the
+sender attempts the same short count-only wake the host timer uses. Arbitrary
+payload text is never pasted into a default recipient composer, so a failed
+send cannot poison the empty-composer precondition its queued twin needs.
+`--interrupt` is the sole explicit full-body injection override; that path
+retains the verified idle-wait + submit-retry transport for safety-critical
+sends. If the override is not verified, its payload joins the same durable
+queue.
+
+A verified immediate count-only wake is a successful queued delivery state.
+Otherwise a fresh host-drainer heartbeat makes the durable queue successful.
+Until a complete drain sweep is actually observed, the existing for-<role>
+fallback remains loud and the send remains non-zero — source landing alone
+never silently retires the backstop (SABLE-m4kyf.5/albyd). If the queue itself
+fails, the fallback remains loud as well. Set
 SABLE_MSG_AUTO_FALLBACK=0 to disable auto-filing; bead-addressed worker sends
 never auto-file because their dispatching manager sees the failure live.
 
@@ -79,15 +79,18 @@ Usage:
                     the owning LANE MANAGER's name for push-attribution
                     (SABLE-bldh.13), not the worker's own identity (SABLE-qqcd:
                     a worker's self-report must not be framed as its manager's
-                    directive). Elsewhere: $CLAUDE_AGENT_NAME, or "operator".
-    --interrupt     send Escape first so the message lands NOW instead of queueing
-                    behind the recipient's current turn
+                    directive). Elsewhere: $SABLE_AGENT_NAME, legacy
+                    $CLAUDE_AGENT_NAME, or "operator".
+    --interrupt     explicit full-body override: send Escape, wait for idle,
+                    then deliver the framed payload directly instead of the
+                    default queue + count-only wake
     --bead          resolve <to-role> as a bead id against a WORKER pane's
                     @sable_bead tag (SABLE-6izz) instead of a manager @sable_role
 
 Env:
   SABLE_TMUX_SOCKET      tmux socket name (-L); for session isolation / tests
-  CLAUDE_AGENT_NAME      default --from value (non-worker panes only; see above)
+  SABLE_AGENT_NAME       provider-neutral default --from value for managers
+  CLAUDE_AGENT_NAME      legacy fallback (non-worker panes only; see above)
   SABLE_WORKER_PANE      when set, forces the default --from to 'worker:<bead>'
                          (SABLE-qqcd), reusing the SABLE-38zi identity marker
   SABLE_BEAD             bead id for the worker default-from label; falls back
@@ -102,19 +105,23 @@ Env:
                             files, scoped by tmux socket+session (SABLE-xwy0b
                             test seam; default a temp dir)
 
-Sender-framing protocol: every message is prefixed with a fixed header line
+Direct-turn framing protocol: every ``--interrupt`` message (and every human-
+readable fallback record) is prefixed with a fixed header line
   ⟦SABLE-MSG⟧ from=<from> to=<to> :: <body> [composed=<UTC ISO-8601>]
-so the recipient is 100% sure who is speaking. Role files instruct: any turn
+so the recipient is 100% sure who is speaking. Default file-queue records keep
+sender and id as typed metadata and preserve the body verbatim, without
+re-parsing this framing. Role files instruct: any turn
 starting with ⟦SABLE-MSG⟧ from=<x> is from agent <x>; everything else is the
 operator. (Local disambiguator, not a security boundary.)
 
-Freshness (SABLE-xwy0b): verified delivery proves the bytes landed, not that
-they were still true when they landed — a retrying send can confirm AFTER a
+Direct-turn freshness (SABLE-xwy0b): verified ``--interrupt`` delivery proves
+the bytes landed, not that they were still true when they landed — a retrying
+send can confirm AFTER a
 later, superseding message from the same sender to the same recipient has
 already been acted on, silently downgrading whatever the newer message
 corrected. Two independent, additive defenses (never a substitute for the
 retry, which stays exactly as aggressive as before):
-  composed=<ts>   every delivered message carries its OWN composition instant
+  composed=<ts>   every directly delivered message carries its OWN composition instant
                   as a TRAILING bracket (see above), so even an unmodified
                   recipient can reason "this landed, but was composed 6
                   minutes ago" — legibility is the floor. It trails the body
@@ -151,7 +158,7 @@ from pathlib import Path
 # Shared pane-readiness/dispatch helpers (SABLE-bldh.14), same module
 # sable-spawn-worker uses. Resolve next to THIS script even via a PATH symlink.
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-from sable_inbox_lib import InboxError, drain_health, enqueue  # noqa: E402
+from sable_inbox_lib import DrainHealth, InboxError, drain_health, enqueue  # noqa: E402
 from sable_pane_lib import (  # noqa: E402
     SUBMIT_GAP_SECONDS, SessionCollision, deliver_text, pane_bead_tag, pane_busy,
     pane_idle, pane_process_identity, pane_provider_tag, pane_ready,
@@ -263,8 +270,8 @@ def resolve_from(socket: str | None = None, run=None) -> str:
     pane's own @sable_bead tag (its $TMUX_PANE, the tag sable-spawn-worker's
     worker_pane_tags stamps on every worker pane).
 
-    Non-worker panes (managers, the operator) are unaffected: they keep
-    $CLAUDE_AGENT_NAME, or "operator" if unset."""
+    Non-worker panes (managers, the operator) use provider-neutral
+    $SABLE_AGENT_NAME, then legacy $CLAUDE_AGENT_NAME, or "operator"."""
     if os.environ.get("SABLE_WORKER_PANE"):
         bead = os.environ.get("SABLE_BEAD") or pane_bead_tag(
             tmux_base(socket), os.environ.get("TMUX_PANE", ""), run=run)
@@ -397,15 +404,15 @@ def deliver_message(pane: str, message: str, interrupt: bool, socket: str | None
                     interval: float = DEFAULT_POLL_INTERVAL) -> bool:
     """Deliver `message` to `pane`, VERIFIED (SABLE-bq93). --interrupt sends
     Escape ONCE then waits for the pane to go IDLE — an empty composer prompt
-    AND no turn still running (wait_for_idle) — before reusing the default-mode
+    AND no turn still running (wait_for_idle) — before entering the shared
     delivery path (deliver_text). Waiting only for pane_ready was the SABLE-m6is
     bug: a busy pane shows the empty composer prompt too, so the interrupt path
     typed WHILE the interrupted turn was still redrawing / clearing the composer
     (spinner redraw, in-flight tool output), and the message was swallowed — two
     consecutive live sends failed all 8 submit attempts. Deferring injection
     until the turn actually settles matches the manual workaround that always
-    landed first try (send Escape, let the pane fall idle, then a default-mode
-    send). Submission is then retried (deliver_text) until `snippet` is visible
+    landed first try (send Escape, let the pane fall idle, then deliver the
+    explicit override). Submission is then retried (deliver_text) until `snippet` is visible
     in the pane and no longer sitting in the input box. The Escape is sent once
     and the submit-retry counter is unchanged. Returns False (never raises) on
     genuine non-delivery.
@@ -648,15 +655,17 @@ def fallback_bead_title(to_role: str, message: str) -> str:
 
     Extracted so callers that need to RECOGNISE such a bead derive the title
     the same way we compose it, instead of hand-typing the format (SABLE-3mrv3).
-    Note what `message` is at every real call site: the FRAMED message from
-    format_message ('⟦SABLE-MSG⟧ from=<frm> to=<to> :: <body> [composed=<ts>]'),
-    never the raw body — so the framing sits BEFORE the body, and a title
-    guessed as '<prefix> <role>: <body>' matches nothing. That mistake made a
-    live-DB-pollution assertion silently unfalsifiable; hence this seam. The
-    composed= bracket trails the body (SABLE-xwy0b), so this 80-char cutoff
-    still shows the same amount of real body content it always has — the
-    bracket is what gets truncated away first for a long body, not the body
-    itself."""
+    Note what `message` is at every real call site: a HUMAN-READABLE framed
+    representation ('⟦SABLE-MSG⟧ from=<frm> to=<to> :: <body>
+    [composed=<ts>]'), never the raw queue body. The default path derives it
+    from message_identity plus the timestamp without parsing the queued record;
+    an undelivered --interrupt path reuses format_message's value. The framing
+    therefore sits BEFORE the body, and a title guessed as '<prefix> <role>:
+    <body>' matches nothing. That mistake made a live-DB-pollution assertion
+    silently unfalsifiable; hence this seam. The composed= bracket trails the
+    body (SABLE-xwy0b), so this 80-char cutoff still shows the same amount of
+    real body content it always has — the bracket is what gets truncated away
+    first for a long body, not the body itself."""
     return f"{FALLBACK_TITLE_PREFIX} {to_role}: {message[:80]}"
 
 
@@ -667,8 +676,9 @@ def fallback_bead_labels(to_role: str) -> str:
 
 
 def file_fallback_bead(frm: str, to_role: str, message: str, runner=None) -> str | None:
-    """File the durable for-<role> inbox bead when live delivery could not be
-    verified (SABLE-1umr). Returns the new bead id, or None when bd is
+    """File the durable for-<role> bead while automatic draining is unproven.
+
+    Returns the new bead id, or None when bd is
     unavailable/errored (the caller then prints the manual hint instead).
     Runs in the sender's cwd, which for manager/lead panes is the repo whose
     beads db owns the coordination inbox.
@@ -684,7 +694,8 @@ def file_fallback_bead(frm: str, to_role: str, message: str, runner=None) -> str
     carries that responsibility without manufacturing tracker work."""
     runner = runner or (lambda args: subprocess.run(args, capture_output=True, text=True))
     title = fallback_bead_title(to_role, message)
-    desc = (f"Auto-filed by sable-msg after verified-delivery failure (SABLE-1umr). "
+    desc = (f"Auto-filed by sable-msg while automatic queue draining was not "
+            f"verified (SABLE-1umr). "
             f"Deliver this message to {to_role} and act on it: {message} "
             f"[no-test] coordination inbox bead, no code change.")
     try:
@@ -721,6 +732,164 @@ def _loud_fallback_suffix(
         "Fallback remains required: bd create --title=\"<summary>\" "
         f"--label=for-{to_role} --type=task"
     )
+
+
+def attempt_inbox_wake(
+    recipient: str,
+    pane: str,
+    session: str,
+    socket: str | None = None,
+    runner=None,
+) -> tuple[bool, str]:
+    """Attempt one immediate count-only wake after a payload is durable.
+
+    The host timer and this sender-side fast path execute the same sibling
+    watcher.  The watcher owns every safety decision (recipient binding,
+    process liveness, provider-aware idle posture, and verified submission),
+    so ``sable-msg`` never grows a second interpretation of pane state.  Any
+    non-zero result or inability to launch is a safe deferral, not evidence
+    that the queued payload was lost.
+    """
+
+    watcher = str(
+        Path(os.path.realpath(__file__)).with_name("sable-inbox-watcher")
+    )
+    provider = pane_provider_tag(tmux_base(socket), pane)
+    command = [
+        watcher,
+        recipient,
+        pane,
+        provider,
+        "--session",
+        session,
+    ]
+    environment = dict(os.environ)
+    if socket:
+        environment["SABLE_TMUX_SOCKET"] = socket
+    else:
+        environment.pop("SABLE_TMUX_SOCKET", None)
+    run = runner or subprocess.run
+    try:
+        result = run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            env=environment,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"count-only wake could not run: {exc}"
+    detail = " ".join(
+        part.strip()
+        for part in (
+            getattr(result, "stdout", "") or "",
+            getattr(result, "stderr", "") or "",
+        )
+        if part.strip()
+    )
+    if result.returncode == 0:
+        return True, detail or "count-only wake completed"
+    return False, detail or f"count-only wake exited {result.returncode}"
+
+
+def queue_payload(
+    *,
+    recipient: str,
+    sender: str,
+    body: str,
+    pane: str,
+    session: str,
+    socket: str | None,
+    fallback_message: str,
+    bead_addressed: bool,
+    attempt_wake: bool,
+    failed_direct_delivery: bool,
+) -> int:
+    """Publish one payload, then prove either a wake or a live drainer.
+
+    Publication always precedes the optional wake.  This ordering is the
+    load-bearing SABLE-1el7e property: the only text a default send can park in
+    a composer is the fixed, machine-recognisable wake, never the arbitrary
+    body whose queue it would otherwise block.
+    """
+
+    try:
+        message_id = enqueue(recipient, sender, body)
+    except (InboxError, OSError, ValueError, TypeError) as exc:
+        fallback = _loud_fallback_suffix(
+            sender,
+            recipient,
+            fallback_message,
+            bead_addressed=bead_addressed,
+        )
+        prior = (
+            "direct --interrupt delivery was not verified, and "
+            if failed_direct_delivery
+            else "the payload was not queued before any pane write, and "
+        )
+        sys.stderr.write(
+            f"sable-msg: QUEUE-FAILED {sender} -> {recipient} ({pane}); {prior}"
+            f"the message could not be queued: {exc}. NOTHING WAS DELIVERED OR "
+            f"QUEUED. {fallback}\n"
+        )
+        return 1
+
+    wake_reason = "immediate count-only wake was not attempted"
+    if attempt_wake:
+        try:
+            woke, wake_reason = attempt_inbox_wake(
+                recipient,
+                pane,
+                session,
+                socket=socket,
+            )
+        except (OSError, ValueError, TypeError) as exc:
+            woke = False
+            wake_reason = f"count-only wake assessment failed: {exc}"
+        if woke:
+            sys.stderr.write(
+                f"sable-msg: queued {sender} -> {recipient} ({pane}); inbox message "
+                f"{message_id} is durable and the immediate count-only wake was "
+                f"verified ({wake_reason}).\n"
+            )
+            return 0
+
+    direct_detail = (
+        "direct --interrupt path was undelivered; "
+        if failed_direct_delivery
+        else ""
+    )
+
+    try:
+        health = drain_health()
+    except (InboxError, OSError, ValueError, TypeError) as exc:
+        health = DrainHealth(
+            fresh=False,
+            reason=f"heartbeat assessment failed: {exc}",
+        )
+    if health.fresh:
+        sys.stderr.write(
+            f"sable-msg: queued {sender} -> {recipient} ({pane}); {direct_detail}"
+            f"inbox message "
+            f"{message_id} is durable and the drainer heartbeat is fresh "
+            f"(immediate wake: {wake_reason}).\n"
+        )
+        return 0
+
+    fallback = _loud_fallback_suffix(
+        sender,
+        recipient,
+        fallback_message,
+        bead_addressed=bead_addressed,
+    )
+    sys.stderr.write(
+        f"sable-msg: QUEUED-BUT-DRAINER-UNVERIFIED {sender} -> {recipient} "
+        f"({pane}); {direct_detail}inbox message {message_id} is durable, but automatic "
+        f"draining is not currently proven ({health.reason}; immediate wake: "
+        f"{wake_reason}). {fallback}\n"
+    )
+    return 1
 
 
 # --------------------------------------------------------------------------
@@ -817,9 +986,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--from", dest="frm", default=None,
                    help="sender label for the framing header (default: "
                         "'worker:<bead>' on a worker pane, else "
-                        "$CLAUDE_AGENT_NAME or \"operator\"; see resolve_from)")
-    p.add_argument("--interrupt", action="store_true",
-                   help="send Escape first so the message lands immediately")
+                        "$SABLE_AGENT_NAME, legacy $CLAUDE_AGENT_NAME, or "
+                        "\"operator\"; see resolve_from)")
+    p.add_argument(
+        "--interrupt",
+        action="store_true",
+        help="explicit full-body override: send Escape, wait for idle, and "
+             "submit directly instead of queueing",
+    )
     p.add_argument("--bead", action="store_true",
                    help="resolve <to_role> as a bead id against a WORKER pane's "
                         "@sable_bead tag instead of a manager @sable_role "
@@ -950,8 +1124,38 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 1
 
-    composed_at = _now()
     body = resolve_body(ns)
+    composed_at = _now()
+    identity = message_identity(ns.frm, ns.to_role, body)
+    fallback_message = (
+        f"{identity} [composed={compose_timestamp(composed_at)}]"
+    )
+
+    if not ns.interrupt:
+        # A durable queue record has no retry loop of its own, but it is still
+        # a newer composition. Register it before publication so an older
+        # --interrupt invocation for this exact sender/recipient pair cannot
+        # finish retrying afterward and silently land stale instructions.
+        register_composition(
+            ns.frm,
+            ns.to_role,
+            composed_at,
+            socket=socket,
+            session=session,
+        )
+        return queue_payload(
+            recipient=ns.to_role,
+            sender=ns.frm,
+            body=body,
+            pane=pane,
+            session=session,
+            socket=socket,
+            fallback_message=fallback_message,
+            bead_addressed=ns.bead,
+            attempt_wake=True,
+            failed_direct_delivery=False,
+        )
+
     try:
         message = format_message(ns.frm, ns.to_role, body, composed_at)
     except UnsafeMultilineMessage as exc:
@@ -960,13 +1164,12 @@ def main(argv: list[str] | None = None) -> int:
     # The matching snippet deliberately excludes composed= (SABLE-xwy0b): see
     # message_identity / deliver_message for why an identical-body resend
     # must still canonically match despite carrying a different timestamp.
-    identity = message_identity(ns.frm, ns.to_role, body)
     ready_timeout = float(os.environ.get("SABLE_MSG_READY_TIMEOUT", DEFAULT_READY_TIMEOUT))
     submit_tries = int(os.environ.get("SABLE_MSG_SUBMIT_TRIES", DEFAULT_SUBMIT_TRIES))
     poll_interval = float(os.environ.get("SABLE_MSG_POLL_INTERVAL", DEFAULT_POLL_INTERVAL))
     expiry_seconds = float(os.environ.get("SABLE_MSG_EXPIRY_SECONDS", DEFAULT_EXPIRY_SECONDS))
     outcome = deliver_with_freshness(
-        pane, message, ns.interrupt, ns.frm, ns.to_role, composed_at, expiry_seconds,
+        pane, message, True, ns.frm, ns.to_role, composed_at, expiry_seconds,
         snippet=identity, socket=socket, session=session, ready_timeout=ready_timeout,
         tries=submit_tries, interval=poll_interval)
 
@@ -986,52 +1189,18 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 6
     if outcome == UNDELIVERED:
-        try:
-            message_id = enqueue(ns.to_role, ns.frm, message)
-        except (InboxError, OSError, ValueError, TypeError) as exc:
-            fallback = _loud_fallback_suffix(
-                ns.frm,
-                ns.to_role,
-                message,
-                bead_addressed=ns.bead,
-            )
-            sys.stderr.write(
-                f"sable-msg: QUEUE-FAILED {ns.frm} -> {ns.to_role} ({pane}); immediate "
-                f"delivery was not verified after {submit_tries} attempt(s), and the "
-                f"message could not be queued: {exc}. NOTHING WAS DELIVERED OR QUEUED. "
-                f"{fallback}\n"
-            )
-            return 1
-
-        try:
-            health = drain_health()
-        except (InboxError, OSError, ValueError, TypeError) as exc:
-            health = type(
-                "UnavailableDrainHealth",
-                (),
-                {"fresh": False, "reason": f"heartbeat assessment failed: {exc}"},
-            )()
-        if health.fresh:
-            sys.stderr.write(
-                f"sable-msg: queued {ns.frm} -> {ns.to_role} ({pane}); immediate delivery "
-                f"was not verified after {submit_tries} attempt(s), but inbox message "
-                f"{message_id} is durable and the drainer heartbeat is fresh.\n"
-            )
-            return 0
-
-        fallback = _loud_fallback_suffix(
-            ns.frm,
-            ns.to_role,
-            message,
+        return queue_payload(
+            recipient=ns.to_role,
+            sender=ns.frm,
+            body=body,
+            pane=pane,
+            session=session,
+            socket=socket,
+            fallback_message=message,
             bead_addressed=ns.bead,
+            attempt_wake=False,
+            failed_direct_delivery=True,
         )
-        sys.stderr.write(
-            f"sable-msg: QUEUED-BUT-DRAINER-UNVERIFIED {ns.frm} -> {ns.to_role} "
-            f"({pane}); the immediate path was undelivered and inbox message "
-            f"{message_id} is durable, but automatic draining "
-            f"is not currently proven ({health.reason}). {fallback}\n"
-        )
-        return 1
 
     sys.stderr.write(f"sable-msg: delivered {ns.frm} -> {ns.to_role} ({pane})\n")
     return 0

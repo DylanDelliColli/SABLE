@@ -2,9 +2,10 @@
 """Integration tests for bin/sable-msg against a REAL tmux server.
 
 Uses an isolated tmux socket (-L) so it never touches the operator's session.
-Proves end-to-end: the role->pane registry (@sable_role user-option) resolves,
-the message is delivered as a real keystroke turn, and a message sent while the
-target pane is BUSY is queued and runs when free (the verified spike behavior).
+Default sends prove queue-first publication and zero arbitrary-body pane writes
+across idle, busy, queued-footer, and stuck-composer postures. Explicit
+``--interrupt`` cases retain real-keystroke authority for the sole direct-body
+override, including role/bead/session routing and verified submission.
 """
 import json
 import os
@@ -18,6 +19,7 @@ from pathlib import Path
 
 import pytest
 
+import sable_inbox_lib as inbox_lib
 import sable_pane_lib as pane_lib
 
 BIN = Path(__file__).resolve().parent / "sable-msg"
@@ -84,6 +86,21 @@ def _capture(sock, target):
     return _tmux(sock, "capture-pane", "-t", target, "-p").stdout
 
 
+def _prepare_bash_interrupt(sock, target):
+    """Make a bash stand-in model the TUI's non-destructive bare Escape."""
+
+    marker = f"SABLE-ESCAPE-READY-{uuid.uuid4().hex[:8]}"
+    command = (
+        '''bind '"\\e": redraw-current-line'; '''
+        f'''bind 'set keyseq-timeout 1'; echo {marker}'''
+    )
+    _tmux(sock, "send-keys", "-t", target, command, "Enter")
+    _require_until(
+        lambda: marker in _capture(sock, target),
+        description=f"bash interrupt binding in {target}",
+    )
+
+
 def _read_recording(path):
     """Defensive read for REC_FILE/ARRIVALS_FILE fixtures. Some stand-ins
     (_BUSY_TUI, _STUCK_BOX_TUI) read the pty a character at a time, which can
@@ -100,6 +117,7 @@ def _start_pane(sock):
     _tmux(sock, "new-session", "-d", "-s", "w", "-x", "200", "-y", "50",
           "PS1='> ' bash --noprofile --norc")
     _tmux(sock, "set-option", "-p", "-t", "w", "@sable_role", "optimus")
+    _prepare_bash_interrupt(sock, "w")
     return "w"
 
 
@@ -128,6 +146,14 @@ def _env():
     # of hermetically testing what each fixture sets up.
     env.pop("SABLE_WORKER_PANE", None)
     env.pop("SABLE_BEAD", None)
+    # No integration failure may manufacture coordination work in the live
+    # tracker. Tests that exercise the fallback do so in an explicit scratch
+    # BEADS_DB in the shell suite.
+    env["SABLE_MSG_AUTO_FALLBACK"] = "0"
+    # Ordinary routing/identity fixtures use already-idle deterministic
+    # stand-ins. The dedicated busy-interrupt cases override this with a real
+    # wait budget; skipping it here avoids paying 25 seconds per direct test.
+    env["SABLE_MSG_READY_TIMEOUT"] = "0"
     return env
 
 
@@ -265,7 +291,7 @@ def test_read_recording_survives_non_utf8_delimiter_bytes(tmp_path):
 def test_message_delivered_to_registered_pane(tmux_socket):
     _start_pane(tmux_socket)
     r = _run_msg(tmux_socket, "optimus",
-                 "echo SABLE-MSG-DELIVERED", "--from", "lincoln")
+                 "echo SABLE-MSG-DELIVERED", "--from", "lincoln", "--interrupt")
     assert r.returncode == 0, r.stderr
     _require_until(
         lambda: "SABLE-MSG-DELIVERED" in _capture(tmux_socket, "w"),
@@ -330,8 +356,11 @@ def test_wrapped_message_in_narrow_pane_is_actually_submitted(tmux_socket):
     _tmux(tmux_socket, "new-session", "-d", "-s", "w", "-x", "60", "-y", "20",
           "PS1='> ' bash --noprofile --norc")
     _tmux(tmux_socket, "set-option", "-p", "-t", "w", "@sable_role", "optimus")
+    _prepare_bash_interrupt(tmux_socket, "w")
     body = "; echo WRAP-$((40+2))-VERIFIED end of a long directive body padding"
-    r = _run_msg(tmux_socket, "optimus", body, "--from", "lincoln")
+    r = _run_msg(
+        tmux_socket, "optimus", body, "--from", "lincoln", "--interrupt"
+    )
     assert r.returncode == 0, r.stderr
     _require_until(
         lambda: "WRAP-42-VERIFIED" in _capture(tmux_socket, "w"),
@@ -385,18 +414,10 @@ def test_idle_pane_receives_interrupt_first_attempt(tmux_socket, tmp_path):
     assert "INTERRUPT-LANDED" in pane                        # and executed (turn submitted)
 
 
-def test_default_send_to_busy_pane_reports_undelivered(tmux_socket):
-    # SABLE-d21h (was test_message_queues_while_target_busy): a DEFAULT-mode send
-    # to a pane that is BUSY at t0 must report UNDELIVERED, not a phantom
-    # 'delivered'. In the real Claude TUI a queued line is hoisted above the
-    # composer with the box cleared, so the old visible-vs-submitted check
-    # false-positived for a message merely QUEUED behind the running turn (which
-    # is droppable on the turn's compaction/redraw/reap). The pre-send idle guard
-    # fails closed so sable-msg routes to the durable fallback. (Here the pane is
-    # busy mid-`sleep`, showing no prompt line -> not idle at t0.)
-    #
-    # AUTO_FALLBACK=0 keeps a failed send from filing a real inbox bead into the
-    # operator's bd db; the manual-hint 'undelivered' line is asserted instead.
+def test_default_send_to_busy_pane_queues_without_typing_body(tmux_socket):
+    # SABLE-1el7e: the default path publishes the original body before a wake
+    # attempt and never lets arbitrary text enter a busy composer. With no live
+    # drainer heartbeat this remains loud/nonzero, but the payload is durable.
     _start_pane(tmux_socket)
     _tmux(tmux_socket, "send-keys", "-t", "w",
           "echo BUSY-START; sleep 3; echo BUSY-END", "Enter")
@@ -411,11 +432,15 @@ def test_default_send_to_busy_pane_reports_undelivered(tmux_socket):
              "SABLE_MSG_AUTO_FALLBACK": "0", "SABLE_MSG_SUBMIT_TRIES": "2",
              "SABLE_MSG_POLL_INTERVAL": "0.2"},
     )
-    assert r.returncode != 0, "busy-at-t0 default send must not report delivered"
-    assert "undelivered" in r.stderr
+    assert r.returncode != 0
+    assert "QUEUED-BUT-DRAINER-UNVERIFIED" in r.stderr
+    assert [message.body for message in inbox_lib.read("optimus")] == [
+        "echo QUEUED-RAN"
+    ]
+    assert "echo QUEUED-RAN" not in _capture(tmux_socket, "w")
 
 
-# --- mid-turn busy pane: interrupt lands, default-mode queues (SABLE-m6is) ---
+# --- mid-turn busy pane: interrupt lands, default queues without typing -----
 # The live failure: --interrupt into a manager pane actively mid-turn (xhigh
 # thinking, tools running) dropped the message on all 8 submit attempts, because
 # the pane STILL shows the empty composer prompt during a turn — pane_ready fired
@@ -426,11 +451,10 @@ def test_default_send_to_busy_pane_reports_undelivered(tmux_socket):
 # prompt line (so pane_ready is True — the early-fire trap) AND an
 # "esc to interrupt" status line (so pane_busy is True, pane_idle False). A bare
 # Escape INTERRUPTS (records INTERRUPTED, settles to an idle REPL); without one,
-# the turn ends on its own after BUSY_SECS (records NATURAL) so a default-mode
-# send that merely QUEUES still eventually lands. Non-Escape input is held and
-# replayed as one submitted turn once the turn ends — the queue behavior a
-# default-mode send relies on. Stray resent Enters (deliver_text's dropped-Enter
-# retries) are ignored. Every submitted turn is appended to REC_FILE.
+# the turn ends on its own after BUSY_SECS (records NATURAL). Non-Escape input
+# is held and replayed as one submitted turn once the turn ends. Default sends
+# must never exercise that input path; the explicit --interrupt control does.
+# Every submitted turn is appended to REC_FILE.
 _BUSY_TUI = r'''#!/usr/bin/env bash
 queued=""
 busy=1
@@ -565,17 +589,11 @@ def _start_busy_pane_markers(sock, tmp_path):
     return rec, end, busy_ready, go_idle
 
 
-def test_default_send_to_busy_turn_does_not_interrupt_and_reports_undelivered(tmux_socket, tmp_path):
-    # The companion guard: on the SAME kind of busy pane, a DEFAULT-mode send
-    # (no --interrupt) must NOT interrupt the turn — the idle-wait + Escape logic
-    # is confined to the --interrupt leg (SABLE-m6is). end.txt == NATURAL proves
-    # the turn ran to its own end. SABLE-d21h: because the pane is BUSY at t0, the
-    # send is not verified-landed, so sable-msg reports undelivered (routes to the
-    # durable fallback) even though the stand-in still physically queues the line.
-    #
-    # SABLE-um6i: BUSY_READY/GO_IDLE markers (not a wall-clock busy_secs window
-    # + fixed sleep) make both the busy phase and the busy->idle transition
-    # deterministic under host load — see _BUSY_MARKER_TUI above.
+def test_default_send_to_busy_turn_does_not_interrupt_or_type_payload(
+    tmux_socket, tmp_path,
+):
+    # The marker-driven companion proves the absence against real tmux: no
+    # Escape, no payload bytes, and the original turn reaches its natural end.
     rec, end, busy_ready, go_idle = _start_busy_pane_markers(tmux_socket, tmp_path)
     assert _wait_until(busy_ready.exists, timeout=10), \
         "stand-in never signalled busy-entry"
@@ -586,40 +604,49 @@ def test_default_send_to_busy_turn_does_not_interrupt_and_reports_undelivered(tm
              "SABLE_MSG_SUBMIT_TRIES": "2", "SABLE_MSG_AUTO_FALLBACK": "0",
              "SABLE_MSG_POLL_INTERVAL": "0.2"},
     )
-    assert r.returncode != 0                          # busy at t0 -> not verified-landed
-    assert "undelivered" in r.stderr
-    go_idle.touch()  # release the busy turn now that undelivered is confirmed
+    assert r.returncode != 0
+    assert "QUEUED-BUT-DRAINER-UNVERIFIED" in r.stderr
+    assert not rec.exists(), "default send must not type into the busy pane"
+    assert [message.body for message in inbox_lib.read("optimus")] == [
+        "queued directive"
+    ]
+    go_idle.touch()
     assert _wait_until(lambda: end.exists() and end.read_text().strip() == "NATURAL",
                        timeout=10), \
         "busy turn never reached its (test-controlled) natural end"
-    assert _wait_until(lambda: rec.exists() and "queued directive" in _read_recording(rec),
-                       timeout=10), \
-        "line must still have been physically queued and run"
+    assert not rec.exists(), "queued payload must stay out of the pane after it idles"
 
 
-def test_default_send_to_busy_pane_that_frees_reports_delivered_h0jw(tmux_socket, tmp_path):
-    # SABLE-h0jw: the delayed-confirmation happy path, end-to-end against a REAL
-    # tmux server + real sable-msg subprocess. The pane is BUSY at t0 (mid-turn,
-    # 'esc to interrupt'); our line queues behind that turn. The turn ends WITHIN
-    # the poll budget (busy_secs=1, budget ~=SUBMIT_TRIES*POLL_INTERVAL) and the
-    # queued line submits as its own turn (recorded to REC_FILE). sable-msg must
-    # then report DELIVERED — NOT the d21h fail-close-at-t0 that would have filed a
-    # redundant noise bead for a message that actually landed. AUTO_FALLBACK=0 so a
-    # (pre-fix) failure can't write a real inbox bead; a generous budget clears the
-    # 1s turn. end.txt == NATURAL proves the turn was never interrupted.
-    rec, end = _start_busy_pane(tmux_socket, tmp_path, busy_secs=1)
+def test_fresh_drainer_makes_busy_default_queue_a_success_without_body_injection(
+    tmux_socket, tmp_path,
+):
+    # Heartbeat semantics stay unchanged under queue-first: a complete recent
+    # host sweep is sufficient evidence for rc0 even when this immediate wake
+    # defers. It is never permission to type the payload into the pane.
+    rec, end, busy_ready, go_idle = _start_busy_pane_markers(
+        tmux_socket, tmp_path
+    )
+    assert _wait_until(busy_ready.exists, timeout=10)
+    inbox_lib.record_drain_heartbeat(interval_seconds=60)
     r = subprocess.run(
         ["python3", str(BIN), "optimus", "cap in force", "--from", "lincoln"],
         capture_output=True, text=True,
         env={**_env(), "SABLE_TMUX_SOCKET": tmux_socket, "SABLE_TMUX_SESSION": "w",
-             "SABLE_MSG_AUTO_FALLBACK": "0", "SABLE_MSG_SUBMIT_TRIES": "20",
-             "SABLE_MSG_POLL_INTERVAL": "0.25"},
+             "SABLE_MSG_AUTO_FALLBACK": "0"},
     )
-    assert "cap in force" in _read_recording(rec), \
-        "precondition: the queued line must have really submitted as a turn"
-    assert r.returncode == 0, r.stderr                 # delayed confirmation -> delivered
-    assert "delivered" in r.stderr
-    assert end.read_text().strip() == "NATURAL"        # default mode never interrupted it
+    assert r.returncode == 0, r.stderr
+    assert "queued" in r.stderr
+    assert "drainer heartbeat is fresh" in r.stderr
+    assert not rec.exists()
+    assert [message.body for message in inbox_lib.read("optimus")] == [
+        "cap in force"
+    ]
+    go_idle.touch()
+    assert _wait_until(
+        lambda: end.exists() and end.read_text().strip() == "NATURAL",
+        timeout=10,
+    )
+    assert not rec.exists()
 
 
 # --- queued-composer footer + idempotent retry (SABLE-msxj) -----------------
@@ -719,21 +746,11 @@ def _start_queued_footer_pane(sock, tmp_path):
     return rec, end, arrivals, busy_ready, go_idle
 
 
-def test_default_send_to_busy_pane_with_queued_footer_confirms_delivered_msxj(tmux_socket, tmp_path):
-    # SABLE-msxj: the running turn never ends (the test never releases
-    # GO_IDLE) so any confirmation must come from recognizing the
-    # queued-messages footer itself, not from h0jw's turn-boundary signals
-    # (which require the turn to actually end or our line to echo as its own
-    # prompt). Pre-fix this exhausted the poll budget and reported undelivered
-    # even though the line was genuinely queued (SABLE-l8a5).
-    #
-    # SABLE-wcbj: waiting for BUSY_READY (instead of racing a wall-clock
-    # BUSY_SECS window) guarantees sable-msg's t0 capture lands during the
-    # busy phase; the stand-in's full-line read (see _QUEUED_FOOTER_TUI above)
-    # keeps the typed text from getting corrupted under host load, and a
-    # generous SUBMIT_TRIES budget is extra headroom on top of that — the
-    # footer stays the SOLE confirmation source either way, since GO_IDLE is
-    # never touched.
+def test_default_send_never_appends_payload_to_existing_queued_composer(
+    tmux_socket, tmp_path,
+):
+    # The exact old msxj posture is now a negative transport control: even a
+    # composer already carrying a queued line must receive no payload bytes.
     rec, end, arrivals, busy_ready, go_idle = _start_queued_footer_pane(tmux_socket, tmp_path)
     assert _wait_until(busy_ready.exists, timeout=10), \
         "stand-in never signalled busy-entry"
@@ -744,28 +761,20 @@ def test_default_send_to_busy_pane_with_queued_footer_confirms_delivered_msxj(tm
              "SABLE_MSG_AUTO_FALLBACK": "0", "SABLE_MSG_SUBMIT_TRIES": "40",
              "SABLE_MSG_POLL_INTERVAL": "0.2"},
     )
-    assert r.returncode == 0, r.stderr           # footer alone must confirm -> delivered
-    assert "delivered" in r.stderr
+    assert r.returncode != 0
+    assert "QUEUED-BUT-DRAINER-UNVERIFIED" in r.stderr
     assert not end.exists(), "the turn must still be running (never reached NATURAL end)"
-    # arrivals.txt is guaranteed to exist here (SABLE-du3w's race is structurally
-    # closed by this test's design): r.returncode == 0 means sable-msg's poll
-    # already observed the queued-footer posture, which requires the stand-in
-    # to have already appended to ARRIVALS_FILE.
-    assert _read_recording(arrivals).count("cap in force") == 1
+    assert not arrivals.exists()
+    assert [message.body for message in inbox_lib.read("optimus")] == [
+        "cap in force"
+    ]
 
 
-def test_second_send_on_still_busy_pane_does_not_double_queue_msxj(tmux_socket, tmp_path):
-    # THE bead's double-queue repro, end-to-end: two independent sable-msg
-    # invocations target the SAME still-busy pane while the first message is
-    # still sitting queued (footer showing). The second call's t0 capture
-    # already contains the message, so it must skip retyping and just
-    # re-confirm the existing queued line -- a single arrival, not two.
-    #
-    # SABLE-wcbj: BUSY_READY/GO_IDLE markers (not a wall-clock BUSY_SECS
-    # window + fixed sleep) make both the busy phase and the busy->idle
-    # transition deterministic under host load. The turn is released to idle
-    # only after the first send's queued arrival is confirmed, so the second
-    # send's t0 capture is guaranteed to observe the already-queued line.
+def test_two_default_sends_are_fifo_payloads_and_zero_composer_writes(
+    tmux_socket, tmp_path,
+):
+    # Poke idempotency does not mean payload deduplication: two explicit sends
+    # are two FIFO records. Neither record may be typed into the busy pane.
     rec, end, arrivals, busy_ready, go_idle = _start_queued_footer_pane(tmux_socket, tmp_path)
     assert _wait_until(busy_ready.exists, timeout=10), \
         "stand-in never signalled busy-entry"
@@ -777,22 +786,21 @@ def test_second_send_on_still_busy_pane_does_not_double_queue_msxj(tmux_socket, 
     )
     r1 = subprocess.run(
         ["python3", str(BIN), "optimus", "cap in force", "--from", "lincoln"], **kwargs)
-    assert r1.returncode == 0, r1.stderr
-    assert _wait_until(lambda: _read_recording(arrivals).count("cap in force") == 1, timeout=10), \
-        "first send must have queued exactly once before the second send starts"
+    assert r1.returncode != 0
     r2 = subprocess.run(
         ["python3", str(BIN), "optimus", "cap in force", "--from", "lincoln"], **kwargs)
-    assert r2.returncode == 0, r2.stderr
+    assert r2.returncode != 0
+    assert [message.body for message in inbox_lib.read("optimus")] == [
+        "cap in force",
+        "cap in force",
+    ]
+    assert not arrivals.exists()
 
     go_idle.touch()  # release the busy turn now that both sends are confirmed queued
     assert _wait_until(lambda: end.exists() and end.read_text().strip() == "NATURAL",
                        timeout=10), \
         "busy turn never reached its (test-controlled) natural end"
-    assert _wait_until(lambda: rec.exists() and _read_recording(rec).count("cap in force") == 1,
-                       timeout=10), \
-        "only a single copy of the message must ultimately submit"
-    assert _read_recording(arrivals).count("cap in force") == 1, \
-        "the second send must not have retyped an already-queued message"
+    assert not rec.exists()
 
 
 # --- idle-pane redraw race: report-NOT-landed-when-it-DID (SABLE-uh4b) --------
@@ -817,8 +825,13 @@ _REDRAW_TUI = r'''#!/usr/bin/env bash
 printf '\033[H\033[2J'
 printf '\xe2\x9d\xaf '                 # empty idle composer (❯ + space), no busy line
 line=""
-while IFS= read -r line; do
-  [ -n "$line" ] && break             # ignore stray blank Enters until the msg arrives
+while [ -z "$line" ]; do
+  IFS= read -rsN1 first || exit 0
+  if [ "$first" = $'\033' ]; then
+    continue                           # --interrupt Escape clears nothing here
+  fi
+  IFS= read -r rest
+  line="${first}${rest}"
 done
 printf '%s\n' "$line" >> "$REC_FILE"   # proof: the line was submitted as a turn
 while true; do
@@ -846,7 +859,7 @@ def test_idle_pane_redraw_race_reports_landed_not_undelivered(tmux_socket, tmp_p
 
     r = subprocess.run(
         ["python3", str(BIN), "optimus", "GO push your worktree branch now",
-         "--from", "lincoln"],
+         "--from", "lincoln", "--interrupt"],
         capture_output=True, text=True,
         env={**_env(), "SABLE_TMUX_SOCKET": tmux_socket, "SABLE_TMUX_SESSION": "w",
              "SABLE_MSG_AUTO_FALLBACK": "0", "SABLE_MSG_SUBMIT_TRIES": "5",
@@ -937,46 +950,31 @@ def _start_stuck_box_pane(sock, tmp_path):
     return rec, busy_ready, stuck_read, go_idle
 
 
-def test_busy_at_t0_text_stuck_in_editable_box_self_heals_and_delivers_l7uv(tmux_socket, tmp_path):
-    # THE SABLE-l7uv repro, end-to-end against a REAL tmux server + real sable-msg.
-    # The pane is BUSY at t0; the single busy-leg Enter is absorbed, then the line
-    # sits stuck in the editable composer. The fix must resend Enter once the pane
-    # is no longer working, submitting the line (REC_FILE) and reporting DELIVERED.
-    # Pre-fix: rc != 0, REC_FILE empty, a durable fallback bead would be filed for a
-    # message left visibly stuck. AUTO_FALLBACK=0 keeps a (pre-fix) failure from
-    # writing a real inbox bead.
-    #
-    # Fully marker-driven (SABLE-l7uv revise — the wall-clock BUSY_SECS form flaked
-    # ~2/3 under load): (A) wait for BUSY_READY so sable-msg's t0 capture lands
-    # DURING the busy phase (deterministic busy-at-t0 self-heal path); (B) release
-    # GO_IDLE only after STUCK_READ proves sable-msg has typed the line into the
-    # busy composer, so it is guaranteed present in the editable box when the pane
-    # falls idle; (C) poll REC_FILE with a budget instead of a single racing read.
-    # sable-msg runs via Popen so the test can drive GO_IDLE while it polls.
+def test_default_queue_cannot_create_the_l7uv_stuck_body_posture(
+    tmux_socket, tmp_path,
+):
+    # The legacy self-heal remains covered at the pane-library layer, but the
+    # default sender must now make this posture unreachable: it never types the
+    # arbitrary body, so there is nothing for a redraw to strand in the editor.
     rec, busy_ready, stuck_read, go_idle = _start_stuck_box_pane(tmux_socket, tmp_path)
     assert _wait_until(busy_ready.exists, timeout=10), \
         "stand-in never signalled busy-entry"
-    proc = subprocess.Popen(
+    result = subprocess.run(
         ["python3", str(BIN), "optimus", "cap in force", "--from", "lincoln"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        capture_output=True,
+        text=True,
         env={**_env(), "SABLE_TMUX_SOCKET": tmux_socket, "SABLE_TMUX_SESSION": "w",
-             "SABLE_MSG_AUTO_FALLBACK": "0", "SABLE_MSG_SUBMIT_TRIES": "60",
-             "SABLE_MSG_POLL_INTERVAL": "0.25"},
+             "SABLE_MSG_AUTO_FALLBACK": "0"},
     )
-    try:
-        assert _wait_until(stuck_read.exists, timeout=15), \
-            "sable-msg never typed the line into the busy composer"
-        go_idle.touch()                              # release busy->idle; line now stuck
-        out, err = proc.communicate(timeout=45)
-    finally:
-        if proc.poll() is None:
-            proc.kill()
-            proc.communicate()
-    assert _wait_until(lambda: rec.exists() and "cap in force" in _read_recording(rec),
-                       timeout=10), \
-        "the stuck line must have been submitted by the self-heal Enter"
-    assert proc.returncode == 0, err             # self-heal -> delivered, no fallback
-    assert "delivered" in err
+    assert result.returncode != 0
+    assert "QUEUED-BUT-DRAINER-UNVERIFIED" in result.stderr
+    assert not stuck_read.exists()
+    assert [message.body for message in inbox_lib.read("optimus")] == [
+        "cap in force"
+    ]
+    go_idle.touch()
+    time.sleep(0.1)
+    assert not rec.exists()
 
 
 # --- per-repo scoping (SABLE-e1e3.3): a fleet is addressed only by its repo ---
@@ -994,6 +992,7 @@ def _make_fleet(sock, tmp_path, name, role="tarzan"):
     _tmux(sock, "set-option", "-t", sess, "@sable_repo", root)
     _tmux(sock, "set-option", "-p", "-t", sess, "@sable_role", role)
     _tmux(sock, "set-option", "-p", "-t", sess, "@sable_repo", root)
+    _prepare_bash_interrupt(sock, sess)
     return repo, sess
 
 
@@ -1008,7 +1007,7 @@ def test_two_fleets_role_delivery_is_repo_scoped(tmux_socket, tmp_path):
     alpha, sess_a = _make_fleet(tmux_socket, tmp_path, "alpha")
     beta, sess_b = _make_fleet(tmux_socket, tmp_path, "beta")
     r = _run_msg_from(tmux_socket, alpha, "tarzan",
-                      "echo ALPHA-ONLY", "--from", "lincoln")
+                      "echo ALPHA-ONLY", "--from", "lincoln", "--interrupt")
     assert r.returncode == 0, r.stderr
     _require_until(
         lambda: "ALPHA-ONLY" in _capture(tmux_socket, sess_a),
@@ -1064,7 +1063,7 @@ def test_pane_session_wins_over_mismatched_cwd_repo(tmux_socket, tmp_path):
     # though the shell's CWD is beta, not alpha.
     body = "; echo CROSS-REPO-DELIVERED"
     cmd = (f'unset SABLE_TMUX_SESSION; SABLE_TMUX_SOCKET={tmux_socket} '
-          f'python3 {BIN} tarzan "{body}" --from worker')
+          f'python3 {BIN} tarzan "{body}" --from worker --interrupt')
     _tmux(tmux_socket, "send-keys", "-t", worker_pane, cmd, "Enter")
     _require_until(
         lambda: "CROSS-REPO-DELIVERED" in _capture(tmux_socket, sess_a),
@@ -1094,6 +1093,7 @@ def _start_worker_pane(sock, session, window_name, bead, status):
     _tmux(sock, "set-option", "-p", "-t", pane_id, "@sable_role", "worker")
     _tmux(sock, "set-option", "-p", "-t", pane_id, "@sable_bead", bead)
     _tmux(sock, "set-option", "-p", "-t", pane_id, "@sable_status", status)
+    _prepare_bash_interrupt(sock, pane_id)
     return pane_id
 
 
@@ -1106,7 +1106,7 @@ def test_bead_message_routes_to_running_pane_not_stale_done_duplicate(tmux_socke
     running_pane = _start_worker_pane(tmux_socket, "w", "new", "SABLE-pi5m", "running")
 
     r = _run_msg(tmux_socket, "SABLE-pi5m", "echo BEAD-MSG-LANDED",
-                 "--from", "optimus", "--bead")
+                 "--from", "optimus", "--bead", "--interrupt")
     assert r.returncode == 0, r.stderr
     _require_until(
         lambda: "BEAD-MSG-LANDED" in _capture(tmux_socket, running_pane),
@@ -1148,6 +1148,7 @@ def _start_pane_with_identity(sock, identity, role_tag):
           "-e", f"CLAUDE_AGENT_NAME={identity}",
           "PS1='> ' bash --noprofile --norc")
     _tmux(sock, "set-option", "-p", "-t", "w", "@sable_role", role_tag)
+    _prepare_bash_interrupt(sock, "w")
     return "w"
 
 
@@ -1178,7 +1179,7 @@ def test_agreeing_identity_still_delivers(tmux_socket):
     # identity AGREES with its role tag (both 'optimus') delivers normally.
     _start_pane_with_identity(tmux_socket, identity="optimus", role_tag="optimus")
     r = _run_msg(tmux_socket, "optimus",
-                 "echo IDENTITY-AGREES-DELIVERED", "--from", "lincoln")
+                 "echo IDENTITY-AGREES-DELIVERED", "--from", "lincoln", "--interrupt")
     assert r.returncode == 0, r.stderr
     _require_until(
         lambda: "IDENTITY-AGREES-DELIVERED" in _capture(tmux_socket, "w"),
@@ -1196,7 +1197,7 @@ def test_untagged_process_identity_falls_open_to_tag(tmux_socket):
     _start_pane(tmux_socket)  # bash, no -e identity
     _tmux(tmux_socket, "set-option", "-p", "-t", "w", "@sable_role", "tarzan")
     r = _run_msg(tmux_socket, "tarzan",
-                 "echo NO-IDENTITY-FALLS-OPEN", "--from", "lincoln")
+                 "echo NO-IDENTITY-FALLS-OPEN", "--from", "lincoln", "--interrupt")
     assert r.returncode == 0, r.stderr
     _require_until(
         lambda: "NO-IDENTITY-FALLS-OPEN" in _capture(tmux_socket, "w"),
@@ -1222,6 +1223,7 @@ def test_worker_pane_send_frames_as_worker_not_manager_lane_qqcd(tmux_socket):
     _tmux(tmux_socket, "new-session", "-d", "-s", "w", "-x", "200", "-y", "50",
           "PS1='> ' bash --noprofile --norc")
     _tmux(tmux_socket, "set-option", "-p", "-t", "w", "@sable_role", "tarzan")
+    _prepare_bash_interrupt(tmux_socket, "w")
     # Pin the manager pane's own id NOW -- _start_worker_pane below creates a
     # second window that becomes the session's active one, so capturing by the
     # bare session name "w" afterwards would capture the WRONG (worker) pane.
@@ -1236,7 +1238,7 @@ def test_worker_pane_send_frames_as_worker_not_manager_lane_qqcd(tmux_socket):
     # (ambient tmux behavior) alongside the CLAUDE_AGENT_NAME=tarzan +
     # SABLE_WORKER_PANE=1 sable-spawn-worker:696-697 actually stamps there.
     r = subprocess.run(
-        ["python3", str(BIN), "tarzan", "status: pushed and green"],
+        ["python3", str(BIN), "tarzan", "status: pushed and green", "--interrupt"],
         capture_output=True, text=True,
         env={**_env(), "SABLE_TMUX_SOCKET": tmux_socket, "SABLE_TMUX_SESSION": "w",
              "CLAUDE_AGENT_NAME": "tarzan", "SABLE_WORKER_PANE": "1",
@@ -1256,7 +1258,7 @@ def test_worker_pane_send_frames_as_worker_not_manager_lane_qqcd(tmux_socket):
     # Same run, a REAL manager pane's own send (CLAUDE_AGENT_NAME=tarzan, no
     # SABLE_WORKER_PANE) must still read from=<manager> -- the regression guard.
     r2 = subprocess.run(
-        ["python3", str(BIN), "tarzan", "manager directive: hold pushes"],
+        ["python3", str(BIN), "tarzan", "manager directive: hold pushes", "--interrupt"],
         capture_output=True, text=True,
         env={**_env(), "SABLE_TMUX_SOCKET": tmux_socket, "SABLE_TMUX_SESSION": "w",
              "CLAUDE_AGENT_NAME": "tarzan"},
@@ -1315,7 +1317,15 @@ def test_body_file_delivers_backticks_and_dollar_paren_unexecuted(tmux_socket, t
     body_path = tmp_path / "body.txt"
     body_path.write_text(hazardous, encoding="utf-8")
 
-    r = _run_msg(tmux_socket, "optimus", "--body-file", str(body_path), "--from", "lincoln")
+    r = _run_msg(
+        tmux_socket,
+        "optimus",
+        "--body-file",
+        str(body_path),
+        "--from",
+        "lincoln",
+        "--interrupt",
+    )
     assert r.returncode == 0, r.stderr
     _require_until(
         lambda: f"$(touch {marker})" in _capture(tmux_socket, "w"),
@@ -1341,7 +1351,7 @@ def test_negative_control_inline_body_through_a_real_shell_is_corrupted_before_s
     marker = tmp_path / "executed-marker"
     shell_cmd = (
         f'python3 {shlex.quote(str(BIN))} optimus '
-        f'"see `hostname` and $(touch {marker}) now" --from lincoln'
+        f'"see `hostname` and $(touch {marker}) now" --from lincoln --interrupt'
     )
     env = {**_env(), "SABLE_TMUX_SOCKET": tmux_socket, "SABLE_TMUX_SESSION": "w"}
     r = subprocess.run(shell_cmd, shell=True, capture_output=True, text=True, env=env)
@@ -1365,166 +1375,50 @@ def test_negative_control_inline_body_through_a_real_shell_is_corrupted_before_s
     assert "`hostname`" not in pane
 
 
-# --- SABLE-o8uti: does delivery outcome depend on PATH, or on PANE STATE? --
+# --- SABLE-o8uti: inline versus body-file on the durable default path -------
 #
-# The sighting: two long inline sends to a busy manager pane failed verified
-# delivery (auto-filed as beads) while a short one to the SAME pane landed
-# moments later; two immediate --body-file replays of previously-failed
-# inline bodies then landed first attempt. LENGTH ALONE was refuted by a
-# counter-example the same shift (a 3067-char --body-file send landed while a
-# shorter 2675-char inline send failed to an overlapping recipient). PATH
-# (inline vs --body-file) was the leading hypothesis after that, but every
-# trial ran on LIVE manager panes whose busy/idle state was never held fixed
-# across arms — the residual confound the dispatch flagged: retry time itself
-# could free a pane, making a later attempt succeed regardless of its path.
-# A later live trial then showed a THIRD failure mode (--body-file itself
-# failing twice in a row to the same recipient, with --interrupt landing the
-# identical content first attempt) that refutes path as a sole mechanism too
-# and points at pane state as the dominant variable, with --interrupt as a
-# candidate practical fix.
-#
-# This test is the controlled experiment the dispatch asks for, run against a
-# DETERMINISTIC stand-in instead of a live pane: busy/idle becomes a FIXED
-# variable per trial (a fresh stand-in per busy-cell trial, never inferred
-# from real-time drift), which eliminates the exact confound above by
-# construction rather than by hoping retries happen to interleave kindly.
+# The original transport experiment asked whether inline and --body-file
+# payloads landed differently in a live composer. SABLE-1el7e removes that
+# variable from default delivery: both input forms must converge to the same
+# byte-exact queue representation before any pane write. Direct transport
+# behavior remains separately exercised through the explicit --interrupt arm.
 
-_IDLE_EXPERIMENT_TUI = r'''#!/usr/bin/env bash
-: > "$IDLE_READY"
-printf '\xe2\x9d\xaf \n'
-buf=
-while IFS= read -r -n 1 ch; do
-  [ "$ch" = $'\033' ] && continue
-  if [ -z "$ch" ]; then
-    printf '\xe2\x9d\xaf %s\n' "$buf"
-    printf '\xe2\x9d\xaf \n'
-    buf=
-  else
-    buf="${buf}${ch}"
-  fi
-done
-'''
+def test_default_inline_and_body_file_enqueue_identical_bytes_o8uti(
+    tmux_socket, tmp_path,
+):
+    """Default input paths converge before pane transport (SABLE-1el7e).
 
+    The former six-cell busy/idle experiment answered a transport question the
+    default path no longer asks. Inline and file bodies must now publish the
+    same original bytes, and a fresh drainer makes both successful without
+    either body appearing in the composer.
+    """
 
-def test_delivery_outcome_by_path_and_pane_state_o8uti(tmux_socket, tmp_path):
-    """SABLE-o8uti controlled experiment (three-arm design per the dispatch's
-    2026-07-23 update): does verified-delivery outcome depend on PATH (inline
-    positional / --body-file / --body-file+--interrupt) or on PANE STATE
-    (busy / idle)? Six cells, three trials each, bodies IDENTICAL in length
-    and character content across every cell and trial, so path and pane-state
-    are the only variables that move.
-
-    Both panes are torn down and respawned fresh before each cell. For the busy
-    pane this prevents ``--interrupt`` from turning a later trial idle; for the
-    idle pane it prevents prior identical messages in the transcript/composer
-    from becoming an uncontrolled seventh variable in the experiment."""
-    idle_session = "idle"
-    busy_session = "busy"
-
-    body = ("o8uti controlled-experiment body: identical length and content "
-            "across every path and pane-state cell and every trial, so only "
-            "the path and pane-state variables ever move")
+    _start_pane(tmux_socket)
+    body = (
+        "o8uti controlled body: identical length and content across both "
+        "default input paths"
+    )
     body_path = tmp_path / "cell_body.txt"
     body_path.write_text(body, encoding="utf-8")
-    idle_script = tmp_path / "idle_tui.sh"
-    idle_script.write_text(_IDLE_EXPERIMENT_TUI)
-    idle_script.chmod(0o755)
-    idle_ready = tmp_path / "idle_ready"
-    busy_script = tmp_path / "busy_tui.sh"
-    busy_script.write_text(_BUSY_MARKER_TUI)
-    busy_script.chmod(0o755)
-    state_dir = tmp_path / "freshness"
+    inbox_lib.record_drain_heartbeat(interval_seconds=60)
 
-    def respawn_idle():
-        subprocess.run(
-            ["tmux", "-L", tmux_socket, "kill-session", "-t", idle_session],
-            capture_output=True,
-            text=True,
-            env=_server_env(),
-        )
-        idle_ready.unlink(missing_ok=True)
-        _tmux(
-            tmux_socket,
-            "new-session",
-            "-d",
-            "-s",
-            idle_session,
-            "-x",
-            "200",
-            "-y",
-            "50",
-            f"IDLE_READY={idle_ready} bash {idle_script}",
-        )
-        _tmux(tmux_socket, "set-option", "-p", "-t", idle_session,
-              "@sable_role", "optimus")
-        _require_until(
-            idle_ready.exists,
-            description="fresh idle experiment TUI prompt",
-        )
-
-    def respawn_busy():
-        subprocess.run(["tmux", "-L", tmux_socket, "kill-session", "-t", busy_session],
-                       capture_output=True, text=True, env=_server_env())
-        busy_ready = tmp_path / "busy_ready"
-        busy_ready.unlink(missing_ok=True)
-        go_idle = tmp_path / "busy_go_idle"
-        go_idle.unlink(missing_ok=True)
-        _tmux(tmux_socket, "new-session", "-d", "-s", busy_session, "-x", "200", "-y", "50",
-              f"REC_FILE={tmp_path / 'busy_rec.txt'} END_FILE={tmp_path / 'busy_end.txt'} "
-              f"BUSY_READY={busy_ready} GO_IDLE={go_idle} bash {busy_script}")
-        _tmux(tmux_socket, "set-option", "-p", "-t", busy_session, "@sable_role", "optimus")
-        assert _wait_until(busy_ready.exists, timeout=10), \
-            "busy stand-in never signalled busy-entry"
-
-    def send(path, session):
-        env = {**_env(), "SABLE_TMUX_SOCKET": tmux_socket, "SABLE_TMUX_SESSION": session,
-               "SABLE_MSG_STATE_DIR": str(state_dir), "SABLE_MSG_AUTO_FALLBACK": "0",
-               "SABLE_MSG_SUBMIT_TRIES": "3", "SABLE_MSG_POLL_INTERVAL": "0.2",
-               "SABLE_MSG_READY_TIMEOUT": "5"}
-        if path == "inline":
-            args = ["optimus", body, "--from", "lincoln"]
-        elif path == "body-file":
-            args = ["optimus", "--body-file", str(body_path), "--from", "lincoln"]
-        else:
-            args = ["optimus", "--body-file", str(body_path), "--from", "lincoln", "--interrupt"]
-        r = subprocess.run(["python3", str(BIN), *args], capture_output=True, text=True, env=env)
-        if r.returncode != 0:
-            print(
-                f"SABLE-o8uti {path}/{session} rc={r.returncode} "
-                f"stdout={r.stdout!r} stderr={r.stderr!r}"
-            )
-        return r.returncode == 0
-
-    paths = ["inline", "body-file", "interrupt"]
-    results = {(p, s): [] for p in paths for s in ("busy", "idle")}
-
-    for _trial in range(3):
-        for p in paths:
-            respawn_busy()
-            results[(p, "busy")].append(send(p, busy_session))
-            respawn_idle()
-            results[(p, "idle")].append(send(p, idle_session))
-
-    table = {f"{p}/{s}": (sum(v), len(v)) for (p, s), v in results.items()}
-    print(f"SABLE-o8uti cell table (successes/trials): {table}")
-
-    # IDLE: every path must be reliable regardless of path -- rules out
-    # inline/body-file/interrupt as a mechanism on an uncontended pane.
-    for p in paths:
-        assert all(results[(p, "idle")]), f"{p}/idle was not 100% reliable: {results[(p, 'idle')]}"
-
-    # BUSY, no --interrupt: the pane never frees within this budget, so
-    # inline and body-file must show the SAME outcome here -- if PATH alone
-    # were the mechanism, one would reliably outperform the other.
-    assert results[("inline", "busy")] == results[("body-file", "busy")], (
-        f"inline and body-file diverged against an identically-busy pane -- this "
-        f"would be evidence FOR path as a mechanism: {table}"
+    inline = _run_msg(
+        tmux_socket, "optimus", body, "--from", "lincoln"
     )
-    # BUSY, --interrupt: must be reliable -- the "practical fix" candidate the
-    # dispatch's update asked this experiment to check.
-    assert all(results[("interrupt", "busy")]), (
-        f"--interrupt was not reliable against a busy pane: {results[('interrupt', 'busy')]}"
+    file_backed = _run_msg(
+        tmux_socket,
+        "optimus",
+        "--body-file",
+        str(body_path),
+        "--from",
+        "lincoln",
     )
+
+    assert inline.returncode == 0, inline.stderr
+    assert file_backed.returncode == 0, file_backed.stderr
+    assert [message.body for message in inbox_lib.read("optimus")] == [body, body]
+    assert body not in _capture(tmux_socket, "w")
 
 
 # --- freshness: supersession (SABLE-xwy0b) ----------------------------------
@@ -1596,64 +1490,58 @@ def _start_busy_pane_markers_discard(sock, tmp_path):
     return rec, end, busy_ready, go_idle
 
 
-def test_superseded_send_never_lands_after_a_later_correction_xwy0b(tmux_socket, tmp_path):
-    """SABLE-xwy0b end-to-end repro. Message A is composed to a BUSY pane
-    (queues, enters its own verified-delivery retry loop); while A is still
-    retrying, message B — same sender, same recipient — is composed and
-    forced in with --interrupt, exactly as the real incident did. A must
-    abort and report `superseded` (never confirm delivered after the fact);
-    B must deliver normally; and the pane's real transcript must show ONLY
-    B ever became a submitted turn."""
+def test_interrupt_bypasses_without_mutating_existing_queued_payload(
+    tmux_socket, tmp_path,
+):
+    """A deliberate override may overtake, but never corrupt, the file queue.
+
+    Direct-retry supersession remains pinned in the unit suite. Once a default
+    payload is durably published it is no longer a retrying pane injection: the
+    later interrupt lands directly while the older FIFO record remains exact
+    and was never exposed to the composer.
+    """
     rec, end, busy_ready, go_idle = _start_busy_pane_markers_discard(tmux_socket, tmp_path)
     assert _wait_until(busy_ready.exists, timeout=10), \
         "stand-in never signalled busy-entry"
 
     a_body = "HOLD-A push-only, superseded"
     b_body = "HOLD-B two-part corrected hold"
-    state_dir = tmp_path / "freshness"
-    env_common = {**_env(), "SABLE_TMUX_SOCKET": tmux_socket, "SABLE_TMUX_SESSION": "w",
-                 "SABLE_MSG_STATE_DIR": str(state_dir)}
+    env_common = {
+        **_env(),
+        "SABLE_TMUX_SOCKET": tmux_socket,
+        "SABLE_TMUX_SESSION": "w",
+    }
 
-    proc_a = subprocess.Popen(
+    result_a = subprocess.run(
         ["python3", str(BIN), "optimus", a_body, "--from", "lincoln"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        env={**env_common, "SABLE_MSG_SUBMIT_TRIES": "40", "SABLE_MSG_POLL_INTERVAL": "0.1",
-             "SABLE_MSG_AUTO_FALLBACK": "0"},
+        capture_output=True,
+        text=True,
+        env=env_common,
     )
-    try:
-        # Wait until A has actually queued its line into the busy pane (i.e.
-        # is now in its own retry/poll phase) before composing the
-        # superseding B — this is the "still retrying" window the bug lives in.
-        assert _wait_until(lambda: a_body in _capture(tmux_socket, "w"), timeout=10), \
-            "message A never queued into the busy pane"
+    assert result_a.returncode != 0
+    assert "QUEUED-BUT-DRAINER-UNVERIFIED" in result_a.stderr
+    assert a_body not in _capture(tmux_socket, "w")
 
-        r_b = subprocess.run(
-            ["python3", str(BIN), "optimus", b_body, "--from", "lincoln", "--interrupt"],
-            capture_output=True, text=True,
-            env={**env_common, "SABLE_MSG_SUBMIT_TRIES": "8", "SABLE_MSG_POLL_INTERVAL": "0.2",
-                "SABLE_MSG_READY_TIMEOUT": "5"},
-        )
-        assert r_b.returncode == 0, r_b.stderr
-        assert "delivered" in r_b.stderr
-
-        out_a, err_a = proc_a.communicate(timeout=20)
-    finally:
-        if proc_a.poll() is None:
-            proc_a.kill()
-        go_idle.touch()  # release the stand-in so the fixture's teardown is clean
-
-    assert proc_a.returncode != 0, (
-        f"a superseded send must not report success -- stdout={out_a!r} stderr={err_a!r}"
+    result_b = subprocess.run(
+        ["python3", str(BIN), "optimus", b_body, "--from", "lincoln", "--interrupt"],
+        capture_output=True,
+        text=True,
+        env={
+            **env_common,
+            "SABLE_MSG_SUBMIT_TRIES": "8",
+            "SABLE_MSG_POLL_INTERVAL": "0.2",
+            "SABLE_MSG_READY_TIMEOUT": "5",
+        },
     )
-    assert "superseded" in err_a, err_a
+    go_idle.touch()
+    assert result_b.returncode == 0, result_b.stderr
+    assert "delivered" in result_b.stderr
 
     assert _wait_until(lambda: rec.exists() and b_body in _read_recording(rec), timeout=10), \
         "message B must have actually landed as a submitted turn"
     rec_text = _read_recording(rec)
-    assert a_body not in rec_text, (
-        "the superseded message A must never surface as a submitted turn once "
-        "B has replaced it"
-    )
+    assert a_body not in rec_text
+    assert [message.body for message in inbox_lib.read("optimus")] == [a_body]
 
 
 if __name__ == "__main__":

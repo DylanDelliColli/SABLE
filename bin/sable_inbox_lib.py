@@ -64,6 +64,11 @@ class InboxMessage:
     id: str
     sender: str
     body: str
+    # Publication time comes from the atomically-replaced message artifact,
+    # so legacy queue records gain cross-channel ordering evidence without a
+    # schema migration. It lets a recipient compare an older queued payload
+    # with a newer direct turn's composed= timestamp (SABLE-1el7e).
+    enqueued_at: float
 
 
 @dataclass(frozen=True)
@@ -426,12 +431,30 @@ def drain_health(*, now: float | None = None) -> DrainHealth:
 
 
 def read(recipient: str) -> list[InboxMessage]:
-    """Return a FIFO snapshot with each body bound to its id and sender."""
+    """Return a FIFO snapshot with identity and publication time attached."""
 
-    return [
-        InboxMessage(id=value["id"], sender=value["sender"], body=value["body"])
-        for value in (_decode(path) for path in _published_paths(recipient))
-    ]
+    messages: list[InboxMessage] = []
+    for path in _published_paths(recipient):
+        value = _decode(path)
+        try:
+            enqueued_at = float(path.stat().st_mtime)
+        except OSError as exc:
+            raise InboxUnavailableError(
+                f"could not assess enqueue time for {path.name}: {exc}"
+            ) from exc
+        if not math.isfinite(enqueued_at) or enqueued_at < 0:
+            raise InboxCorruptError(
+                f"invalid enqueue time for inbox message {path.name}"
+            )
+        messages.append(
+            InboxMessage(
+                id=value["id"],
+                sender=value["sender"],
+                body=value["body"],
+                enqueued_at=enqueued_at,
+            )
+        )
+    return messages
 
 
 def ack(recipient: str, msg_id: str) -> None:

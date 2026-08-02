@@ -26,6 +26,8 @@ _LOADER = SourceFileLoader("sable_msg", str(Path(__file__).resolve().parent / "s
 _SPEC = importlib.util.spec_from_loader("sable_msg", _LOADER)
 sable_msg = importlib.util.module_from_spec(_SPEC)
 _LOADER.exec_module(sable_msg)
+_REAL_ATTEMPT_INBOX_WAKE = sable_msg.attempt_inbox_wake
+_REAL_FILE_FALLBACK_BEAD = sable_msg.file_fallback_bead
 
 # sable-msg inserts its own dir on sys.path at import, so the shared helper
 # module it imports from is now importable directly for predicate-level tests.
@@ -136,6 +138,14 @@ def _pin_session(monkeypatch, tmp_path):
     # writes hermetic and their fallback loud by default; the heartbeat-specific
     # cases below override both seams explicitly.
     monkeypatch.setattr(sable_msg, "enqueue", lambda *args, **kwargs: "test-message")
+    monkeypatch.setattr(
+        sable_msg,
+        "attempt_inbox_wake",
+        lambda *_args, **_kwargs: (False, "test wake deferred"),
+    )
+    # No unit test may manufacture coordination work in the live bead store.
+    # Main-path fallback cases that need a positive id override this seam.
+    monkeypatch.setattr(sable_msg, "file_fallback_bead", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         sable_msg,
         "drain_health",
@@ -280,7 +290,7 @@ def test_main_worker_pane_default_from_labels_as_worker(monkeypatch, capsys):
     monkeypatch.setattr(sable_msg, "lookup_pane",
                         lambda role, run=None, socket=None, session=None: "%2")
     monkeypatch.setattr(sable_msg, "deliver_message", lambda *a, **k: True)
-    rc = sable_msg.main(["tarzan", "status update"])
+    rc = sable_msg.main(["tarzan", "status update", "--interrupt"])
     assert rc == 0
     err = capsys.readouterr().err
     assert "worker:SABLE-i8kv -> tarzan" in err
@@ -293,7 +303,9 @@ def test_main_explicit_from_overrides_worker_default(monkeypatch, capsys):
     monkeypatch.setattr(sable_msg, "lookup_pane",
                         lambda role, run=None, socket=None, session=None: "%2")
     monkeypatch.setattr(sable_msg, "deliver_message", lambda *a, **k: True)
-    rc = sable_msg.main(["optimus", "status update", "--from", "lincoln"])
+    rc = sable_msg.main(
+        ["optimus", "status update", "--from", "lincoln", "--interrupt"]
+    )
     assert rc == 0
     err = capsys.readouterr().err
     assert "lincoln -> optimus" in err
@@ -311,14 +323,169 @@ def test_main_missing_role_errors(monkeypatch, capsys):
 
 # --- main: delivery is verified, not assumed (SABLE-bq93) -------------------
 
-def test_main_happy_path_reports_delivered(monkeypatch, capsys):
+def test_main_interrupt_happy_path_reports_delivered(monkeypatch, capsys):
     monkeypatch.setattr(sable_msg, "lookup_pane", lambda role, run=None, socket=None, session=None: "%2")
     monkeypatch.setattr(sable_msg, "deliver_message", lambda *a, **k: True)
-    rc = sable_msg.main(["optimus", "ship it", "--from", "lincoln"])
+    rc = sable_msg.main(
+        ["optimus", "ship it", "--from", "lincoln", "--interrupt"]
+    )
     assert rc == 0
     err = capsys.readouterr().err
     assert "delivered" in err
     assert "optimus" in err
+
+
+def test_default_send_registers_then_enqueues_before_wake_and_never_types_body(
+    monkeypatch, capsys,
+):
+    """Queue-first also supersedes an older direct retry for the same pair."""
+    events = []
+
+    monkeypatch.setattr(
+        sable_msg,
+        "lookup_pane",
+        lambda role, run=None, socket=None, session=None: "%2",
+    )
+    monkeypatch.setattr(
+        sable_msg,
+        "register_composition",
+        lambda sender, recipient, composed_at, socket=None, session=None: events.append(
+            ("register", sender, recipient, composed_at, socket, session)
+        )
+        or 1,
+    )
+    monkeypatch.setattr(
+        sable_msg,
+        "enqueue",
+        lambda recipient, sender, body: events.append(
+            ("enqueue", recipient, sender, body)
+        )
+        or "msg-1",
+    )
+
+    def wake(recipient, pane, session, socket=None):
+        assert [event[0] for event in events] == ["register", "enqueue"]
+        events.append(("wake", recipient, pane, session, socket))
+        return True, "count-only wake submitted"
+
+    monkeypatch.setattr(sable_msg, "attempt_inbox_wake", wake, raising=False)
+    monkeypatch.setattr(
+        sable_msg,
+        "deliver_with_freshness",
+        lambda *_args, **_kwargs: pytest.fail(
+            "default sends must never type the arbitrary body into a pane"
+        ),
+    )
+
+    body = "cap in force\nthen release"
+    rc = sable_msg.main(["optimus", body, "--from", "lincoln"])
+
+    assert rc == 0
+    assert [event[0] for event in events] == ["register", "enqueue", "wake"]
+    assert events[1][3] == body
+    assert "queued" in capsys.readouterr().err.lower()
+
+
+def test_attempt_inbox_wake_runs_the_sibling_watcher_with_exact_binding(
+    monkeypatch,
+):
+    calls = []
+
+    class Result:
+        returncode = 0
+        stdout = "sable-inbox-watcher: poked %2"
+        stderr = ""
+
+    def run(command, **kwargs):
+        calls.append((command, kwargs))
+        return Result()
+
+    monkeypatch.setattr(sable_msg, "pane_provider_tag", lambda base, pane: "codex")
+
+    woke, detail = _REAL_ATTEMPT_INBOX_WAKE(
+        "optimus", "%2", "sable-repo", socket="sock", runner=run
+    )
+
+    assert woke is True
+    assert "poked %2" in detail
+    command, kwargs = calls[0]
+    assert Path(command[0]).name == "sable-inbox-watcher"
+    assert command[1:] == [
+        "optimus",
+        "%2",
+        "codex",
+        "--session",
+        "sable-repo",
+    ]
+    assert kwargs["env"]["SABLE_TMUX_SOCKET"] == "sock"
+    assert "shell" not in kwargs
+
+
+@pytest.mark.parametrize("returncode", [1, 2])
+def test_attempt_inbox_wake_treats_refusal_or_unassessable_as_safe_deferral(
+    monkeypatch, returncode,
+):
+    class Result:
+        stdout = ""
+        stderr = "REFUSED: composer is not idle"
+
+        def __init__(self, rc):
+            self.returncode = rc
+
+    monkeypatch.setattr(sable_msg, "pane_provider_tag", lambda base, pane: "claude")
+
+    woke, detail = _REAL_ATTEMPT_INBOX_WAKE(
+        "optimus",
+        "%2",
+        "s",
+        runner=lambda _command, **_kwargs: Result(returncode),
+    )
+
+    assert woke is False
+    assert "composer is not idle" in detail
+
+
+def test_attempt_inbox_wake_spawn_failure_is_a_named_deferral(monkeypatch):
+    monkeypatch.setattr(sable_msg, "pane_provider_tag", lambda base, pane: "claude")
+
+    def cannot_spawn(_command, **_kwargs):
+        raise OSError("watcher unavailable")
+
+    woke, detail = _REAL_ATTEMPT_INBOX_WAKE(
+        "optimus", "%2", "s", runner=cannot_spawn
+    )
+
+    assert woke is False
+    assert "watcher unavailable" in detail
+
+
+def test_interrupt_remains_the_only_full_body_delivery_override(monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(
+        sable_msg,
+        "lookup_pane",
+        lambda role, run=None, socket=None, session=None: "%2",
+    )
+    monkeypatch.setattr(
+        sable_msg,
+        "deliver_with_freshness",
+        lambda *_args, **_kwargs: calls.append("deliver") or sable_msg.DELIVERED,
+    )
+    monkeypatch.setattr(
+        sable_msg,
+        "enqueue",
+        lambda *_args, **_kwargs: pytest.fail(
+            "a verified interrupt must not leave a duplicate queued payload"
+        ),
+    )
+
+    rc = sable_msg.main(
+        ["optimus", "urgent stop", "--from", "lincoln", "--interrupt"]
+    )
+
+    assert rc == 0
+    assert calls == ["deliver"]
+    assert "delivered" in capsys.readouterr().err
 
 
 def test_main_refuses_poisoned_role_tag(monkeypatch, capsys):
@@ -343,7 +510,9 @@ def test_main_delivers_when_identity_agrees(monkeypatch, capsys):
     monkeypatch.setattr(sable_msg, "lookup_pane", lambda role, run=None, socket=None, session=None: "%2")
     monkeypatch.setattr(sable_msg, "recipient_identity", lambda pane, socket=None: "optimus")
     monkeypatch.setattr(sable_msg, "deliver_message", lambda *a, **k: True)
-    assert sable_msg.main(["optimus", "ship it", "--from", "lincoln"]) == 0
+    assert sable_msg.main(
+        ["optimus", "ship it", "--from", "lincoln", "--interrupt"]
+    ) == 0
     assert "delivered" in capsys.readouterr().err
 
 
@@ -504,7 +673,9 @@ def test_file_fallback_bead_creates_for_role_inbox_bead():
         return R()
 
     message = "⟦SABLE-MSG⟧ from=lincoln to=optimus :: cap in force"
-    bead_id = sable_msg.file_fallback_bead("lincoln", "optimus", message, runner=runner)
+    bead_id = _REAL_FILE_FALLBACK_BEAD(
+        "lincoln", "optimus", message, runner=runner
+    )
     assert bead_id == "SABLE-ab12"
     argv = seen[0]
     assert argv[:2] == ["bd", "create"]
@@ -532,7 +703,7 @@ def test_file_fallback_bead_is_not_filed_p1():
         seen.append(args)
         return R()
 
-    sable_msg.file_fallback_bead("lincoln", "optimus", "body", runner=runner)
+    _REAL_FILE_FALLBACK_BEAD("lincoln", "optimus", "body", runner=runner)
     argv = seen[0]
     assert "--priority=1" not in argv, (
         "fallback inbox beads must not be P1 — they bury real engineering work "
@@ -587,7 +758,7 @@ def test_file_fallback_bead_uses_the_shared_title_and_label_helpers_3mrv3():
         return R()
 
     framed = sable_msg.format_message("lincoln", "chuck", "sandbox fallback probe", 0.0)
-    sable_msg.file_fallback_bead("lincoln", "chuck", framed, runner=runner)
+    _REAL_FILE_FALLBACK_BEAD("lincoln", "chuck", framed, runner=runner)
     argv = seen[0]
     assert f"--title={sable_msg.fallback_bead_title('chuck', framed)}" in argv
     assert f"--labels={sable_msg.fallback_bead_labels('chuck')}" in argv
@@ -599,8 +770,9 @@ def test_file_fallback_bead_returns_none_when_bd_unavailable():
         stdout = ""
         stderr = "bd: not a beads workspace"
 
-    assert sable_msg.file_fallback_bead("lincoln", "optimus", "msg",
-                                        runner=lambda a: R()) is None
+    assert _REAL_FILE_FALLBACK_BEAD(
+        "lincoln", "optimus", "msg", runner=lambda _args: R()
+    ) is None
 
 
 # --- seat sightings (SABLE-441vl) -------------------------------------------
@@ -1100,8 +1272,13 @@ def test_main_landed_box_frame_send_does_not_double_file_fallback_bead_uh4b(monk
     monkeypatch.setattr(sable_msg, "file_fallback_bead",
                         lambda *a, **k: filed.append(a) or "SABLE-should-not-file")
 
-    rc = sable_msg.main(["optimus", "GO push your worktree branch now recovery landed",
-                         "--from", "lincoln"])
+    rc = sable_msg.main([
+        "optimus",
+        "GO push your worktree branch now recovery landed",
+        "--from",
+        "lincoln",
+        "--interrupt",
+    ])
     assert rc == 0
     assert filed == [], "a landed send must not also file a durable fallback bead"
 
@@ -1360,12 +1537,12 @@ def test_deliver_message_busy_at_t0_turn_never_ends_times_out_and_fails_h0jw():
     assert landed is False
 
 
-def test_main_busy_delayed_land_files_no_fallback_bead_h0jw(monkeypatch):
-    # End-to-end through the REAL main -> deliver_message -> deliver_text ->
-    # submitted_own_turn composition: a busy-at-t0 send whose queued line later
-    # submits+lands must report rc 0 AND must NOT file a durable fallback bead.
-    # This is the exact regression the bead is about — every busy-pane send under
-    # d21h permanently cost a noise bead even when the message landed.
+def test_main_interrupt_settles_busy_turn_then_files_no_fallback_bead_h0jw(
+    monkeypatch,
+):
+    # End-to-end through the sole remaining full-body path. Escape settles the
+    # busy turn before typing; the later verified submission must report rc 0
+    # and must not manufacture a fallback bead.
     monkeypatch.setenv("SABLE_MSG_POLL_INTERVAL", "0")
     monkeypatch.setenv("SABLE_MSG_SUBMIT_TRIES", "8")
     monkeypatch.setenv("SABLE_MSG_READY_TIMEOUT", "1")
@@ -1377,18 +1554,22 @@ def test_main_busy_delayed_land_files_no_fallback_bead_h0jw(monkeypatch):
 
     framed = sable_msg.format_message("lincoln", "optimus", "cap in force", 1_700_000_000.0)
     other_turn = "● Running the auth refactor…\n✻ Thinking… (12s · esc to interrupt)"
-    state = {"typed": False, "polls": 0}
+    state = {"interrupted": False, "typed": False, "polls": 0}
 
     class FakeProc:
         returncode = 0
 
     def fake_run(cmd, **kw):
+        if cmd[-1:] == ["Escape"]:
+            state["interrupted"] = True
         if "paste-buffer" in cmd:
             state["typed"] = True
         return FakeProc()
 
     def fake_capture(base, pane):
         if not state["typed"]:
+            if state["interrupted"]:
+                return "● interrupted\n❯ \n  ddc@host:~/wt"
             return f"{other_turn}\n❯ \n  ddc@host:~/wt"       # busy at t0
         state["polls"] += 1
         if state["polls"] < 3:
@@ -1401,7 +1582,9 @@ def test_main_busy_delayed_land_files_no_fallback_bead_h0jw(monkeypatch):
     monkeypatch.setattr(sable_msg, "file_fallback_bead",
                         lambda *a, **k: filed.append(a) or "SABLE-should-not-file")
 
-    rc = sable_msg.main(["optimus", "cap in force", "--from", "lincoln"])
+    rc = sable_msg.main(
+        ["optimus", "cap in force", "--from", "lincoln", "--interrupt"]
+    )
     assert rc == 0
     assert filed == [], "a busy-at-t0 send that eventually lands must not file a noise bead"
 
@@ -1858,8 +2041,14 @@ def test_main_bead_addressed_delivery(monkeypatch, capsys):
     monkeypatch.setattr(sable_msg, "lookup_worker_by_bead",
                         lambda bead, run=None, socket=None, session=None: "%9")
     monkeypatch.setattr(sable_msg, "deliver_message", lambda *a, **k: True)
-    rc = sable_msg.main(["market-brief-package-73t4", "hold the tree claim",
-                        "--from", "optimus", "--bead"])
+    rc = sable_msg.main([
+        "market-brief-package-73t4",
+        "hold the tree claim",
+        "--from",
+        "optimus",
+        "--bead",
+        "--interrupt",
+    ])
     assert rc == 0
     err = capsys.readouterr().err
     assert "delivered" in err
@@ -1950,7 +2139,14 @@ def test_main_body_file_delivers_hazardous_content_unmodified(monkeypatch, tmp_p
         return True
 
     monkeypatch.setattr(sable_msg, "deliver_message", fake_deliver)
-    rc = sable_msg.main(["optimus", "--body-file", str(body_path), "--from", "lincoln"])
+    rc = sable_msg.main([
+        "optimus",
+        "--body-file",
+        str(body_path),
+        "--from",
+        "lincoln",
+        "--interrupt",
+    ])
     assert rc == 0
     assert "message" in delivered
     assert "`hostname`" in delivered["message"]
@@ -1982,7 +2178,14 @@ def test_body_file_content_never_reaches_a_shell(monkeypatch, tmp_path):
                         lambda role, run=None, socket=None, session=None: "%2")
     monkeypatch.setattr(sable_msg, "deliver_message", lambda *a, **k: True)
 
-    rc = sable_msg.main(["optimus", "--body-file", str(body_path), "--from", "lincoln"])
+    rc = sable_msg.main([
+        "optimus",
+        "--body-file",
+        str(body_path),
+        "--from",
+        "lincoln",
+        "--interrupt",
+    ])
     assert rc == 0
     for args, kwargs in calls:
         flat = " ".join(str(a) for a in args)
@@ -2215,7 +2418,9 @@ def test_main_reports_superseded_distinctly_and_exits_nonzero(monkeypatch, capsy
     filed = []
     monkeypatch.setattr(sable_msg, "file_fallback_bead",
                         lambda *a, **k: filed.append(a) or "SABLE-should-not-file")
-    rc = sable_msg.main(["optimus", "hold", "--from", "lincoln"])
+    rc = sable_msg.main(
+        ["optimus", "hold", "--from", "lincoln", "--interrupt"]
+    )
     assert rc != 0
     err = capsys.readouterr().err
     assert "superseded" in err
@@ -2231,7 +2436,9 @@ def test_main_reports_expired_distinctly_and_exits_nonzero(monkeypatch, capsys):
     filed = []
     monkeypatch.setattr(sable_msg, "file_fallback_bead",
                         lambda *a, **k: filed.append(a) or "SABLE-should-not-file")
-    rc = sable_msg.main(["optimus", "hold", "--from", "lincoln"])
+    rc = sable_msg.main(
+        ["optimus", "hold", "--from", "lincoln", "--interrupt"]
+    )
     assert rc != 0
     err = capsys.readouterr().err
     assert "expired" in err
@@ -2248,7 +2455,9 @@ def test_main_still_reports_undelivered_and_auto_files_when_outcome_undelivered(
     calls = []
     monkeypatch.setattr(sable_msg, "file_fallback_bead",
                         lambda frm, to, msg, runner=None: calls.append((frm, to)) or "SABLE-fb99")
-    rc = sable_msg.main(["optimus", "cap in force", "--from", "lincoln"])
+    rc = sable_msg.main(
+        ["optimus", "cap in force", "--from", "lincoln", "--interrupt"]
+    )
     assert rc != 0
     assert calls == [("lincoln", "optimus")]
     err = capsys.readouterr().err

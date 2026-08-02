@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+"""Read and acknowledge the host-global SABLE payload inbox (SABLE-1el7e).
+
+``read`` is deliberately non-destructive: the caller receives each body bound
+to its own id and sender, then acknowledges that exact observed id only after
+the message is safely present in its turn.  Missing identity or unreadable
+queue state is CANNOT-ASSESS, never an empty inbox.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from dataclasses import asdict
+from pathlib import Path
+from typing import Mapping
+
+
+sys.path.insert(0, str(Path(os.path.realpath(__file__)).parent))
+from sable_inbox_lib import InboxError, ack, read  # noqa: E402
+
+
+def resolve_recipient(environment: Mapping[str, str] | None = None) -> str | None:
+    """The queue identity owned by this process, or ``None`` when unknowable."""
+
+    env = os.environ if environment is None else environment
+    if env.get("SABLE_WORKER_PANE"):
+        value = env.get("SABLE_BEAD")
+    else:
+        value = env.get("SABLE_AGENT_NAME") or env.get("CLAUDE_AGENT_NAME")
+    return value.strip() if value and value.strip() else None
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="sable-inbox")
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    read_parser = commands.add_parser(
+        "read", help="read a non-destructive FIFO snapshot"
+    )
+    read_parser.add_argument("--recipient", help="explicit recipient identity")
+    read_parser.add_argument(
+        "--json", action="store_true", help="emit one JSON array"
+    )
+
+    ack_parser = commands.add_parser(
+        "ack", help="acknowledge one exact message id after reading it"
+    )
+    ack_parser.add_argument("message_id")
+    ack_parser.add_argument("--recipient", help="explicit recipient identity")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parser().parse_args(sys.argv[1:] if argv is None else argv)
+    recipient = args.recipient or resolve_recipient()
+    if recipient is None:
+        sys.stderr.write(
+            "sable-inbox: CANNOT-ASSESS: recipient identity is absent; set "
+            "SABLE_AGENT_NAME (manager/cockpit) or SABLE_BEAD in a worker pane, "
+            "or pass --recipient.\n"
+        )
+        return 2
+
+    try:
+        if args.command == "read":
+            messages = read(recipient)
+            if args.json:
+                print(
+                    json.dumps(
+                        [asdict(message) for message in messages],
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                )
+            else:
+                print(f"INBOX ({recipient}) — {len(messages)} pending")
+                for message in messages:
+                    print(f"[{message.id}] from={message.sender}")
+                    print(message.body)
+            return 0
+
+        ack(recipient, args.message_id)
+        print(f"sable-inbox: acknowledged {args.message_id} for {recipient}")
+        return 0
+    except (InboxError, OSError, ValueError, TypeError) as exc:
+        sys.stderr.write(f"sable-inbox: CANNOT-ASSESS: {exc}\n")
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

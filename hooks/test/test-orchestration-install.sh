@@ -59,6 +59,21 @@ if grep -qF '${CLAUDE_PROJECT_DIR}/.claude/hooks/' "$SET"; then pass "project: h
 if grep -q "$P/.claude/hooks/" "$SET"; then fail "project: no absolute machine path in hook commands" "found absolute path in $SET"; else pass "project: no absolute machine path in hook commands"; fi
 exists "$P/.claude/sable/agents.yaml" "project: registry (agents.yaml) installed"
 exists "$P/.claude/commands/inbox.md" "project: /inbox command installed"
+file_inbox_line="$(grep -n 'sable-inbox read' "$P/.claude/commands/inbox.md" | head -1 | cut -d: -f1)"
+bead_inbox_line="$(grep -n 'bd ready' "$P/.claude/commands/inbox.md" | head -1 | cut -d: -f1)"
+if [ -n "$file_inbox_line" ] && [ -n "$bead_inbox_line" ] \
+   && [ "$file_inbox_line" -lt "$bead_inbox_line" ]; then
+  pass "project: /inbox reads file payloads before addressed beads"
+else
+  fail "project: /inbox reads file payloads before addressed beads" \
+    "file-line=${file_inbox_line:-missing} bead-line=${bead_inbox_line:-missing}"
+fi
+if grep -q 'enqueued_at' "$P/.claude/commands/inbox.md" \
+   && grep -q 'composed=' "$P/.claude/commands/inbox.md"; then
+  pass "project: /inbox exposes cross-channel ordering evidence"
+else
+  fail "project: /inbox exposes cross-channel ordering evidence"
+fi
 if [ -x "$P/.claude/hooks/multi-manager/session-role-anchor.sh" ]; then pass "project: identity hook installed+exec"; else fail "project: identity hook installed+exec"; fi
 if [ "$(count_in_event "$SET" SessionStart session-role-anchor.sh)" = "1" ]; then pass "project: identity hook registered SessionStart"; else fail "project: identity hook registered SessionStart" "count=$(count_in_event "$SET" SessionStart session-role-anchor.sh)"; fi
 if [ "$(count_in_event "$SET" PreCompact session-role-anchor.sh)" = "1" ]; then pass "project: identity hook registered PreCompact"; else fail "project: identity hook registered PreCompact"; fi

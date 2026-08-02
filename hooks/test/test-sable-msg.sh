@@ -96,6 +96,8 @@ export SABLE_MSG_READY_TIMEOUT="5"
 # miss the pane (SABLE-r0m9). The per-repo case (5) unsets this inline for its
 # own CWD-derivation path.
 export SABLE_TMUX_SESSION="w"
+READLINE_INPUTRC="$REC/inputrc"
+printf '%s\n' '"\e": redraw-current-line' 'set keyseq-timeout 1' > "$READLINE_INPUTRC"
 
 # A stand-in "TUI" pane: shows nothing while its boot gate is closed, records
 # the interrupt byte that proves sable-msg contacted it while still unready,
@@ -164,14 +166,16 @@ fi
 
 # --- 2) worker pane, tagged like sable-spawn-worker tags it -----------------
 BEAD="market-brief-package-73t4"
-tmux_spawn_ new-window -d -t w: -n worker -c /tmp "PS1='> ' bash --noprofile --norc"
+tmux_spawn_ new-window -d -t w: -n worker -c /tmp \
+  "INPUTRC=$READLINE_INPUTRC PS1='> ' bash --noprofile --norc"
 wpane="$(tmux_ list-panes -a -F '#{pane_id} #{window_name}' | awk '$2=="worker"{print $1; exit}')"
 tmux_ set-option -p -t "$wpane" @sable_role worker
 tmux_ set-option -p -t "$wpane" @sable_bead "$BEAD"
 tmux_ set-option -p -t "$wpane" @sable_status running
 require_event worker-shell-ready pane_command_is "$wpane" bash
 
-if CLAUDE_AGENT_NAME=optimus python3 "$BIN/sable-msg" "$BEAD" "hold the tree claim" --bead >/dev/null 2>&1; then
+if CLAUDE_AGENT_NAME=optimus python3 "$BIN/sable-msg" "$BEAD" \
+    "hold the tree claim" --bead --interrupt >/dev/null 2>&1; then
   pass "sable-msg --bead resolves a worker pane by @sable_bead (SABLE-6izz)"
 else
   fail "sable-msg --bead resolves a worker pane by @sable_bead (SABLE-6izz)"
@@ -196,11 +200,23 @@ else
 fi
 
 # --- 4) manager-role resolution is unchanged (regression) --------------------
-if CLAUDE_AGENT_NAME=lincoln python3 "$BIN/sable-msg" optimus "still routes by role" >/dev/null 2>&1; then
+PYTHONPATH="$BIN" python3 - <<'PY'
+from sable_inbox_lib import record_drain_heartbeat
+record_drain_heartbeat(interval_seconds=60)
+PY
+if CLAUDE_AGENT_NAME=lincoln python3 "$BIN/sable-msg" optimus \
+    "still routes by role" >/dev/null 2>&1 \
+   && PYTHONPATH="$BIN" python3 - <<'PY'
+from sable_inbox_lib import read
+messages = read("optimus")
+raise SystemExit(0 if messages[-1].body == "still routes by role" else 1)
+PY
+then
   pass "manager-role resolution unchanged"
 else
   fail "manager-role resolution unchanged"
 fi
+rm -f "$SABLE_TEST_INBOX_ROOT/.drain-heartbeat.json"
 
 # --- 5) cross-repo CWD vs actual pane session (market-brief-package-ssd8) ---
 # The live bug this bead fixes: a worker's shell CWD can be a DIFFERENT
@@ -218,10 +234,12 @@ git init -q "$REPO_A"; git init -q "$REPO_B"
 SESS_A="sable-$(basename "$REPO_A")"
 SESS_B="sable-$(basename "$REPO_B")"
 
-tmux_spawn_ new-session -d -s "$SESS_A" -x 200 -y 50 -c "$REPO_A" "PS1='> ' bash --noprofile --norc"
+tmux_spawn_ new-session -d -s "$SESS_A" -x 200 -y 50 -c "$REPO_A" \
+  "INPUTRC=$READLINE_INPUTRC PS1='> ' bash --noprofile --norc"
 tmux_ set-option -t "$SESS_A" @sable_repo "$REPO_A"
 tmux_ set-option -p -t "$SESS_A" @sable_role tarzan
-tmux_spawn_ new-session -d -s "$SESS_B" -x 200 -y 50 -c "$REPO_B" "PS1='> ' bash --noprofile --norc"
+tmux_spawn_ new-session -d -s "$SESS_B" -x 200 -y 50 -c "$REPO_B" \
+  "INPUTRC=$READLINE_INPUTRC PS1='> ' bash --noprofile --norc"
 tmux_ set-option -t "$SESS_B" @sable_repo "$REPO_B"
 require_event repo-a-manager-shell-ready pane_command_is "$SESS_A" bash
 require_event repo-b-manager-shell-ready pane_command_is "$SESS_B" bash
@@ -229,7 +247,8 @@ require_event repo-b-manager-shell-ready pane_command_is "$SESS_B" bash
 tarzan_pane="$(tmux_ list-panes -t "$SESS_A" -F '#{pane_id}')"
 # a second pane in alpha's OWN session, shelled into beta's worktree — exactly
 # the mismatched-CWD shape a cross-repo worker dispatch produces.
-tmux_spawn_ split-window -t "$SESS_A" -d -c "$REPO_B" "PS1='> ' bash --noprofile --norc"
+tmux_spawn_ split-window -t "$SESS_A" -d -c "$REPO_B" \
+  "INPUTRC=$READLINE_INPUTRC PS1='> ' bash --noprofile --norc"
 require_event cross-repo-worker-pane-created pane_count_at_least "$SESS_A" 2
 worker_pane="$(tmux_ list-panes -t "$SESS_A" -F '#{pane_id}' | grep -v "^$tarzan_pane$")"
 tmux_ set-option -p -t "$worker_pane" @sable_role worker
@@ -239,7 +258,7 @@ require_event cross-repo-worker-shell-ready pane_command_is "$worker_pane" bash
 # by tmux for that pane's own bash, not injected) even though CWD is beta.
 CROSS_REPO_DONE="$REC/cross-repo.done"
 tmux_ send-keys -t "$worker_pane" \
-  "unset SABLE_TMUX_SESSION; SABLE_TMUX_SOCKET=$SOCK python3 $BIN/sable-msg tarzan 'cross-repo-ssd8-check' --from worker; : > '$CROSS_REPO_DONE'" Enter
+  "unset SABLE_TMUX_SESSION; SABLE_TMUX_SOCKET=$SOCK python3 $BIN/sable-msg tarzan 'cross-repo-ssd8-check' --from worker --interrupt; : > '$CROSS_REPO_DONE'" Enter
 require_event cross-repo-send-completed file_exists "$CROSS_REPO_DONE"
 
 acap="$(tmux_ capture-pane -t "$SESS_A" -p)"
@@ -334,6 +353,13 @@ if command -v bd >/dev/null 2>&1; then
     fail "unverifiable delivery to a never-ready pane reports undelivered (unexpectedly returned 0)" "$(cat "$ERRFILE2")"
   else
     pass "unverifiable delivery to a never-ready pane reports undelivered"
+  fi
+
+  if ! tmux_ capture-pane -p -J -e -t "$stuckpane" | grep -Fq "$FIXTURE_BODY"; then
+    pass "default send never types the arbitrary payload into the recipient pane"
+  else
+    fail "default send never types the arbitrary payload into the recipient pane" \
+      "$(tmux_ capture-pane -p -J -e -t "$stuckpane")"
   fi
 
   if grep -q "Filed durable inbox bead" "$ERRFILE2"; then

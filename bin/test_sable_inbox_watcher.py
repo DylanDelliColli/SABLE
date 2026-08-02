@@ -9,6 +9,7 @@ from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 import pytest
+from sable_pane_lib import deliberate_hold
 
 
 _LOADER = SourceFileLoader(
@@ -64,12 +65,18 @@ def test_poke_text_is_short_fixed_single_line_with_only_count_varying():
     actual = [watcher.poke_text(count) for count in (0, 1, 7)]
 
     assert actual == [
-        "Check SABLE inbox: 0 pending.",
-        "Check SABLE inbox: 1 pending.",
-        "Check SABLE inbox: 7 pending.",
+        "⟦SABLE-MSG⟧ Run sable-inbox read: 0 pending.",
+        "⟦SABLE-MSG⟧ Run sable-inbox read: 1 pending.",
+        "⟦SABLE-MSG⟧ Run sable-inbox read: 7 pending.",
     ]
     assert all("\n" not in text and len(text) < 64 for text in actual)
     assert len(inspect.signature(watcher.poke_text).parameters) == 1
+
+
+def test_parked_poke_remains_machine_recognisable_to_stall_recovery():
+    capture = f"completed turn\n❯ {watcher.poke_text(1)}\n"
+
+    assert deliberate_hold(capture, "claude") is False
 
 
 def test_poke_text_structurally_refuses_a_message_body():
