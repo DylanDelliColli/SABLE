@@ -417,7 +417,8 @@ def test_idle_pane_receives_interrupt_first_attempt(tmux_socket, tmp_path):
 def test_default_send_to_busy_pane_queues_without_typing_body(tmux_socket):
     # SABLE-1el7e: the default path publishes the original body before a wake
     # attempt and never lets arbitrary text enter a busy composer. With no live
-    # drainer heartbeat this remains loud/nonzero, but the payload is durable.
+    # drainer heartbeat this reports deferred surfacing, but the enqueue itself
+    # is the successful durable delivery state.
     _start_pane(tmux_socket)
     _tmux(tmux_socket, "send-keys", "-t", "w",
           "echo BUSY-START; sleep 3; echo BUSY-END", "Enter")
@@ -432,8 +433,8 @@ def test_default_send_to_busy_pane_queues_without_typing_body(tmux_socket):
              "SABLE_MSG_AUTO_FALLBACK": "0", "SABLE_MSG_SUBMIT_TRIES": "2",
              "SABLE_MSG_POLL_INTERVAL": "0.2"},
     )
-    assert r.returncode != 0
-    assert "QUEUED-BUT-DRAINER-UNVERIFIED" in r.stderr
+    assert r.returncode == 0
+    assert "QUEUED-WAKE-DEFERRED" in r.stderr
     assert [message.body for message in inbox_lib.read("optimus")] == [
         "echo QUEUED-RAN"
     ]
@@ -604,8 +605,8 @@ def test_default_send_to_busy_turn_does_not_interrupt_or_type_payload(
              "SABLE_MSG_SUBMIT_TRIES": "2", "SABLE_MSG_AUTO_FALLBACK": "0",
              "SABLE_MSG_POLL_INTERVAL": "0.2"},
     )
-    assert r.returncode != 0
-    assert "QUEUED-BUT-DRAINER-UNVERIFIED" in r.stderr
+    assert r.returncode == 0
+    assert "QUEUED-WAKE-DEFERRED" in r.stderr
     assert not rec.exists(), "default send must not type into the busy pane"
     assert [message.body for message in inbox_lib.read("optimus")] == [
         "queued directive"
@@ -761,8 +762,8 @@ def test_default_send_never_appends_payload_to_existing_queued_composer(
              "SABLE_MSG_AUTO_FALLBACK": "0", "SABLE_MSG_SUBMIT_TRIES": "40",
              "SABLE_MSG_POLL_INTERVAL": "0.2"},
     )
-    assert r.returncode != 0
-    assert "QUEUED-BUT-DRAINER-UNVERIFIED" in r.stderr
+    assert r.returncode == 0
+    assert "QUEUED-WAKE-DEFERRED" in r.stderr
     assert not end.exists(), "the turn must still be running (never reached NATURAL end)"
     assert not arrivals.exists()
     assert [message.body for message in inbox_lib.read("optimus")] == [
@@ -786,10 +787,10 @@ def test_two_default_sends_are_fifo_payloads_and_zero_composer_writes(
     )
     r1 = subprocess.run(
         ["python3", str(BIN), "optimus", "cap in force", "--from", "lincoln"], **kwargs)
-    assert r1.returncode != 0
+    assert r1.returncode == 0
     r2 = subprocess.run(
         ["python3", str(BIN), "optimus", "cap in force", "--from", "lincoln"], **kwargs)
-    assert r2.returncode != 0
+    assert r2.returncode == 0
     assert [message.body for message in inbox_lib.read("optimus")] == [
         "cap in force",
         "cap in force",
@@ -966,8 +967,8 @@ def test_default_queue_cannot_create_the_l7uv_stuck_body_posture(
         env={**_env(), "SABLE_TMUX_SOCKET": tmux_socket, "SABLE_TMUX_SESSION": "w",
              "SABLE_MSG_AUTO_FALLBACK": "0"},
     )
-    assert result.returncode != 0
-    assert "QUEUED-BUT-DRAINER-UNVERIFIED" in result.stderr
+    assert result.returncode == 0
+    assert "QUEUED-WAKE-DEFERRED" in result.stderr
     assert not stuck_read.exists()
     assert [message.body for message in inbox_lib.read("optimus")] == [
         "cap in force"
@@ -1518,8 +1519,8 @@ def test_interrupt_bypasses_without_mutating_existing_queued_payload(
         text=True,
         env=env_common,
     )
-    assert result_a.returncode != 0
-    assert "QUEUED-BUT-DRAINER-UNVERIFIED" in result_a.stderr
+    assert result_a.returncode == 0
+    assert "QUEUED-WAKE-DEFERRED" in result_a.stderr
     assert a_body not in _capture(tmux_socket, "w")
 
     result_b = subprocess.run(

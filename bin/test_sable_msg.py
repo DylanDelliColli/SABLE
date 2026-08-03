@@ -516,36 +516,47 @@ def test_main_delivers_when_identity_agrees(monkeypatch, capsys):
     assert "delivered" in capsys.readouterr().err
 
 
-def test_main_reports_undelivered_and_exits_nonzero(monkeypatch, capsys):
-    # This is the exact SABLE-bq93 false-positive: send-keys "succeeding" must
-    # no longer be enough to print `delivered` — verification failing must
-    # surface as a hard, non-zero-exit failure with a durable-fallback hint
-    # (bd unavailable here, so the manual hint is the fallback's fallback).
+def test_main_unverified_interrupt_degrades_to_durable_queue(monkeypatch, capsys):
+    # A failed direct verification is not delivery loss once the exact payload
+    # is durably queued.  It must not manufacture a second pull-only bead.
     monkeypatch.setattr(sable_msg, "lookup_pane", lambda role, run=None, socket=None, session=None: "%2")
     monkeypatch.setattr(sable_msg, "deliver_message", lambda *a, **k: False)
-    monkeypatch.setattr(sable_msg, "file_fallback_bead", lambda *a, **k: None)
+    monkeypatch.setattr(sable_msg, "enqueue", lambda *a, **k: "msg-queued")
+    monkeypatch.setattr(sable_msg, "attempt_inbox_wake", lambda *a, **k: (False, "busy"))
+    monkeypatch.setattr(
+        sable_msg,
+        "drain_health",
+        lambda: type("Health", (), {"fresh": False, "reason": "absent"})(),
+    )
+    monkeypatch.setattr(
+        sable_msg,
+        "file_fallback_bead",
+        lambda *a, **k: pytest.fail("a queued payload must not also file a bead"),
+    )
     rc = sable_msg.main(["optimus", "cap in force", "--from", "lincoln", "--interrupt"])
-    assert rc != 0
+    assert rc == 0
     err = capsys.readouterr().err
-    assert "undelivered" in err
-    assert "optimus" in err
-    assert "for-optimus" in err  # durable inbox-bead fallback hint
+    assert "QUEUED-WAKE-DEFERRED" in err
+    assert "msg-queued" in err
 
 
-def test_main_undelivered_auto_files_durable_fallback_bead(monkeypatch, capsys):
-    # SABLE-1umr acceptance: failed verification FILES the durable inbox bead
-    # (not just advice) and reports its id — delivery degrades to the bead
-    # substrate instead of silently degrading to nothing.
+def test_main_default_queue_does_not_auto_file_duplicate_bead(monkeypatch, capsys):
     monkeypatch.setattr(sable_msg, "lookup_pane", lambda role, run=None, socket=None, session=None: "%2")
-    monkeypatch.setattr(sable_msg, "deliver_message", lambda *a, **k: False)
+    monkeypatch.setattr(sable_msg, "enqueue", lambda *a, **k: "msg-queued")
+    monkeypatch.setattr(sable_msg, "attempt_inbox_wake", lambda *a, **k: (False, "busy"))
+    monkeypatch.setattr(
+        sable_msg,
+        "drain_health",
+        lambda: type("Health", (), {"fresh": False, "reason": "absent"})(),
+    )
     calls = []
     monkeypatch.setattr(sable_msg, "file_fallback_bead",
                         lambda frm, to, msg, runner=None: calls.append((frm, to, msg)) or "SABLE-fb42")
     rc = sable_msg.main(["optimus", "cap in force", "--from", "lincoln"])
-    assert rc != 0
-    assert calls and calls[0][0] == "lincoln" and calls[0][1] == "optimus"
+    assert rc == 0
+    assert calls == []
     err = capsys.readouterr().err
-    assert "SABLE-fb42" in err
+    assert "QUEUED-WAKE-DEFERRED" in err
 
 
 def test_main_undelivered_bead_addressed_does_not_auto_file(monkeypatch, capsys):
@@ -557,7 +568,7 @@ def test_main_undelivered_bead_addressed_does_not_auto_file(monkeypatch, capsys)
     monkeypatch.setattr(sable_msg, "file_fallback_bead",
                         lambda *a, **k: pytest.fail("must not auto-file for --bead"))
     rc = sable_msg.main(["market-brief-package-73t4", "hold", "--from", "optimus", "--bead"])
-    assert rc != 0
+    assert rc == 0
 
 
 def test_main_undelivered_queues_without_fallback_only_after_fresh_drain_heartbeat(
@@ -598,7 +609,7 @@ def test_main_undelivered_queues_without_fallback_only_after_fresh_drain_heartbe
 
 
 @pytest.mark.parametrize("health_reason", ["absent", "stale by 2.0s", "invalid JSON"])
-def test_main_undelivered_queues_and_preserves_loud_fallback_until_drainer_is_observed(
+def test_main_queued_payload_never_duplicates_into_bead_when_drainer_is_unverified(
     monkeypatch, capsys, health_reason,
 ):
     monkeypatch.setattr(
@@ -621,12 +632,11 @@ def test_main_undelivered_queues_and_preserves_loud_fallback_until_drainer_is_ob
 
     rc = sable_msg.main(["optimus", "cap in force", "--from", "lincoln"])
 
-    assert rc != 0
-    assert len(filed) == 1
+    assert rc == 0
+    assert filed == []
     err = capsys.readouterr().err
-    assert "QUEUED-BUT-DRAINER-UNVERIFIED" in err
+    assert "QUEUED-WAKE-DEFERRED" in err
     assert health_reason in err
-    assert "SABLE-fallback" in err
 
 
 def test_main_enqueue_failure_is_loud_never_claims_queued_and_keeps_fallback(
@@ -2445,24 +2455,28 @@ def test_main_reports_expired_distinctly_and_exits_nonzero(monkeypatch, capsys):
     assert filed == [], "an expired send must not ALSO file a fallback bead"
 
 
-def test_main_still_reports_undelivered_and_auto_files_when_outcome_undelivered(monkeypatch, capsys):
-    # Regression guard: routing through deliver_with_freshness must not
-    # disturb the pre-existing UNDELIVERED -> fallback-bead behavior.
+def test_main_unverified_interrupt_queues_without_duplicate_fallback(monkeypatch, capsys):
     monkeypatch.setattr(sable_msg, "lookup_pane",
                         lambda role, run=None, socket=None, session=None: "%2")
     monkeypatch.setattr(sable_msg, "deliver_with_freshness",
                         lambda *a, **k: sable_msg.UNDELIVERED)
+    monkeypatch.setattr(sable_msg, "enqueue", lambda *a, **k: "msg-fb99")
+    monkeypatch.setattr(
+        sable_msg,
+        "drain_health",
+        lambda: type("Health", (), {"fresh": False, "reason": "absent"})(),
+    )
     calls = []
     monkeypatch.setattr(sable_msg, "file_fallback_bead",
                         lambda frm, to, msg, runner=None: calls.append((frm, to)) or "SABLE-fb99")
     rc = sable_msg.main(
         ["optimus", "cap in force", "--from", "lincoln", "--interrupt"]
     )
-    assert rc != 0
-    assert calls == [("lincoln", "optimus")]
+    assert rc == 0
+    assert calls == []
     err = capsys.readouterr().err
-    assert "undelivered" in err
-    assert "SABLE-fb99" in err
+    assert "QUEUED-WAKE-DEFERRED" in err
+    assert "msg-fb99" in err
 
 
 if __name__ == "__main__":
