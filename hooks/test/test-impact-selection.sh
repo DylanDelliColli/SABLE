@@ -975,6 +975,7 @@ B4_BROAD_PY_WANT=$(printf '%s\n' \
   bin/test_identifier_decay_integration.py \
   bin/test_merge_report.py \
   bin/test_merge_report_integration.py \
+  bin/test_sable_activation_lib.py \
   bin/test_sable_batch_coordinator_lib.py \
   bin/test_sable_gate_promote_integration.py \
   bin/test_sable_gate_promote_lib_integration.py \
@@ -989,9 +990,9 @@ if [ "$B4_BROAD_RC" -eq 0 ] && printf '%s' "$B4_BROAD" | grep -q 'Python: select
    && printf '%s' "$B4_BROAD" | grep -qi 'declared-broad' \
    && [ "$(b4_python_set "$B4_BROAD")" = "$B4_BROAD_PY_WANT" ] \
    && [ "$(b4_shell_set "$B4_BROAD")" = "$B4_ALLOW_SET" ]; then
-  pass "y4nom.7.1 B4 BROAD: settings.json plans EXACTLY its 13 python consumers + shell EXACTLY == ALLOW (declared-broad)"
+  pass "y4nom.7.1 B4 BROAD: settings.json plans EXACTLY its 14 python consumers + shell EXACTLY == ALLOW (declared-broad)"
 else
-  fail "y4nom.7.1 B4 BROAD: settings.json plans EXACTLY its 13 python consumers + shell EXACTLY == ALLOW (declared-broad)" "py=[$(b4_python_set "$B4_BROAD" | tr '\n' ' ')] shN=$(b4_shell_set "$B4_BROAD" | grep -c .)"
+  fail "y4nom.7.1 B4 BROAD: settings.json plans EXACTLY its 14 python consumers + shell EXACTLY == ALLOW (declared-broad)" "py=[$(b4_python_set "$B4_BROAD" | tr '\n' ' ')] shN=$(b4_shell_set "$B4_BROAD" | grep -c .)"
 fi
 
 B4_DEL=$(b4_plan hooks/multi-manager/removed-by-commit.sh); B4_DEL_RC=$?
