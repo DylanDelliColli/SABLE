@@ -42,6 +42,34 @@ def test_push_state_detached_short_circuits():
     assert rec.classify_push_state(has_origin=False, ahead=0, detached=True) == rec.DETACHED
 
 
+def test_diverged_branch_is_not_classified_ahead():
+    """SABLE-su3j3. The live instance: wk-hotswap-runners measured 22 ahead / 1
+    behind, so a plain push was guaranteed non-fast-forward — yet the tool called
+    it `ahead`, which is the name for "a plain push fast-forwards".
+
+    The whole matrix is re-asserted here, not just the new row. The failure mode
+    this test exists to catch is not "DIVERGED is missing" (that shows up
+    immediately); it is a later simplification that reaches DIVERGED by breaking
+    AHEAD — and a lone diverged assertion cannot tell those apart."""
+    # the new row: commits on BOTH sides -> DIVERGED, never AHEAD
+    assert rec.classify_push_state(has_origin=True, ahead=22, behind=1) == rec.DIVERGED
+    assert rec.classify_push_state(has_origin=True, ahead=1, behind=1) == rec.DIVERGED
+
+    # NEGATIVE CONTROL: origin a strict ancestor is still AHEAD, still pushable
+    assert rec.classify_push_state(has_origin=True, ahead=22, behind=0) == rec.AHEAD
+    assert rec.classify_push_state(has_origin=True, ahead=3) == rec.AHEAD  # behind defaults 0
+
+    # the rest of the pre-existing matrix is unchanged
+    assert rec.classify_push_state(has_origin=True, ahead=0, behind=0) == rec.PUSHED
+    assert rec.classify_push_state(has_origin=False, ahead=0, behind=0) == rec.UNPUSHED
+    assert rec.classify_push_state(has_origin=False, ahead=5, behind=5) == rec.UNPUSHED
+    assert rec.classify_push_state(has_origin=True, ahead=9, behind=9,
+                                   detached=True) == rec.DETACHED
+
+    # strictly behind: nothing to push, so not a push candidate
+    assert rec.classify_push_state(has_origin=True, ahead=0, behind=4) == rec.PUSHED
+
+
 # --- owning-bead resolution --------------------------------------------------
 
 def test_owning_bead_pane_tag_wins():
@@ -225,9 +253,10 @@ def test_unreachable_named_socket_is_a_loud_mode_not_an_empty_live_fleet(monkeyp
 
 # --- full report assembly + ordered plan -------------------------------------
 
-def _wt(path, branch, dirty=False, has_origin=False, ahead=0, detached=False):
+def _wt(path, branch, dirty=False, has_origin=False, ahead=0, behind=0, detached=False):
     return {"path": path, "branch": branch, "dirty": dirty,
-            "has_origin": has_origin, "ahead": ahead, "detached": detached}
+            "has_origin": has_origin, "ahead": ahead, "behind": behind,
+            "detached": detached}
 
 
 def test_build_report_classifies_three_canonical_states():
@@ -382,6 +411,165 @@ def test_dirty_worktree_is_review_not_push():
     worktrees = [_wt("/wt/d", "wk-d", dirty=True, has_origin=False, ahead=0)]
     report = rec.build_report(worktrees, [], [], [], [])
     assert [s["action"] for s in report["plan"]] == ["review"]
+
+
+# --- SABLE-su3j3: a DIVERGED branch is never a push step ---------------------
+
+def test_diverged_branch_never_becomes_a_push_step():
+    """The hazard is the PLAN TEXT, not the push. A rejected push fails loudly;
+    a plan line that says "push this" is what sends an operator to
+    --force-with-lease on published history. So the assertion is about what the
+    plan says, and it must also say the counts — a review step that reports
+    divergence without reporting how far apart the sides are just sends the
+    reader back to the shell."""
+    worktrees = [
+        _wt("/wt/div", "wk-div", has_origin=True, ahead=22, behind=1),
+        # NEGATIVE CONTROL in the same fixture: strict-ancestor origin.
+        # Without this row, "never emit a push step" passes trivially.
+        _wt("/wt/ahead", "wk-ahead", has_origin=True, ahead=3, behind=0),
+    ]
+    report = rec.build_report(worktrees, [], [], [], [])
+
+    assert report["worktrees"][0]["push_state"] == rec.DIVERGED
+    assert report["worktrees"][1]["push_state"] == rec.AHEAD
+
+    div_steps = [s for s in report["plan"] if s["target"] == "wk-div"]
+    assert [s["action"] for s in div_steps] == ["review"]
+    detail = div_steps[0]["detail"]
+    assert "22" in detail and "1" in detail          # both counts stated
+    assert "REJECTED" in detail                       # says what a push would do
+    assert "force-with-lease" in detail               # names the trap explicitly
+
+    ahead_steps = [s for s in report["plan"] if s["target"] == "wk-ahead"]
+    assert [s["action"] for s in ahead_steps] == ["push"]
+
+
+def test_apply_fix_refuses_a_diverged_branch_even_if_a_push_step_reaches_it():
+    """Defence in depth at the line that actually mutates origin. The plan no
+    longer produces this step; the guard is for the edit that reintroduces it."""
+    row = {"path": "/wt/div", "branch": "wk-div", "push_state": rec.DIVERGED,
+           "dirty": False, "frozen": False}
+    report = {"worktrees": [row],
+              "plan": [{"order": 1, "action": "push", "target": "wk-div", "detail": "x"}]}
+    ok, failed, refused = rec.apply_fix(report)
+    assert (ok, failed, refused) == ([], [], ["wk-div"])
+
+
+# --- SABLE-xgb29: a FROZEN branch is never a push or merge step --------------
+
+def test_frozen_branch_is_excluded_from_push_steps():
+    frozen, warnings = rec.parse_frozen_branches(
+        "wk-frozen  SABLE-wvxb4  do-not-merge, never force-push\n")
+    assert warnings == []
+
+    worktrees = [
+        # frozen AND a perfectly ordinary push candidate — clean, unpushed.
+        # Freeze has to outrank the git state, not merely agree with it.
+        _wt("/wt/frozen", "wk-frozen", has_origin=False, ahead=0),
+        # NEGATIVE CONTROL: an identical non-frozen sibling still gets its push.
+        _wt("/wt/free", "wk-free", has_origin=False, ahead=0),
+    ]
+    report = rec.build_report(worktrees, [], [],
+                              ["origin/wk-frozen", "origin/wk-free"], [],
+                              frozen=frozen)
+
+    assert [s["target"] for s in report["plan"] if s["action"] == "push"] == ["wk-free"]
+    # not quietly downgraded to a review either — a frozen branch is not a to-do
+    assert [s for s in report["plan"] if s["target"] == "wk-frozen"] == []
+
+    # visible, and citing the ruling bead
+    section = {f["branch"]: f for f in report["frozen_branches"]}
+    assert section["wk-frozen"]["bead"] == "SABLE-wvxb4"
+    assert "do-not-merge" in section["wk-frozen"]["reason"]
+    assert report["worktrees"][0]["frozen"] is True
+    assert report["worktrees"][1]["frozen"] is False
+
+
+def test_frozen_branch_is_withheld_from_chucks_merge_list():
+    """A branch excluded from the push plan but still queued for a merge has
+    only moved the hazard one line down — the live ruling is do-not-MERGE."""
+    frozen, _ = rec.parse_frozen_branches("wk-frozen SABLE-wvxb4 do-not-merge\n")
+    report = rec.build_report([], [], [],
+                              ["origin/wk-frozen", "origin/wk-free"], [],
+                              frozen=frozen)
+    assert report["unmerged_branches"] == ["origin/wk-free"]
+    merge_steps = [s for s in report["plan"] if s["action"] == "merge"]
+    assert merge_steps and "wk-frozen" not in merge_steps[0]["detail"]
+    # withheld, not vanished
+    section = {f["branch"]: f for f in report["frozen_branches"]}
+    assert section["wk-frozen"]["held_from_merge_list"] is True
+
+
+def test_frozen_section_reports_a_freeze_whose_branch_this_sweep_never_saw():
+    """The ruling outlives the branch. If the section were built from worktree
+    rows it would go silent exactly when the branch stops being visible
+    elsewhere, and the freeze would decay back into human memory."""
+    frozen, _ = rec.parse_frozen_branches("wk-reaped SABLE-wvxb4 retires unmerged\n")
+    report = rec.build_report([], [], [], [], [], frozen=frozen)
+    entry = report["frozen_branches"][0]
+    assert entry["branch"] == "wk-reaped"
+    assert entry["seen"] is False
+    assert entry["worktree"] is None
+
+
+def test_frozen_list_parse_tolerates_absent_and_malformed_file(tmp_path):
+    """*** THE FAIL DIRECTION HERE IS THE OPPOSITE OF EVERY OTHER TEST IN THIS
+    FILE. *** Elsewhere the tool must refuse to recommend. Here it must refuse to
+    RELEASE: an absent or damaged freeze list is not the fact "nothing is
+    frozen", and the two must never render identically."""
+    # absent -> empty set, no exception, but a LOUD warning
+    frozen, warnings = rec.load_frozen_branches(str(tmp_path / "nope.txt"))
+    assert frozen == {}
+    assert len(warnings) == 1
+    assert "NOT FOUND" in warnings[0]
+    assert "nope.txt" in warnings[0]          # names the path it looked at
+
+    # blank lines and comments are ignored SILENTLY — they are not damage
+    path = tmp_path / "frozen.txt"
+    path.write_text(
+        "# a comment\n"
+        "\n"
+        "   \n"
+        "   # an indented comment\n"
+        "wk-good  SABLE-aaaa  a stated reason\n"
+    )
+    frozen, warnings = rec.load_frozen_branches(str(path))
+    assert list(frozen) == ["wk-good"]
+    assert frozen["wk-good"] == {"bead": "SABLE-aaaa", "reason": "a stated reason"}
+    assert warnings == []
+
+    # malformed (no ruling bead) -> STILL FROZEN, and warned about. Dropping the
+    # line would release a branch a human deliberately wrote down.
+    path.write_text("wk-nobead\nwk-good SABLE-aaaa fine\n")
+    frozen, warnings = rec.load_frozen_branches(str(path))
+    assert set(frozen) == {"wk-nobead", "wk-good"}
+    assert frozen["wk-nobead"]["bead"] is None
+    assert len(warnings) == 1
+    assert "wk-nobead" in warnings[0]
+
+    # and the malformed entry still suppresses the push step
+    report = rec.build_report([_wt("/wt/n", "wk-nobead")], [], [], [], [],
+                              frozen=frozen)
+    assert [s for s in report["plan"] if s["action"] == "push"] == []
+
+
+def test_warnings_reach_the_report_and_the_rendered_text():
+    """A warning nothing surfaces is the silence it was written to prevent."""
+    report = rec.build_report([], [], [], [], [], frozen={},
+                              warnings=["FROZEN-BRANCH LIST NOT FOUND at /x"])
+    assert report["warnings"] == ["FROZEN-BRANCH LIST NOT FOUND at /x"]
+    out = rec.render_text(report)
+    assert "WARNINGS" in out
+    assert "NOT FOUND" in out
+
+
+def test_apply_fix_refuses_a_frozen_branch_even_if_a_push_step_reaches_it():
+    row = {"path": "/wt/f", "branch": "wk-frozen", "push_state": rec.UNPUSHED,
+           "dirty": False, "frozen": True}
+    report = {"worktrees": [row],
+              "plan": [{"order": 1, "action": "push", "target": "wk-frozen", "detail": "x"}]}
+    ok, failed, refused = rec.apply_fix(report)
+    assert (ok, failed, refused) == ([], [], ["wk-frozen"])
 
 
 if __name__ == "__main__":
