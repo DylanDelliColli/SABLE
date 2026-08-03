@@ -29,12 +29,13 @@ retains the verified idle-wait + submit-retry transport for safety-critical
 sends. If the override is not verified, its payload joins the same durable
 queue.
 
-A verified immediate count-only wake is a successful queued delivery state.
-Otherwise a fresh host-drainer heartbeat makes the durable queue successful.
-Until a complete drain sweep is actually observed, the existing for-<role>
-fallback remains loud and the send remains non-zero — source landing alone
-never silently retires the backstop (SABLE-m4kyf.5/albyd). If the queue itself
-fails, the fallback remains loud as well. Set
+A successful atomic enqueue is the durable delivery state. A verified immediate
+count-only wake or fresh host-drainer heartbeat proves prompt surfacing; when
+neither is available, the queued message remains successful but reports
+QUEUED-WAKE-DEFERRED so the latency is visible. It is never copied into a
+for-<role> bead: that second pull-only record was duplicate noise for messages
+already preserved in the queue (SABLE-ijd7j). If the queue itself fails, the
+for-<role> fallback remains loud. Set
 SABLE_MSG_AUTO_FALLBACK=0 to disable auto-filing; bead-addressed worker sends
 never auto-file because their dispatching manager sees the failure live.
 
@@ -676,7 +677,7 @@ def fallback_bead_labels(to_role: str) -> str:
 
 
 def file_fallback_bead(frm: str, to_role: str, message: str, runner=None) -> str | None:
-    """File the durable for-<role> bead while automatic draining is unproven.
+    """File the durable for-<role> bead when queue publication failed.
 
     Returns the new bead id, or None when bd is
     unavailable/errored (the caller then prints the manual hint instead).
@@ -688,14 +689,14 @@ def file_fallback_bead(frm: str, to_role: str, message: str, runner=None) -> str
     `bd ready`, and one measured pool held 26 items of which 11 were these —
     roughly doubling the apparent queue and pushing the real work down it. The
     recipient still finds them by the for-<role> label, which is how the inbox
-    is read anyway. Keep filing them whenever automatic queue draining is not
-    proven by a fresh heartbeat: this fallback is what makes an unverified
-    delivery lossless. Once a live drainer is observed, the durable file queue
-    carries that responsibility without manufacturing tracker work."""
+    is read anyway. A successfully queued payload must never call this helper:
+    the file queue already carries the exact content, and duplicating it into
+    beads recreates the write-only/noise channel this fallback was meant to
+    prevent (SABLE-ijd7j)."""
     runner = runner or (lambda args: subprocess.run(args, capture_output=True, text=True))
     title = fallback_bead_title(to_role, message)
-    desc = (f"Auto-filed by sable-msg while automatic queue draining was not "
-            f"verified (SABLE-1umr). "
+    desc = (f"Auto-filed by sable-msg because durable queue publication failed "
+            f"(SABLE-ijd7j/SABLE-1umr). "
             f"Deliver this message to {to_role} and act on it: {message} "
             f"[no-test] coordination inbox bead, no code change.")
     try:
@@ -718,7 +719,7 @@ def _loud_fallback_suffix(
     *,
     bead_addressed: bool,
 ) -> str:
-    """Preserve the existing durable backstop until live draining is proven."""
+    """Create the last-resort bead used only when queue publication failed."""
 
     bead_id = None
     if not bead_addressed and os.environ.get("SABLE_MSG_AUTO_FALLBACK", "1") != "0":
@@ -877,19 +878,14 @@ def queue_payload(
         )
         return 0
 
-    fallback = _loud_fallback_suffix(
-        sender,
-        recipient,
-        fallback_message,
-        bead_addressed=bead_addressed,
-    )
     sys.stderr.write(
-        f"sable-msg: QUEUED-BUT-DRAINER-UNVERIFIED {sender} -> {recipient} "
+        f"sable-msg: QUEUED-WAKE-DEFERRED {sender} -> {recipient} "
         f"({pane}); {direct_detail}inbox message {message_id} is durable, but automatic "
         f"draining is not currently proven ({health.reason}; immediate wake: "
-        f"{wake_reason}). {fallback}\n"
+        f"{wake_reason}). The host watcher or the recipient's next inbox read will "
+        "surface this exact queued payload; no duplicate tracker bead was filed.\n"
     )
-    return 1
+    return 0
 
 
 # --------------------------------------------------------------------------
