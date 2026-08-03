@@ -238,6 +238,49 @@ def test_live_then_fresh_idle_capture_routes_poke_through_shared_delivery():
     ]
 
 
+def test_live_claude_ghost_only_composer_is_poked_once():
+    calls = []
+    deliveries = []
+    ghost = "completed turn\n\x1b[1m❯\x1b[0m \x1b[2mcheck the summary\x1b[0m\n"
+
+    def run(command):
+        calls.append(command)
+        if "list-panes" in command:
+            return completed(command, stdout=registry(("%8", "optimus", "")))
+        if command[0] == "status-probe":
+            return completed(
+                command,
+                stdout=process_report("%8", watcher.PROCESS_LIVE),
+                returncode=0,
+            )
+        if "capture-pane" in command:
+            return completed(command, stdout=ghost)
+        raise AssertionError(f"watcher must not send directly: {command}")
+
+    def deliver(base, pane, text, snippet, **kwargs):
+        deliveries.append((base, pane, text, snippet, kwargs["provider"]))
+        return True
+
+    result = watcher.wake_once(
+        "optimus",
+        "%8",
+        "claude",
+        run=run,
+        pending_fn=lambda _recipient: [object()],
+        delivery_fn=deliver,
+        status_command="status-probe",
+        socket="scratch",
+        session="scratch",
+    )
+
+    assert result == watcher.WakeResult(1, watcher.poke_text(1))
+    assert len(deliveries) == 1
+    assert calls[-1] == [
+        "tmux", "-L", "scratch", "capture-pane", "-p", "-J", "-e",
+        "-t", "%8",
+    ]
+
+
 def test_shared_delivery_failure_is_loud():
     def run(command):
         if "list-panes" in command:

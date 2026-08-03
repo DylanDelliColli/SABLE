@@ -42,10 +42,10 @@ out1="$(SABLE_PROJECT_DIR="$P" bash "$INSTALLER" --project --merge-settings 2>&1
 CODEX_SCOPE_NOTICE="Codex lifecycle hooks are user-scoped and were not installed. Re-run: sable-orchestration-install --user --merge-settings"
 exists "$P/.claude/skills/sable-plan/SKILL.md"    "project: /plan skill installed"
 exists "$P/.claude/skills/sable-execute/SKILL.md" "project: /execute skill installed"
-exists "$P/.claude/sable/roles/lincoln.md"  "project: lincoln role installed"
-exists "$P/.claude/sable/roles/optimus.md"  "project: optimus pane role installed (tmux-native)"
-exists "$P/.claude/sable/roles/tarzan.md"   "project: tarzan pane role installed (tmux-native)"
-exists "$P/.claude/sable/roles/chuck.md"    "project: chuck pane role installed (tmux-native)"
+for role_template in "$REPO"/templates/multi-manager/roles/*.md; do
+  role="$(basename "$role_template" .md)"
+  exists "$P/.claude/sable/roles/$role.md" "project: $role role installed"
+done
 if [ ! -e "$P/.claude/agents-teams" ]; then pass "project: agents-teams defs NOT installed (tmux-only)"; else fail "project: agents-teams defs NOT installed (tmux-only)" "unexpected $P/.claude/agents-teams/"; fi
 if printf '%s' "$out1" | grep -q "sable-tmux"; then pass "project: install output points at the sable-tmux bring-up"; else fail "project: install output points at the sable-tmux bring-up" "no sable-tmux mention"; fi
 if printf '%s' "$out1" | grep -qF "$CODEX_SCOPE_NOTICE"; then pass "project: output explains Codex hooks require --user"; else fail "project: output explains Codex hooks require --user" "output=$out1"; fi
@@ -376,7 +376,13 @@ project_uninstall_out="$(SABLE_PROJECT_DIR="$P" bash "$INSTALLER" --project --un
 if printf '%s' "$project_uninstall_out" | grep -qi "Codex"; then fail "project uninstall: output says nothing about Codex" "output=$project_uninstall_out"; else pass "project uninstall: output says nothing about Codex"; fi
 if [ ! -e "$P/.claude/skills/sable-plan/SKILL.md" ]; then pass "uninstall removes skills"; else fail "uninstall removes skills"; fi
 if [ ! -e "$P/.claude/sable/agents.yaml" ]; then pass "uninstall removes registry"; else fail "uninstall removes registry"; fi
-if [ ! -e "$P/.claude/sable/roles/optimus.md" ] && [ ! -e "$P/.claude/sable/roles/chuck.md" ]; then pass "uninstall removes tmux-native pane roles"; else fail "uninstall removes tmux-native pane roles"; fi
+if [ ! -e "$P/.claude/sable/roles/optimus.md" ] \
+   && [ ! -e "$P/.claude/sable/roles/chuck.md" ] \
+   && [ ! -e "$P/.claude/sable/roles/victor.md" ]; then
+  pass "uninstall removes derived role-card set"
+else
+  fail "uninstall removes derived role-card set"
+fi
 if [ ! -e "$P/.claude/agents-teams" ]; then pass "uninstall cleans up legacy agents-teams defs"; else fail "uninstall cleans up legacy agents-teams defs"; fi
 if [ ! -e "$P/.claude/sable/reconcile-timer" ]; then pass "uninstall removes staged reconcile-timer artifacts"; else fail "uninstall removes staged reconcile-timer artifacts"; fi
 if [ ! -e "$P/.claude/sable/inbox-timer" ]; then pass "uninstall removes staged inbox-timer artifacts"; else fail "uninstall removes staged inbox-timer artifacts"; fi
