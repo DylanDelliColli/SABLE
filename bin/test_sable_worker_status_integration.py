@@ -19,6 +19,8 @@ import pytest
 BIN = Path(__file__).resolve().parent / "sable-worker-status"
 VIEW_BIN = Path(__file__).resolve().parent / "sable-view"
 HAVE_TMUX = shutil.which("tmux") is not None
+BD_BIN = shutil.which("bd")
+HAVE_BD = BD_BIN is not None
 pytestmark = pytest.mark.skipif(not HAVE_TMUX, reason="tmux not installed")
 
 # SABLE-517s: a tmux session's panes inherit the tmux SERVER's global
@@ -92,7 +94,19 @@ def _wait_until(predicate, *, timeout=3.0, interval=0.02, description="condition
 
 
 @pytest.fixture()
-def sock(monkeypatch):
+def sock(monkeypatch, tmp_path):
+    # Ordinary pane fixtures must not inherit the developer checkout's dirty
+    # CWD: the production reap guard correctly treats that as uncommitted work.
+    # Give them a real clean repo; dedicated worktree tests below override cwd.
+    clean_repo = tmp_path / "clean-pane-repo"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(clean_repo)], check=True)
+    subprocess.run(["git", "-C", str(clean_repo), "config", "user.email",
+                    "worker-status@sable.invalid"], check=True)
+    subprocess.run(["git", "-C", str(clean_repo), "config", "user.name",
+                    "SABLE Worker Status Test"], check=True)
+    subprocess.run(["git", "-C", str(clean_repo), "commit", "-q", "--allow-empty",
+                    "-m", "clean fixture"], check=True)
+    monkeypatch.chdir(clean_repo)
     socket_root = Path(tempfile.mkdtemp(prefix="sable-ws-tmux-"))
     monkeypatch.setenv("TMUX_TMPDIR", str(socket_root))
     experiment = os.environ.get("SABLE_TEST_CONTENTION_EXPERIMENT")
@@ -402,7 +416,7 @@ def test_reap_scoped_to_caller_repo(sock, tmp_path):
         subprocess.run(["git", "init", "-q", str(repo)], check=True)
         sess = f"sable-{name}"
         _tmux(sock, "new-session", "-d", "-s", sess, "-x", "180", "-y", "40",
-              "bash --noprofile --norc")
+              "-c", str(repo), "bash --noprofile --norc")
         _tmux(sock, "set-option", "-t", sess, "@sable_repo", str(repo.resolve()))
         _tag(sock, f"{sess}:0.0", "worker", f"bead-{name}", "done")
         sessions[name] = (repo, sess)
@@ -1109,6 +1123,91 @@ def test_json_output_carries_scope_metadata(sock):
     assert payload_all["scope"]["lane"] is None
     assert payload_all["scope"]["shown"] == 3
     assert payload_all["scope"]["hidden"] == 0
+
+
+def test_real_dirty_worktree_blocks_reap(sock, tmp_path):
+    """A real linked worktree with real uncommitted bytes survives real reap."""
+    primary = tmp_path / "repo"
+    dirty = tmp_path / "wk-dirty"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(primary)], check=True)
+    subprocess.run(["git", "-C", str(primary), "config", "user.email",
+                    "worker-status@sable.invalid"], check=True)
+    subprocess.run(["git", "-C", str(primary), "config", "user.name",
+                    "SABLE Worker Status Test"], check=True)
+    tracked = primary / "tracked.txt"
+    tracked.write_text("base\n")
+    subprocess.run(["git", "-C", str(primary), "add", "tracked.txt"], check=True)
+    subprocess.run(["git", "-C", str(primary), "commit", "-q", "-m", "base"], check=True)
+    subprocess.run(["git", "-C", str(primary), "worktree", "add", "-q", "-b",
+                    "wk-dirty", str(dirty), "main"], check=True)
+    (dirty / "tracked.txt").write_text("uncommitted critical work\n")
+
+    _tmux(sock, "new-session", "-d", "-s", "w", "-n", "worker-dirty",
+          "-c", str(dirty), "bash --noprofile --norc")
+    pane = _tmux(sock, "list-panes", "-t", "w", "-F", "#{pane_id}").stdout.strip()
+    _tag(sock, pane, "worker", "SABLE-dirty", "done")
+
+    env = {**os.environ, "SABLE_TMUX_SOCKET": sock,
+           "SABLE_TMUX_SESSION": "w", "SABLE_STATUS_SAMPLE_INTERVAL": "0",
+           "CLAUDE_AGENT_NAME": ""}
+    result = subprocess.run(["python3", str(BIN), "--all", "--reap"],
+                            cwd=primary, env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert str(dirty) in result.stdout + result.stderr
+    assert "tracked.txt" in result.stdout + result.stderr
+    assert "NOT reaping" in result.stderr
+    survivors = _tmux(sock, "list-panes", "-t", "w", "-F", "#{pane_id}").stdout
+    assert pane in survivors
+    assert (dirty / "tracked.txt").read_text() == "uncommitted critical work\n"
+
+
+@pytest.mark.skipif(not HAVE_BD, reason="bd not installed")
+def test_real_bundle_reports_work_count_not_pane_count(sock, tmp_path):
+    """Real tmux + real isolated bd: three claimed beads occupy one pane."""
+    primary = tmp_path / "bundle-repo"
+    worktree = tmp_path / "wk-bundle"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(primary)], check=True)
+    subprocess.run(["git", "-C", str(primary), "config", "user.email",
+                    "worker-status@sable.invalid"], check=True)
+    subprocess.run(["git", "-C", str(primary), "config", "user.name",
+                    "SABLE Worker Status Test"], check=True)
+    (primary / "tracked.txt").write_text("base\n")
+    subprocess.run(["git", "-C", str(primary), "add", "tracked.txt"], check=True)
+    subprocess.run(["git", "-C", str(primary), "commit", "-q", "-m", "base"], check=True)
+    subprocess.run(["git", "-C", str(primary), "worktree", "add", "-q", "-b",
+                    "wk-bundle", str(worktree), "main"], check=True)
+    init = subprocess.run([BD_BIN, "init", "--prefix", "WSTAT"], cwd=primary,
+                          capture_output=True, text=True)
+    if init.returncode != 0:
+        pytest.skip(f"could not initialize isolated bd store: {init.stderr[-300:]}")
+
+    bead_ids = []
+    for n in range(3):
+        created = subprocess.run(
+            [BD_BIN, "create", "--silent", "--title", f"bundle member {n}",
+             "--description", "integration fixture", "--type", "task"],
+            cwd=primary, capture_output=True, text=True, check=True)
+        bead = created.stdout.strip()
+        bead_ids.append(bead)
+        subprocess.run([BD_BIN, "update", bead, "--claim", "--set-metadata",
+                        "branch=wk-bundle"], cwd=primary, check=True,
+                       stdout=subprocess.DEVNULL)
+
+    _tmux(sock, "new-session", "-d", "-s", "w", "-n", "worker-bundle",
+          "-c", str(worktree), "bash --noprofile --norc")
+    pane = _tmux(sock, "list-panes", "-t", "w", "-F", "#{pane_id}").stdout.strip()
+    _tag(sock, pane, "worker", bead_ids[0], "running")
+    real_bd_path = f"{Path(BD_BIN).parent}:{os.environ.get('PATH', '')}"
+    env = {**os.environ, "PATH": real_bd_path, "SABLE_TMUX_SOCKET": sock,
+           "SABLE_TMUX_SESSION": "w", "SABLE_STATUS_SAMPLE_INTERVAL": "0",
+           "CLAUDE_AGENT_NAME": ""}
+    result = subprocess.run(["python3", str(BIN), "--all", "--json"],
+                            cwd=primary, env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["running"] == {"panes": 1, "beads": 3}
+    assert payload["workers"][0]["beads"] == [bead_ids[0], *sorted(bead_ids[1:])]
+    assert payload["stranded_in_progress"] == []
 
 
 if __name__ == "__main__":
