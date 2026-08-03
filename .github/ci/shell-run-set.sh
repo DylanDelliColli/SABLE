@@ -247,7 +247,6 @@ declare -A DECLARED_BROAD=(
 )
 
 PY_OWNED=(
-  bin/sable-corruption-sweep
   bin/sable-identifier-decay
   bin/sable-merge-report
   bin/sable_activation_debt_lib.py
