@@ -1592,7 +1592,8 @@ def resolve_refresh_base(worktree: str, base_branch: str | None) -> str:
     return resolve_base_ref(worktree, base_branch or default_base)
 
 
-def refresh_worktree(worktree: str, base_branch: str | None) -> str | None:
+def refresh_worktree(worktree: str, base_branch: str | None,
+                     replay_notices: list[str] | None = None) -> str | None:
     """Re-homed pre-dispatch-refresh (SABLE-bldh.8) — lowest priority per the
     bead: only relevant when REUSING an existing worktree via --worktree, since
     a freshly `bd worktree create`d tree is already at the base HEAD, and the
@@ -1629,6 +1630,11 @@ def refresh_worktree(worktree: str, base_branch: str | None) -> str | None:
                 "git-common-dir), not a linked worktree; standing down (no "
                 "fetch/rebase) to avoid the shared-tree rebase race (o45j).")
 
+    before = subprocess.run(
+        ["git", "-C", worktree, "rev-parse", "HEAD"],
+        capture_output=True, text=True)
+    before_sha = before.stdout.strip() if before.returncode == 0 else ""
+
     fetch = subprocess.run(["git", "-C", worktree, "fetch", "origin"],
                            capture_output=True, text=True)
     if fetch.returncode != 0:
@@ -1643,6 +1649,20 @@ def refresh_worktree(worktree: str, base_branch: str | None) -> str | None:
                        capture_output=True, text=True)
         return (f"refresh: rebase of {worktree} on {base} failed and was aborted: "
                 f"{(rebase.stdout + rebase.stderr).strip()[:300]}")
+    after = subprocess.run(
+        ["git", "-C", worktree, "rev-parse", "HEAD"],
+        capture_output=True, text=True)
+    after_sha = after.stdout.strip() if after.returncode == 0 else ""
+    base_tip = subprocess.run(
+        ["git", "-C", worktree, "rev-parse", base],
+        capture_output=True, text=True)
+    base_sha = base_tip.stdout.strip() if base_tip.returncode == 0 else ""
+    if (replay_notices is not None and before_sha and after_sha
+            and before_sha != after_sha):
+        base_identity = f"{base} ({base_sha})" if base_sha else base
+        replay_notices.append(
+            "this worktree was refreshed at spawn: "
+            f"{before_sha} replayed onto {base_identity} as {after_sha}")
     return None
 
 
@@ -2149,12 +2169,44 @@ spine — the rebase meant to guarantee that did not complete.
 """
 
 
+def render_refresh_notice_section(refresh_notice: str) -> str:
+    """Announce a successful spawn-time rebase only when it changed HEAD.
+
+    A revise brief may correctly cite the old branch tip as the implementation
+    to preserve.  The refresh happens after that brief was assembled, so the
+    worker needs the old and replacement object identities in its own prompt
+    to reconcile the instruction without attempting destructive recovery.
+    """
+    if not refresh_notice:
+        return ""
+    return f"""
+## WORKTREE REFRESHED AT SPAWN (SABLE-9u86l)
+{refresh_notice}
+
+If the bead or revise brief cites the pre-refresh SHA, preserve the replayed
+commit at the post-refresh SHA. Do not cherry-pick or reset to the old lineage.
+"""
+
+
+def render_worker_inbox_check(worker_label: str) -> str:
+    """End every dispatch with the durable fallback's actual read path."""
+    return f"""
+## Durable correction inbox — check before closing any bead (SABLE-5w5bj)
+Run `bd list --label for-{worker_label}` immediately before closing. Read and
+act on every correction addressed there. Corrections should be routed through
+a claim or an update to a bead you already hold whenever possible; a message
+that merely hopes to land is not a durable assignment channel.
+"""
+
+
 def assemble_dispatch_prompt(bead_id, title, description, worktree, branch, model,
                              bundle: list[dict] | None = None,
                              notes: str = "",
                              comments: list[dict] | None = None,
                              refresh_warning: str = "",
-                             dirty_paths: list[str] | None = None) -> str:
+                             dirty_paths: list[str] | None = None,
+                             refresh_notice: str = "",
+                             worker_label: str = "") -> str:
     """`bundle` (SABLE-q13h), when non-empty, is a list of {id, title,
     description, notes, comments} dicts for sibling beads dispatched alongside
     `bead_id` in the SAME worktree/branch. Every bundled bead's FULL
@@ -2172,6 +2224,7 @@ def assemble_dispatch_prompt(bead_id, title, description, worktree, branch, mode
     was ever rendered into the dispatch prompt at all — reachable only by a
     worker choosing to run `bd show`/`bd comments` unprompted."""
     bundle = bundle or []
+    worker_label = worker_label or bead_id
     all_ids = [bead_id] + [b["id"] for b in bundle]
 
     bundled_sections = "".join(
@@ -2228,6 +2281,7 @@ Worktree: {worktree}
 Branch: {branch}
 Worker model: {model}
 {render_refresh_warning_section(refresh_warning, dirty_paths)}
+{render_refresh_notice_section(refresh_notice)}
 ## Bead
 {bead_id}: {title}
 
@@ -2289,6 +2343,7 @@ them the same form:
   (`echo $TMUX_PANE`), then target it explicitly — do NOT omit `-t`, or the
   flag lands on whichever pane has operator focus instead of your own:
   `tmux set-option -p -t "$TMUX_PANE" @sable_status done`.
+{render_worker_inbox_check(worker_label)}
 """
 
 
@@ -2683,6 +2738,7 @@ def main(argv: list[str] | None = None) -> int:
     # (a `bd worktree create`d tree is already at base HEAD, nothing to warn
     # about) and for a --skip-governance spawn that never calls refresh_worktree.
     refresh_warning = None
+    refresh_notices: list[str] = []
     dirty_paths: list[str] = []
     if ns.worktree:
         worktree = ns.worktree
@@ -2704,7 +2760,7 @@ def main(argv: list[str] | None = None) -> int:
             # resolves the per-repo integration base itself (SABLE-ybdm); an
             # explicit env value still wins inside resolve_refresh_base.
             refresh_warning = refresh_worktree(
-                worktree, os.environ.get("SABLE_BASE_BRANCH"))
+                worktree, os.environ.get("SABLE_BASE_BRANCH"), refresh_notices)
             if refresh_warning:
                 sys.stderr.write(f"sable-spawn-worker: {refresh_warning}\n")
                 # SABLE-zv0h6: the failed refresh is reported to stderr above
@@ -2765,7 +2821,9 @@ def main(argv: list[str] | None = None) -> int:
         notes=bead.get("notes", ""),
         comments=fetch_bead_comments(bid),
         refresh_warning=refresh_warning or "",
-        dirty_paths=dirty_paths))
+        dirty_paths=dirty_paths,
+        refresh_notice=refresh_notices[0] if refresh_notices else "",
+        worker_label=lane or bid))
 
     # --- open the worker window (stamped with the lane identity) + capture pane ---
     # SABLE-5v9n: set remain-on-exit GLOBALLY, BEFORE the window is created,
