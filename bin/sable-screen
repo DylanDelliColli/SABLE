@@ -210,6 +210,7 @@ last of a repeated --status and drops the rest silently (SABLE-4t97d).
 
 Usage:
   sable-screen dispatch <bead-id> [<bead-id> ...] [--repo DIR] [--format text|json]
+  sable-screen occupants [--exclude <bead-id> ...] [--repo DIR] [--format text|json]
   sable-screen holds [--repo DIR] [--format text|json]
   sable-screen activation [<bead-id> ...] [--ready] [--install-root DIR]...
                           [--repo DIR] [--format text|json]
@@ -1526,6 +1527,13 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--repo", default=os.getcwd())
     d.add_argument("--format", choices=["text", "json"], default="text")
 
+    o = sub.add_parser(
+        "occupants",
+        help="shared live-occupancy census for dispatch consumers")
+    o.add_argument("--exclude", nargs="*", default=[], metavar="BEAD-ID")
+    o.add_argument("--repo", default=os.getcwd())
+    o.add_argument("--format", choices=["text", "json"], default="text")
+
     h = sub.add_parser("holds", help="pre-close hold sweep")
     h.add_argument("--repo", default=os.getcwd())
     h.add_argument("--format", choices=["text", "json"], default="text")
@@ -1548,6 +1556,21 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list | None = None) -> int:
     args = build_parser().parse_args(argv)
     repo = os.path.abspath(args.repo)
+
+    if args.cmd == "occupants":
+        integration_branch = git_lib.resolve_integration_branch(repo)
+        integration_ref = f"origin/{integration_branch}"
+        occupants = build_occupants(repo, integration_ref, set(args.exclude))
+        serializable = {label: sorted(paths)
+                        for label, paths in sorted(occupants.items())}
+        if args.format == "json":
+            print(json.dumps({"integration_ref": integration_ref,
+                              "occupants": serializable}, indent=2))
+        else:
+            print(f"integration ref: {integration_ref}")
+            for label, paths in serializable.items():
+                print(f"{label}: {', '.join(paths)}")
+        return 0
 
     if args.cmd == "activation":
         if not args.bead_ids and not args.ready:
