@@ -159,6 +159,88 @@ def _refs_snapshot(repo: Path) -> set[str]:
     return set(r.stdout.split())
 
 
+WORKTREE_SCRATCH_BASE_ENV = "SABLE_TEST_WORKTREE_SCRATCH_BASE"
+
+
+def _worktree_scratch_base() -> Path:
+    """Configurable writable base for tests that create sibling worktrees."""
+    configured = os.environ.get(WORKTREE_SCRATCH_BASE_ENV)
+    if configured:
+        return Path(configured).expanduser()
+    return Path(os.environ.get("TMPDIR") or tempfile.gettempdir()).expanduser()
+
+
+def _make_worktree_scratch_root() -> Path:
+    """Create a per-test root, naming the environment defect on denial."""
+    base = _worktree_scratch_base()
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+        return Path(tempfile.mkdtemp(prefix="sable-spawn-worktrees-", dir=base))
+    except OSError as exc:
+        raise RuntimeError(
+            f"spawn-worker integration scratch base is not writable: {base}: {exc}"
+        ) from exc
+
+
+@pytest.fixture()
+def scratch_repo_binding():
+    """Bind the real repo below /tmp so its derived siblings are writable.
+
+    The production path rule deliberately derives a new worktree beside the
+    repository root. A detached binding preserves that exact rule and the real
+    common git/beads state while moving only this test harness's filesystem
+    boundary beneath the configurable scratch base.
+    """
+    source = Path(__file__).resolve().parent.parent
+    root = _make_worktree_scratch_root()
+    binding = root / "repo"
+    added = subprocess.run(
+        ["git", "-C", str(source), "worktree", "add", "--detach", str(binding),
+         "HEAD"],
+        capture_output=True,
+        text=True,
+    )
+    if added.returncode != 0:
+        shutil.rmtree(root, ignore_errors=True)
+        raise RuntimeError(
+            f"could not bind spawn-worker scratch repo beneath {root}: "
+            f"{added.stderr.strip()}"
+        )
+    try:
+        yield SimpleNamespace(root=root, repo=binding, source=source)
+    finally:
+        subprocess.run(
+            ["git", "-C", str(source), "worktree", "remove", "--force",
+             str(binding)],
+            capture_output=True,
+            text=True,
+        )
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_worktree_scratch_root_defaults_beneath_tmpdir(monkeypatch, tmp_path):
+    monkeypatch.delenv(WORKTREE_SCRATCH_BASE_ENV, raising=False)
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+
+    root = _make_worktree_scratch_root()
+    try:
+        assert root.parent == tmp_path
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_worktree_scratch_root_rejects_read_only_base_loudly(monkeypatch):
+    read_only_base = Path("/sys/sable-spawn-worker-integration-read-only")
+    monkeypatch.setenv(WORKTREE_SCRATCH_BASE_ENV, str(read_only_base))
+
+    with pytest.raises(RuntimeError) as raised:
+        _make_worktree_scratch_root()
+
+    message = str(raised.value)
+    assert "scratch base is not writable" in message
+    assert str(read_only_base) in message
+
+
 def test_approved_handoff_refuses_outside_scope_before_external_work(tmp_path):
     _write_execution_state(
         Path(os.environ["SABLE_MODE_STATE"]),
@@ -541,14 +623,16 @@ def test_dispatch_refused_on_notes_only_bead(sock):
         _delete_scratch_bead(bead_id)
 
 
-def test_spawn_without_worktree_lands_where_dispatch_points(sock, request):
+def test_spawn_without_worktree_lands_where_dispatch_points(
+    sock, request, scratch_repo_binding,
+):
     """SABLE-bldh.11 regression: with NO --worktree, the path `bd worktree create`
     actually creates MUST equal the path embedded in the dispatch file (== the
     tmux -c target) AND exist on disk. The original bug created the worktree
     inside the repo but pointed tmux at the repo's sibling, dropping the worker in
     $HOME. Runs against real bd in THIS repo with a unique scope; removes the
     worktree + branch afterward."""
-    repo = Path(__file__).resolve().parent.parent  # the SABLE repo root
+    repo = scratch_repo_binding.repo
     scope = f"sw-it-{uuid.uuid4().hex[:8]}"
     wt_name = f"wk-{scope}"
     expected = repo.parent / wt_name  # sibling of the repo, NOT inside it
@@ -568,7 +652,8 @@ def test_spawn_without_worktree_lands_where_dispatch_points(sock, request):
 
     def cleanup_unrelated_branch():
         subprocess.run(
-            ["git", "-C", str(repo), "branch", "-D", unrelated_branch],
+            ["git", "-C", str(scratch_repo_binding.source), "branch", "-D",
+             unrelated_branch],
             capture_output=True,
             text=True,
         )
@@ -612,12 +697,12 @@ def test_spawn_without_worktree_lands_where_dispatch_points(sock, request):
             assert not expected.exists()
 
 
-def test_spawn_scope_already_prefixed_is_idempotent(sock):
+def test_spawn_scope_already_prefixed_is_idempotent(sock, scratch_repo_binding):
     """SABLE-v2k3 regression: a --scope that already starts with wk- (as happens
     when a caller passes an existing worktree-style name, e.g. wk-claim-hook-
     sandbox) must NOT be double-prefixed into wk-wk-*. Runs against real bd +
     git worktree create in THIS repo; removes the worktree + branch afterward."""
-    repo = Path(__file__).resolve().parent.parent  # the SABLE repo root
+    repo = scratch_repo_binding.repo
     scope = f"wk-sw-it-{uuid.uuid4().hex[:8]}"
     wt_name = scope  # idempotent: already wk-prefixed, so name == scope
     expected = repo.parent / wt_name
@@ -649,11 +734,19 @@ def test_spawn_scope_already_prefixed_is_idempotent(sock):
             body = (Path(dd) / f"{BEAD}.md").read_text()
             assert f"Worktree: {expected}" in body, body
         finally:
-            subprocess.run(["git", "-C", str(repo), "worktree", "remove",
-                            "--force", str(expected)],
-                           capture_output=True, text=True)
-            subprocess.run(["git", "-C", str(repo), "branch", "-D", wt_name],
-                           capture_output=True, text=True)
+            removed = subprocess.run(
+                ["git", "-C", str(repo), "worktree", "remove", "--force",
+                 str(expected)],
+                capture_output=True,
+                text=True,
+            )
+            assert removed.returncode == 0, removed.stderr
+            deleted = subprocess.run(
+                ["git", "-C", str(repo), "branch", "-D", wt_name],
+                capture_output=True,
+                text=True,
+            )
+            assert deleted.returncode == 0, deleted.stderr
             assert _refs_snapshot(repo) == before_refs
 
 
@@ -1384,14 +1477,16 @@ def test_claim_then_hold_first_dispatch_succeeds(sock):
         ), listing
 
 
-def test_claim_then_hold_blocks_when_derived_worktree_exists(sock):
+def test_claim_then_hold_blocks_when_derived_worktree_exists(
+    sock, scratch_repo_binding,
+):
     """SABLE-676c inverse: an IN_PROGRESS bead whose DERIVED wk-<scope> worktree
     already exists (a prior dispatch cut it) IS a duplicate and stays refused
     (exit 5), even with no live pane — worktree-evidence alone blocks. Pre-creates
     the sibling wk-<scope> dir the dispatch would use, then dispatches WITHOUT
     --worktree; the block fires in governance before any worktree creation, so no
     real git worktree is made."""
-    repo = Path(__file__).resolve().parent.parent  # the SABLE repo root
+    repo = scratch_repo_binding.repo
     scope = f"sw-hold-{uuid.uuid4().hex[:8]}"
     derived = repo.parent / f"wk-{scope}"  # sibling of the repo (SABLE-bldh.11)
     with tempfile.TemporaryDirectory() as stub_dir, \
@@ -1435,7 +1530,9 @@ def test_claim_then_hold_blocks_when_derived_worktree_exists(sock):
                 shutil.rmtree(derived, ignore_errors=True)
 
 
-def test_crash_leak_orphan_worktree_dispatch_refused_and_refs_unchanged(sock):
+def test_crash_leak_orphan_worktree_dispatch_refused_and_refs_unchanged(
+    sock, scratch_repo_binding,
+):
     """SABLE-0ssz.4 crash-leak harness: simulate a PRIOR dispatch that was
     hard-killed after `git worktree add` + branch creation but before its own
     cleanup ran, leaving a REAL orphaned worktree + branch at the derived
@@ -1447,7 +1544,7 @@ def test_crash_leak_orphan_worktree_dispatch_refused_and_refs_unchanged(sock):
     real repo's refs/heads set must be byte-identical before vs after this
     test's own cleanup — proving the crash artifact does not survive as a
     permanent leak once noticed."""
-    repo = Path(__file__).resolve().parent.parent  # the SABLE repo root
+    repo = scratch_repo_binding.repo
     scope = f"sw-crash-{uuid.uuid4().hex[:8]}"
     wt_name = f"wk-{scope}"
     orphan = repo.parent / wt_name  # sibling of the repo (SABLE-bldh.11)
