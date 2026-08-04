@@ -587,7 +587,7 @@ def test_provider_boot_failure_removes_manager_pane(sock, tmp_path):
     }
     r = subprocess.run(
         ["python3", str(BIN), "optimus"],
-        capture_output=True, text=True, env=env,
+        capture_output=True, text=True, env=env, cwd=tmp_path,
     )
 
     assert r.returncode == 5, f"stdout={r.stdout!r} stderr={r.stderr!r}"
