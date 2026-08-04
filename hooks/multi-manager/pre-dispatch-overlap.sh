@@ -238,37 +238,67 @@ print(json.dumps({
   exit 0
 fi
 
-# Find all in-progress beads (status=in_progress) not in dispatch set
+# Read the canonical TWO-LEG occupant census.  Candidate parsing and
+# serialize-with policy remain local to this hook; occupancy does not.  In
+# particular, a closed bead's pushed/uncontained branch remains present via
+# sable-screen's actual branch diff until the integration ref contains it.
+SCREEN="$HOOK_DIR/../../bin/sable-screen"
+if [ ! -r "$SCREEN" ]; then
+  deny_footprint_assessment "shared occupancy screen not found at $SCREEN"
+  exit 0
+fi
+if ! OCCUPANTS_JSON=$(python3 "$SCREEN" occupants --repo "$PWD" \
+    --exclude $DISPATCH_IDS --format json 2>&1); then
+  deny_footprint_assessment "shared occupancy screen failed: $(printf '%s' "$OCCUPANTS_JSON" | head -c 240)"
+  exit 0
+fi
+if ! printf '%s' "$OCCUPANTS_JSON" | python3 -c '
+import json, sys
+payload = json.load(sys.stdin)
+if not isinstance(payload.get("occupants"), dict):
+    raise SystemExit(1)
+' >/dev/null 2>&1; then
+  deny_footprint_assessment "shared occupancy screen returned malformed output"
+  exit 0
+fi
+
+# Assignees are presentation only; membership and paths come exclusively from
+# OCCUPANTS_JSON above.
 IN_PROGRESS=$(bd list --status=in_progress --json --limit 0 2>/dev/null || echo "[]")
 
-OVERLAPS_JSON=$(echo "$IN_PROGRESS" | DISPATCH_IDS="$DISPATCH_IDS" DISPATCH_FILES="$DISPATCH_FILES" python3 -c "
-import json, sys, os
+OVERLAPS_JSON=$(OCCUPANTS_JSON="$OCCUPANTS_JSON" IN_PROGRESS="$IN_PROGRESS" DISPATCH_FILES="$DISPATCH_FILES" python3 -c "
+import json, os
 
-dispatch_ids = set(os.environ.get('DISPATCH_IDS', '').split())
 dispatch_files = set(os.environ.get('DISPATCH_FILES', '').split('\n'))
 dispatch_files.discard('')
 
 try:
-    data = json.load(sys.stdin)
+    occupants = json.loads(os.environ.get('OCCUPANTS_JSON') or '{}').get('occupants', {})
 except Exception:
-    data = []
+    occupants = {}
 
-if not isinstance(data, list):
-    data = []
+try:
+    in_progress = json.loads(os.environ.get('IN_PROGRESS') or '[]')
+except Exception:
+    in_progress = []
+assignees = {
+    item.get('id', ''): item.get('assignee', '') or 'unassigned'
+    for item in in_progress if isinstance(item, dict)
+}
 
 overlaps = []
-for item in data:
-    bid = item.get('id', '')
-    if not bid or bid in dispatch_ids:
-        continue
-    metadata = item.get('metadata', {}) or {}
-    wip_claims = metadata.get('wip_claims', '') or ''
-    files = set(p.strip() for p in wip_claims.split(',') if p.strip())
-    shared = files & dispatch_files
+for label, files in occupants.items():
+    shared = set(files) & dispatch_files
     if shared:
+        if label.startswith('in_progress:'):
+            bid = label.split(':', 1)[1]
+            assignee = assignees.get(bid, 'unassigned')
+        else:
+            bid = label
+            assignee = 'branch ground truth'
         overlaps.append({
             'bead': bid,
-            'assignee': item.get('assignee', '') or 'unassigned',
+            'assignee': assignee,
             'files': sorted(shared),
         })
 
@@ -288,7 +318,7 @@ covered = [o for o in overlaps if o['bead'] in serialize_with]
 
 if uncovered:
     lines = '\n'.join(
-        f\"  - {o['bead']} ({o['assignee']}, in-progress): {', '.join(o['files'])}\"
+        f\"  - {o['bead']} ({o['assignee']}): {', '.join(o['files'])}\"
         for o in uncovered
     )
     reason = (
