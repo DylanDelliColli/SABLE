@@ -40,6 +40,40 @@ fail() { FAIL=$((FAIL+1)); FAIL_NAMES="$FAIL_NAMES\n  $1"; echo "FAIL: $1"; [ -n
 FIXTURE_DIR="$(mktemp -d)"
 trap 'rm -rf "$FIXTURE_DIR"' EXIT
 
+# Real-git occupancy fixture.  The hook asks sable-screen to enumerate every
+# origin/wk-* ref relative to the repository in $PWD, so running it from this
+# checkout leaks the developer's live worker branches into otherwise-hermetic
+# assertions.  Keep one unrelated branch visible by default and retain the
+# commit for a second branch that can be exposed only for the leg-(b) positive
+# control below.
+SCREEN_REPO="$FIXTURE_DIR/screen-repo"
+git init -q --initial-branch=tmux-only "$SCREEN_REPO"
+git -C "$SCREEN_REPO" config user.email test@example.com
+git -C "$SCREEN_REPO" config user.name "SABLE test"
+echo base > "$SCREEN_REPO/README.md"
+git -C "$SCREEN_REPO" add README.md
+git -C "$SCREEN_REPO" commit -q -m base
+BASE_TIP="$(git -C "$SCREEN_REPO" rev-parse HEAD)"
+git -C "$SCREEN_REPO" update-ref refs/remotes/origin/tmux-only "$BASE_TIP"
+git -C "$SCREEN_REPO" config sable.integrationBranch tmux-only
+
+git -C "$SCREEN_REPO" switch -q -c wk-unrelated
+mkdir -p "$SCREEN_REPO/unrelated"
+echo occupied > "$SCREEN_REPO/unrelated/branch-only.py"
+git -C "$SCREEN_REPO" add unrelated/branch-only.py
+git -C "$SCREEN_REPO" commit -q -m "unrelated worker path"
+UNRELATED_TIP="$(git -C "$SCREEN_REPO" rev-parse HEAD)"
+git -C "$SCREEN_REPO" update-ref refs/remotes/origin/wk-unrelated "$UNRELATED_TIP"
+
+git -C "$SCREEN_REPO" switch -q tmux-only
+git -C "$SCREEN_REPO" switch -q -c wk-occupies-spawn
+mkdir -p "$SCREEN_REPO/bin"
+echo occupied > "$SCREEN_REPO/bin/sable-spawn-worker"
+git -C "$SCREEN_REPO" add bin/sable-spawn-worker
+git -C "$SCREEN_REPO" commit -q -m "occupy dispatch path"
+OCCUPIED_TIP="$(git -C "$SCREEN_REPO" rev-parse HEAD)"
+git -C "$SCREEN_REPO" switch -q tmux-only
+
 # Registry so lib-identity resolves optimus as a manager.
 AGENTS_YAML="$FIXTURE_DIR/agents.yaml"
 cat > "$AGENTS_YAML" <<'YAML'
@@ -120,6 +154,7 @@ run_hook() {
   BD_CALL_LOG="$FIXTURE_DIR/bd_calls.log"
   : > "$BD_CALL_LOG"
   printf '%s' "$1" | \
+    (cd "$SCREEN_REPO" && \
     env -u CLAUDE_AGENT_NAME -u CLAUDE_AGENT_ROLE -u SABLE_WORKER_PANE -u SABLE_BEAD \
         SABLE_AGENTS_YAML="$AGENTS_YAML" \
         SABLE_MODE_STATE="$NONEXISTENT_MODE" \
@@ -130,7 +165,7 @@ run_hook() {
         DISP_WIP_CLAIMS="${6:-}" \
         BD_CALL_LOG="$BD_CALL_LOG" \
         PATH="$STUB_DIR:$PATH" \
-        bash "${7:-$HOOK}" 2>/dev/null
+        bash "${7:-$HOOK}" 2>/dev/null)
 }
 
 # Case 1: manager-subagent dispatch whose bead file (hooks/foo.sh) collides
@@ -278,15 +313,31 @@ else
 fi
 
 # Case 11b (SABLE-e2ic3 complement, load-bearing): a bead that DOES declare a
-# footprint, checked against a genuinely non-overlapping in-progress claim,
-# must NOT say NO-DECLARATION — that would make the signal noisy enough to
-# stop being read. Reuses the Case-7-shaped footprint declaration but against
-# a DIFFERENT in-progress file so nothing overlaps (silent, like Case 2).
+# footprint, checked against a genuinely non-overlapping in-progress claim
+# AND a controlled worker branch touching an unrelated path, must NOT say
+# NO-DECLARATION — that would make the signal noisy enough to stop being read.
+# Reuses the Case-7-shaped footprint declaration but with neither occupant leg
+# overlapping (silent, like Case 2).
 OUT=$(run_hook "$(make_input a11b optimus 'Work SABLE-disp')" "unrelated/other.py" "$FOOTPRINT_DESC")
 if [ -z "$OUT" ] && ! printf '%s' "$OUT" | grep -q 'NO-DECLARATION'; then
   pass "a bead WITH a declared, non-overlapping footprint does not say NO-DECLARATION"
 else
   fail "a bead WITH a declared, non-overlapping footprint does not say NO-DECLARATION" "got: ${OUT:-<empty>}"
+fi
+
+# Case 11c (SABLE-m2fyf LEG-(b) POSITIVE CONTROL): expose a controlled remote
+# worker ref whose real diff occupies the declared path.  The in-progress bead
+# remains unrelated, so only the branch-diff leg can make this deny.  Remove
+# the ref immediately afterwards so later cases retain the negative fixture.
+git -C "$SCREEN_REPO" update-ref refs/remotes/origin/wk-occupies-spawn "$OCCUPIED_TIP"
+OUT=$(run_hook "$(make_input a11c optimus 'Work SABLE-disp')" "unrelated/other.py" "$FOOTPRINT_DESC")
+git -C "$SCREEN_REPO" update-ref -d refs/remotes/origin/wk-occupies-spawn
+if printf '%s' "$OUT" | grep -q 'OVERLAP DETECTED' \
+   && printf '%s' "$OUT" | grep -q 'branch:wk-occupies-spawn' \
+   && printf '%s' "$OUT" | grep -q 'bin/sable-spawn-worker'; then
+  pass "controlled uncontained branch occupying the declared path is DENIED by leg (b)"
+else
+  fail "controlled uncontained branch occupying the declared path is DENIED by leg (b)" "got: ${OUT:-<empty>}"
 fi
 
 # Case 12: an EMPTY footprint section immediately followed by another '##'
