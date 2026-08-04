@@ -41,6 +41,8 @@ import sys
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
+import pytest
+
 _LOADER = SourceFileLoader(
     "sable_screen", str(Path(__file__).resolve().parent / "sable-screen")
 )
@@ -489,7 +491,7 @@ def test_render_ready_candidate_adds_no_readiness_line():
 # in_progress_occupants — pure, no git/bd
 # ===========================================================================
 
-def test_in_progress_occupants_excludes_dispatch_ids():
+def test_in_progress_declaration_still_counted():
     beads = [
         {"id": "SABLE-a", "metadata": {"wip_claims": "bin/a.py"}},
         {"id": "SABLE-b", "metadata": {"wip_claims": "bin/b.py"}},
@@ -822,7 +824,10 @@ def test_render_holds_emits_one_row_per_branch_naming_every_bead():
 # wk_branch_occupants — REAL git fixture, no bd
 # ===========================================================================
 
-def test_wk_branch_occupants_excludes_landed_includes_uncontained(tmp_path):
+def test_closed_bead_with_uncontained_branch_still_occupies(tmp_path):
+    """Branch occupancy deliberately has no bead-status input: a pushed
+    branch remains live after its authoring bead closes.  A leg-(a)-only
+    implementation returns an empty map for this fixture."""
     repo = _git_repo(tmp_path)
     _commit(repo, "base.txt")
 
@@ -841,5 +846,144 @@ def test_wk_branch_occupants_excludes_landed_includes_uncontained(tmp_path):
     _fake_remote_ref(repo, "wk-uncontained", uncontained_tip)
 
     occ = ss.wk_branch_occupants(str(repo), "origin/tmux-only")
-    assert "branch:wk-landed" not in occ
     assert occ.get("branch:wk-uncontained") == frozenset({"uncontained.txt"})
+
+
+def test_failed_merge_base_refuses_occupancy_assessment(tmp_path, monkeypatch):
+    """A merge-base failure is unknown, never a two-dot fallback against the
+    integration ref that attributes integration-side changes to a worker."""
+    repo = _git_repo(tmp_path)
+    spine = _commit(repo, "base.txt")
+    _run("git", "checkout", "-qb", "wk-uncontained", cwd=str(repo))
+    tip = _commit(repo, "worker.txt")
+    _run("git", "checkout", "-q", "-", cwd=str(repo))
+    _fake_remote_ref(repo, "tmux-only", spine)
+    _fake_remote_ref(repo, "wk-uncontained", tip)
+
+    real_git = ss._git
+
+    def fail_merge_base(repo_path, *args):
+        if args and args[0] == "merge-base" and "--is-ancestor" not in args:
+            return subprocess.CompletedProcess(args, 128, "", "shallow history")
+        return real_git(repo_path, *args)
+
+    monkeypatch.setattr(ss, "_git", fail_merge_base)
+    with pytest.raises(ss.OccupancyAssessmentError, match="merge base.*shallow history"):
+        ss.wk_branch_occupants(str(repo), "origin/tmux-only")
+
+
+def test_failed_branch_diff_refuses_occupancy_assessment(tmp_path, monkeypatch):
+    """A failed diff is unknown, never an empty path set that releases the
+    branch and reports a false clean occupancy screen."""
+    repo = _git_repo(tmp_path)
+    spine = _commit(repo, "base.txt")
+    _run("git", "checkout", "-qb", "wk-uncontained", cwd=str(repo))
+    tip = _commit(repo, "worker.txt")
+    _run("git", "checkout", "-q", "-", cwd=str(repo))
+    _fake_remote_ref(repo, "tmux-only", spine)
+    _fake_remote_ref(repo, "wk-uncontained", tip)
+
+    real_git = ss._git
+
+    def fail_diff(repo_path, *args):
+        if args and args[0] == "diff":
+            return subprocess.CompletedProcess(args, 128, "", "missing object")
+        return real_git(repo_path, *args)
+
+    monkeypatch.setattr(ss, "_git", fail_diff)
+    with pytest.raises(ss.OccupancyAssessmentError, match="branch diff.*missing object"):
+        ss.wk_branch_occupants(str(repo), "origin/tmux-only")
+
+
+def test_occupants_cli_reports_could_not_assess(tmp_path, monkeypatch, capsys):
+    repo = _git_repo(tmp_path)
+    _commit(repo, "base.txt")
+
+    def refuse(*_args, **_kwargs):
+        raise ss.OccupancyAssessmentError("fixture git failure")
+
+    monkeypatch.setattr(ss, "build_occupants", refuse)
+    rc = ss.main(["occupants", "--repo", str(repo), "--format", "json"])
+
+    assert rc == 2
+    assert "COULD NOT ASSESS OCCUPANCY" in capsys.readouterr().err
+
+
+def test_contained_branch_stops_occupying(tmp_path, monkeypatch):
+    """Negative control: the branch leg releases a path once its tip is
+    contained.  An always-occupies implementation would be safe but unusable."""
+    repo = _git_repo(tmp_path)
+    _commit(repo, "base.txt")
+
+    _run("git", "checkout", "-qb", "wk-landed", cwd=str(repo))
+    landed_tip = _commit(repo, "landed.txt")
+    _run("git", "checkout", "-q", "-", cwd=str(repo))
+    _run("git", "merge", "--ff-only", "wk-landed", cwd=str(repo))
+    spine = _run("git", "rev-parse", "HEAD", cwd=str(repo)).stdout.strip()
+
+    _fake_remote_ref(repo, "tmux-only", spine)
+    _fake_remote_ref(repo, "wk-landed", landed_tip)
+
+    # Make the test depend on the containment decision itself.  In a normal
+    # repository merge-base(integration, contained-tip) == tip, so the later
+    # diff is empty and this test would accidentally pass even if the
+    # containment guard were deleted.  A planted downstream path ensures only
+    # the guard can release the branch.
+    monkeypatch.setattr(
+        ss, "branch_diff_files",
+        lambda _repo, _base, _tip: frozenset({"landed.txt"}))
+
+    occ = ss.wk_branch_occupants(str(repo), "origin/tmux-only")
+    assert "branch:wk-landed" not in occ
+
+
+def test_occupancy_consumers_route_through_shared_screen():
+    """Architecture control: both production dispatch gates consume the
+    canonical occupant-set command instead of maintaining private censuses."""
+    root = Path(__file__).resolve().parents[1]
+    spawn = (root / "bin" / "sable-spawn-worker").read_text()
+    hook = (root / "hooks" / "multi-manager" /
+            "pre-dispatch-overlap.sh").read_text()
+    assert "_shared_occupancy_module" in spawn
+    assert 'occupants --repo' in hook
+
+
+def test_spawn_consumer_sees_uncontained_branch_and_releases_after_merge(tmp_path):
+    """Exercise the Python consumer, not only sable-screen itself: its
+    candidate parser remains local, while occupancy comes from the shared
+    branch census and therefore survives a closed lifecycle."""
+    root = Path(__file__).resolve().parents[1]
+    name = "sable_spawn_occupancy_test"
+    loader = SourceFileLoader(name, str(root / "bin" / "sable-spawn-worker"))
+    spec = importlib.util.spec_from_loader(name, loader)
+    spawn = importlib.util.module_from_spec(spec)
+    sys.modules[name] = spawn
+    loader.exec_module(spawn)
+
+    repo = _git_repo(tmp_path)
+    base = _commit(repo, "base.txt")
+    _fake_remote_ref(repo, "tmux-only", base)
+    (repo / ".sable").write_text("integrationBranch=tmux-only\n")
+
+    _run("git", "checkout", "-qb", "wk-closed", cwd=str(repo))
+    tip = _commit(repo, "shared.py")
+    _run("git", "checkout", "-q", "-", cwd=str(repo))
+    _fake_remote_ref(repo, "wk-closed", tip)
+
+    candidate = {
+        "id": "SABLE-candidate",
+        "description": "work\n\n## File footprint\nshared.py",
+        "metadata": {},
+    }
+    occupied = spawn.overlap_check(
+        "SABLE-candidate", candidate, [], repo=str(repo))
+    assert occupied.decision == "deny"
+    assert "branch:wk-closed" in occupied.message
+    assert "shared.py" in occupied.message
+
+    _run("git", "merge", "--ff-only", "wk-closed", cwd=str(repo))
+    merged = _run("git", "rev-parse", "HEAD", cwd=str(repo)).stdout.strip()
+    _fake_remote_ref(repo, "tmux-only", merged)
+    released = spawn.overlap_check(
+        "SABLE-candidate", candidate, [], repo=str(repo))
+    assert released.decision == "none"
