@@ -321,15 +321,11 @@ else
   fail "fresh-spawn interrupt was SUBMITTED as a turn, not swallowed" "$(tmux_ capture-pane -t "$mpane" -p)"
 fi
 
-# --- 7) unverifiable delivery files the SABLE-1umr fallback bead IN A SANDBOX,
-#     never the live DB (SABLE-j0vr / SABLE-f3zp) -----------------------------
+# --- 7) queued delivery never duplicates into a bead; queue FAILURE does ----
 # A pane that never renders the composer prompt can never be confirmed IDLE,
-# so deliver_text exhausts its retries and sable-msg falls back to
-# file_fallback_bead. This is the exact shape test-tmux-e2e.sh's stand-in
-# hits in isolated/CI runs (SABLE-gcmu) -- reproduced here directly against a
-# pane that is provably never ready, so the fallback is guaranteed to fire
-# rather than depending on timing. BEADS_DB scopes bd create to a throwaway
-# sandbox DB; the assertions below prove the live repo DB never gained a bead.
+# so the immediate count-only wake defers. The payload is already durable and
+# must not also become a tracker bead (SABLE-ijd7j). A deterministic queue
+# publication failure then proves the true-undelivered fallback still fires.
 if command -v bd >/dev/null 2>&1; then
   SCRATCH_BEADS_DIR="$(mktemp -d)"
   # -u BEADS_DB (SABLE-sx1rb): never inherit an ambient BEADS_DB (e.g. the
@@ -350,9 +346,9 @@ if command -v bd >/dev/null 2>&1; then
   if CLAUDE_AGENT_NAME=lincoln SABLE_MSG_SUBMIT_TRIES=3 SABLE_MSG_POLL_INTERVAL=0.1 \
       BEADS_DB="$SCRATCH_BEADS_DIR/.beads" \
       python3 "$BIN/sable-msg" chuck "$FIXTURE_BODY" >/dev/null 2>"$ERRFILE2"; then
-    fail "unverifiable delivery to a never-ready pane reports undelivered (unexpectedly returned 0)" "$(cat "$ERRFILE2")"
+    pass "durably queued delivery succeeds even when the immediate wake defers"
   else
-    pass "unverifiable delivery to a never-ready pane reports undelivered"
+    fail "durably queued delivery succeeds even when the immediate wake defers" "$(cat "$ERRFILE2")"
   fi
 
   if ! tmux_ capture-pane -p -J -e -t "$stuckpane" | grep -Fq "$FIXTURE_BODY"; then
@@ -362,22 +358,22 @@ if command -v bd >/dev/null 2>&1; then
       "$(tmux_ capture-pane -p -J -e -t "$stuckpane")"
   fi
 
-  if grep -q "Filed durable inbox bead" "$ERRFILE2"; then
-    pass "sable-msg's SABLE-1umr fallback fired"
+  if ! grep -q "Filed durable inbox bead" "$ERRFILE2"; then
+    pass "successful enqueue does not manufacture a duplicate fallback bead"
   else
-    fail "sable-msg's SABLE-1umr fallback fired" "$(cat "$ERRFILE2")"
+    fail "successful enqueue does not manufacture a duplicate fallback bead" "$(cat "$ERRFILE2")"
   fi
 
   queued_count="$(PYTHONPATH="$BIN" python3 - <<'PY'
 from sable_inbox_lib import pending
 print(len(pending("chuck")))
 PY
-)"
+  )"
   if [ "$queued_count" = "1" ] \
-     && grep -q "QUEUED-BUT-DRAINER-UNVERIFIED" "$ERRFILE2"; then
-    pass "pre-activation send queues durably AND keeps the loud fallback"
+     && grep -q "QUEUED-WAKE-DEFERRED" "$ERRFILE2"; then
+    pass "pre-activation send is durable and reports deferred surfacing"
   else
-    fail "pre-activation send queues durably AND keeps the loud fallback" \
+    fail "pre-activation send is durable and reports deferred surfacing" \
       "queued=$queued_count err=$(cat "$ERRFILE2")"
   fi
 
@@ -386,10 +382,11 @@ PY
   # privileged test runner (chmod-based unwritability is not).
   printf 'not a directory\n' > "$REC/not-a-directory"
   QUEUE_FAIL_ERR="$REC/queue-fail-err.txt"
+  FALLBACK_FIXTURE_BODY="queue failure probe"
   if SABLE_TEST_INBOX_ROOT="$REC/not-a-directory/inbox" \
-      SABLE_MSG_AUTO_FALLBACK=0 CLAUDE_AGENT_NAME=lincoln \
+      BEADS_DB="$SCRATCH_BEADS_DIR/.beads" CLAUDE_AGENT_NAME=lincoln \
       SABLE_MSG_SUBMIT_TRIES=1 SABLE_MSG_POLL_INTERVAL=0.01 \
-      python3 "$BIN/sable-msg" chuck "queue failure probe" \
+      python3 "$BIN/sable-msg" chuck "$FALLBACK_FIXTURE_BODY" \
         >/dev/null 2>"$QUEUE_FAIL_ERR"; then
     fail "unwritable queue is loud and nonzero" "unexpected rc0"
   elif grep -q "QUEUE-FAILED" "$QUEUE_FAIL_ERR" \
@@ -443,7 +440,7 @@ PY
   # prefix of that frame; passing it through the production title composer
   # yields a prefix of the real bead title. Control (b) below exists to catch
   # a non-matching derivation.
-  fallback_title="$(SABLE_FIXTURE_BODY="$FIXTURE_BODY" python3 - "$BIN" <<'PY'
+  fallback_title="$(SABLE_FIXTURE_BODY="$FALLBACK_FIXTURE_BODY" python3 - "$BIN" <<'PY'
 import importlib.util, os, sys
 from importlib.machinery import SourceFileLoader
 loader = SourceFileLoader("sable_msg", os.path.join(sys.argv[1], "sable-msg"))
@@ -454,7 +451,7 @@ identity = mod.message_identity("lincoln", "chuck", os.environ["SABLE_FIXTURE_BO
 print(mod.fallback_bead_title("chuck", identity), end="")
 PY
 )"
-  if [ -n "$fallback_title" ] && [ "$fallback_title" != "${fallback_title#*$FIXTURE_BODY}" ]; then
+  if [ -n "$fallback_title" ] && [ "$fallback_title" != "${fallback_title#*$FALLBACK_FIXTURE_BODY}" ]; then
     pass "fixture signature was derived from bin/sable-msg, not hand-typed"
   else
     fail "fixture signature was derived from bin/sable-msg, not hand-typed" "derived title=[$fallback_title]"
