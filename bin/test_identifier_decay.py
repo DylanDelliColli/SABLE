@@ -14,7 +14,10 @@ line. An instrument that reports a comfortable number without detecting the
 case it was built for is a dead grep.
 """
 import importlib.util
+import json
 import os
+import re
+import shlex
 import subprocess
 import sys
 from importlib.machinery import SourceFileLoader
@@ -25,8 +28,9 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from sable_identifier_decay_lib import (  # noqa: E402
-    KNOWN_LIMIT, format_flags, format_unassessed, identifier_variants,
-    is_instructional, is_provenance, sweep, sweep_bead,
+    CITATION, INSTRUCTION, KNOWN_LIMIT, format_flags, format_unassessed,
+    identifier_variants, is_instructional, is_provenance, sentence_spans,
+    sweep, sweep_bead,
 )
 
 CLI = Path(__file__).resolve().parent / "sable-identifier-decay"
@@ -217,15 +221,18 @@ def test_report_names_the_referrer_the_line_and_the_known_limit():
 def test_long_reports_truncate_but_never_silently():
     """A hub bead can leave twenty-plus referrals; twenty-plus is not readable.
     The cap must state the TRUE total and how to see the rest — a silent cap
-    reads as 'everything is covered' when it isn't."""
-    corpus = [bead(f"SABLE-r{i}", notes="must verify SABLE-X") for i in range(25)]
+    reads as 'everything is covered' when it isn't.
+
+    SABLE-l662t: the named remedy is now `--all`. The bare command it used to
+    print reproduced this very truncation, so following it looped."""
+    corpus = [bead(f"SABLE-r{i:02d}", notes="must verify SABLE-X") for i in range(25)]
     flags = sweep(["SABLE-X"], corpus)
     assert len(flags) == 25
     report = format_flags(flags, ["SABLE-X"])
     assert "leaves 25 open instructions" in report, "the head states the TRUE total"
     assert "15 more not shown" in report
-    assert "sable-identifier-decay SABLE-X" in report, "names how to see the rest"
-    assert "SABLE-r0" in report and "SABLE-r24" not in report
+    assert "sable-identifier-decay --all SABLE-X" in report, "names how to see the rest"
+    assert "SABLE-r00" in report and "SABLE-r24" not in report
 
 
 def test_known_limit_names_the_undetectable_case():
@@ -372,6 +379,233 @@ def test_cli_help_states_the_known_limit():
     cp = _cli("--help")
     assert cp.returncode == 0
     assert "code path" in cp.stdout.lower()
+
+
+def test_cli_accepts_all_and_renders_every_flag(tmp_path):
+    """--all is the remedy the truncation line names; it must exist and it must
+    render past MAX_RENDERED."""
+    corpus = [bead(f"SABLE-r{i:02d}", notes="must verify SABLE-X") for i in range(25)]
+    out = _cli_against_stub_store(tmp_path, corpus, ["--all", "SABLE-X"]).stdout
+    assert "SABLE-r24" in out
+    assert "more not shown" not in out
+
+
+# --------------------------------------------------------------------------
+# SABLE-l662t: the SCOPE of the match is not the property being enforced
+#
+# Measured live 2026-07-24: closing the completed 9-child epic SABLE-be4lo
+# reported 61 hits of which approximately ZERO were real decay. Three
+# independent defects stacked, and they fail DIFFERENTLY, so they get three
+# separate fixes and three separate pairs of tests here.
+#
+# Every one of these is paired with a NEGATIVE CONTROL, because the failure
+# mode of this whole bead is a checker that stops firing: a blinded detector
+# passes every "no false positives" test and is strictly worse than the noise
+# it removed. If a control below does not bite when the corresponding fix is
+# reverted to "match everything", the fix is unverified.
+# --------------------------------------------------------------------------
+
+# ---- LAYER 1: prefix collision -------------------------------------------
+
+def test_retiring_a_parent_does_not_flag_child_references():
+    """Retiring SABLE-be4lo retires NOTHING of SABLE-be4lo.1's — the children
+    were closed on their own schedule, days apart. 44 of the 50 measured hits
+    were this: a DIFFERENT identifier that happens to share a prefix."""
+    corpus = [
+        bead("SABLE-c1", notes="you must verify SABLE-be4lo.1 before landing"),
+        bead("SABLE-c2", notes="DO NOT CLOSE until SABLE-be4lo.9 is merged"),
+    ]
+    assert sweep(["SABLE-be4lo"], corpus) == []
+
+
+def test_retiring_a_parent_still_flags_a_bare_reference_to_the_parent():
+    """NEGATIVE CONTROL for layer 1: the fix must NARROW the match, not disable
+    it. A bare reference to the epic itself is exactly the case the detector
+    exists for and must survive."""
+    corpus = [bead("SABLE-r", notes="you must verify SABLE-be4lo before landing")]
+    assert [f.referrer_id for f in sweep(["SABLE-be4lo"], corpus)] == ["SABLE-r"]
+
+
+def test_retiring_a_child_still_flags_that_child():
+    """The other half of the same control: when the CHILD is the thing being
+    retired, references to it are real decay and must flag."""
+    corpus = [bead("SABLE-r", notes="you must verify SABLE-be4lo.1 before landing")]
+    assert [f.referrer_id for f in sweep(["SABLE-be4lo.1"], corpus)] == ["SABLE-r"]
+
+
+def test_child_exclusion_also_covers_the_bare_suffix_form():
+    """Bead ids are written bare as often as fully (that is why bare-suffix
+    matching exists), so `be4lo.3` must be excluded on the same grounds as
+    `SABLE-be4lo.3` — otherwise the noise just re-enters through the other door."""
+    corpus = [bead("SABLE-r", notes="you must verify be4lo.3 before landing")]
+    assert sweep(["SABLE-be4lo"], corpus) == []
+
+
+def test_a_sentence_ending_period_is_not_a_child_suffix():
+    """The exclusion is `.<digit>`, not `.` — otherwise every mention that ends
+    a sentence would be silently dropped, which is the blinding failure."""
+    corpus = [bead("SABLE-r", notes="you must verify SABLE-be4lo. Then land it.")]
+    assert [f.referrer_id for f in sweep(["SABLE-be4lo"], corpus)] == ["SABLE-r"]
+
+
+# ---- LAYER 2: citation vs instruction ------------------------------------
+
+def test_a_citation_is_not_reported_as_an_instruction():
+    """"This bug was observed on X" is true forever and cannot be satisfied or
+    unsatisfied; a hold naming X as a live precondition can. Only the second is
+    decay. Both are still REPORTED — separating is safe, suppressing is not."""
+    corpus = [
+        bead("SABLE-cite", description=(
+            "The checker misfired here. This was first observed on SABLE-X during "
+            "the 2026-07-24 drain. We must check the tier budget before the next run.")),
+        bead("SABLE-instr", notes="hold_until: SABLE-X must land on the integration branch"),
+    ]
+    flags = sweep(["SABLE-X"], corpus)
+    kinds = {f.referrer_id: f.kind for f in flags}
+    assert kinds == {"SABLE-cite": CITATION, "SABLE-instr": INSTRUCTION}
+    counted = [f.referrer_id for f in flags if f.kind == INSTRUCTION]
+    assert counted == ["SABLE-instr"], "only the instruction counts as decay"
+
+
+def test_the_citation_class_does_not_blind_a_genuine_instruction():
+    """NEGATIVE CONTROL for layer 2, the SABLE-fzn14 shape: a real instruction
+    naming a retired identifier as still-live, sitting inside an otherwise
+    narrative paragraph. This is the case the detector caught for real the same
+    day the false-positive flood was measured; it must still be an INSTRUCTION."""
+    corpus = [bead("SABLE-r", description=(
+        "Background: the drain ran clean on 2026-07-24 and nothing regressed. "
+        "HARD REQUIREMENT: verify SABLE-fzn14's misverdict guard still holds "
+        "before dispatching."))]
+    flags = sweep(["SABLE-fzn14"], corpus)
+    assert [(f.referrer_id, f.kind) for f in flags] == [("SABLE-r", INSTRUCTION)]
+
+
+def test_an_instructional_word_in_a_different_sentence_does_not_make_an_instruction():
+    """The mechanism, stated directly: co-location on the same physical LINE was
+    the proxy, and a bead description is one line per PARAGRAPH — in the live
+    corpus the instructional token sat up to 427 characters and several
+    sentences away from the mention. Co-location now means the same sentence."""
+    line = "SABLE-X shipped last Tuesday. Separately, you must migrate the hold."
+    (flag,) = sweep(["SABLE-X"], [bead("SABLE-r", notes=line)])
+    assert flag.kind == CITATION
+
+
+def test_sentence_spans_cover_the_line_exactly():
+    """The splitter is load-bearing for layer 2, so it is pinned directly: every
+    character of the line lands in exactly one span, at its true offset."""
+    line = "First one. Second one; third one! Fourth."
+    spans = sentence_spans(line)
+    assert [t for _, t in spans] == ["First one.", "Second one;", "third one!", "Fourth."]
+    for start, text in spans:
+        assert line[start:start + len(text)] == text
+
+
+def test_citations_alone_do_not_raise_the_decay_banner_but_are_not_hidden():
+    """The measured live case, in miniature: an identifier whose only open
+    referrals are historical citations must not fire the ⚠ decay banner (there
+    is nothing to fix), and must not vanish either — the count and the way to
+    read them are stated."""
+    corpus = [bead(f"SABLE-c{i}", description=(
+        "This was observed on SABLE-X last week. We must check it again someday."))
+        for i in range(6)]
+    flags = sweep(["SABLE-X"], corpus)
+    assert len(flags) == 6 and {f.kind for f in flags} == {CITATION}
+    report = format_flags(flags, ["SABLE-X"])
+    assert "⚠" not in report, "zero instructions must not read as a warning"
+    assert "6" in report and "citation" in report.lower()
+    assert "--all" in report, "non-actionable does not mean unreadable"
+
+
+def test_a_report_counts_instructions_and_states_the_citations_separately():
+    corpus = [bead("SABLE-instr", notes="hold_until: SABLE-X must land first")]
+    corpus += [bead(f"SABLE-c{i}", description=(
+        "This was observed on SABLE-X last week. We must check it again someday."))
+        for i in range(4)]
+    report = format_flags(sweep(["SABLE-X"], corpus), ["SABLE-X"])
+    assert "leaves 1 open instruction still naming it" in report
+    assert "SABLE-instr" in report
+    assert "4" in report and "citation" in report.lower()
+
+
+# ---- LAYER 3: the remedy that looped -------------------------------------
+
+def _cli_against_stub_store(tmp_path, corpus, argv):
+    """Run the REAL CLI against a stub `bd` that answers with `corpus`. Real
+    argument parsing, real rendering, real process — only the store is a
+    fixture, which is what makes this a unit test rather than the integration
+    one."""
+    root = tmp_path / f"stub{len(list(tmp_path.iterdir()))}"
+    root.mkdir()
+    store = root / "beads.json"
+    store.write_text(json.dumps(corpus))
+    bin_dir = root / "bin"
+    bin_dir.mkdir()
+    _write_bd_stub(bin_dir, f'cat {shlex.quote(str(store))}')
+    env = dict(os.environ)
+    env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
+    env.pop("SABLE_IDREF_TIMEOUT", None)
+    cp = subprocess.run([sys.executable, str(CLI), *argv], text=True, env=env,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+    assert cp.returncode == 0, f"rc={cp.returncode} stderr={cp.stderr}"
+    return cp
+
+
+def test_the_printed_see_them_all_command_actually_shows_them_all(tmp_path):
+    """LAYER 3, EXECUTED rather than asserted by wording: parse the command the
+    tool prints in its own truncation line, RUN that exact command, and require
+    its output to contain every hit.
+
+    Against the pre-fix tool this fails: the printed command was the bare
+    invocation that had just truncated, so following it reproduced the same ten
+    lines and the same message. A remedy that loops spends the reader's trust
+    before their attention."""
+    corpus = [bead(f"SABLE-r{i:02d}", notes="must verify SABLE-X") for i in range(25)]
+
+    first = _cli_against_stub_store(tmp_path, corpus, ["SABLE-X"])
+    # POSITIVE CONTROL: the default run really is truncated, so the comparison
+    # below is measuring a real difference and not an empty one.
+    assert "more not shown" in first.stdout
+    assert "SABLE-r24" not in first.stdout
+
+    m = re.search(r"see them all with:\s*(.+?)\s*$", first.stdout, re.M)
+    assert m, f"the truncation line must still name a remedy: {first.stdout!r}"
+    remedy = shlex.split(m.group(1))
+    assert remedy[0] == "sable-identifier-decay", remedy
+    assert remedy[1:] != ["SABLE-X"], (
+        "the remedy must not be the very command that just truncated")
+
+    second = _cli_against_stub_store(tmp_path, corpus, remedy[1:])
+    missing = [f"SABLE-r{i:02d}" for i in range(25) if f"SABLE-r{i:02d}" not in second.stdout]
+    assert not missing, f"the printed remedy did not show: {missing}"
+    assert "more not shown" not in second.stdout, "the remedy must terminate, not re-truncate"
+
+
+@pytest.mark.parametrize("n_instructions", [0, 1, 25])
+def test_no_printed_command_carries_trailing_punctuation(n_instructions):
+    """Every rendering path that prints a command must print a PASTABLE one.
+    A trailing period is the same defect as a looping remedy, one keystroke
+    smaller: the reader follows the instruction exactly and it fails."""
+    corpus = [bead(f"SABLE-i{i:02d}", notes="hold_until: SABLE-X must land first")
+              for i in range(n_instructions)]
+    corpus += [bead(f"SABLE-c{i}", description=(
+        "This was observed on SABLE-X last week. We must check it again someday."))
+        for i in range(3)]
+    report = format_flags(sweep(["SABLE-X"], corpus), ["SABLE-X"])
+    for line in report.splitlines():
+        if "sable-identifier-decay" in line:
+            assert not line.rstrip().endswith((".", ",", ";", ":")), line
+
+
+def test_the_remedy_reproduces_the_branch_seam_invocation(tmp_path):
+    """A remedy that drops --branch would print a command that sweeps for a
+    DIFFERENT thing than the report it appears under."""
+    corpus = [bead(f"SABLE-r{i:02d}", notes="DO NOT MERGE wk-foo while this hold stands")
+              for i in range(12)]
+    out = _cli_against_stub_store(tmp_path, corpus, ["--branch", "wk-foo"]).stdout
+    m = re.search(r"see them all with:\s*(.+?)\s*$", out, re.M)
+    assert m, out
+    remedy = shlex.split(m.group(1))
+    assert "--branch" in remedy and "--all" in remedy and "wk-foo" in remedy
 
 
 def test_cli_reports_could_not_assess_when_bd_is_absent(tmp_path):

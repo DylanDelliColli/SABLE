@@ -25,6 +25,8 @@ THIS checkout's sweeper so a globally-installed one can never be under test.
 """
 import json
 import os
+import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -358,3 +360,191 @@ def test_slow_store_still_never_reports_a_false_clean(bulk_sandbox):
     assert cp_text.returncode == 3
     assert "COULD NOT ASSESS" in cp_text.stdout
     assert "NOT a clean result" in cp_text.stdout
+
+
+# --------------------------------------------------------------------------
+# SABLE-l662t: the three false-positive classes, against a REAL bd store
+#
+# The measured live failure was a CORPUS effect — closing the completed
+# 9-child epic SABLE-be4lo reported 61 hits of which approximately zero were
+# real decay. A unit test over synthetic dicts cannot show that the corpus
+# behaviour changed, because the thing that broke was the interaction between
+# real hierarchical bead ids (`X.1` is a DIFFERENT bead from `X`), real
+# paragraph-shaped description prose, and the report's own truncation. So
+# these run against real `bd create --parent` children in a real store.
+#
+# Every assertion below is about beads THIS fixture created (SABLE-jd5fj.15 —
+# a global count against a live store the fleet is filing into is a flake
+# generator), and every one is paired with a control proving the detector can
+# still produce the other outcome.
+# --------------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def scope_sandbox(tmp_path_factory):
+    """A real store shaped like the live failure: a real epic with real
+    `--parent` children, referrers naming ONLY the children, one referrer
+    citing the epic as history, one carrying a genuine instruction about it,
+    and a separate hub identifier with more referrers than the render cap."""
+    root = tmp_path_factory.mktemp("iddecay-scope")
+    work = root / "work"
+    work.mkdir()
+    home = root / "home"
+    home.mkdir()
+    subprocess.run(["git", "init", "-q", str(work)], check=True)
+    _robust_bd_init(work, home)
+
+    def create(title, *, parent=None, issue_type="task", notes=None):
+        argv = ["create", "--sandbox", "--json", "--title", title,
+                f"--type={issue_type}", "--priority=2"]
+        if parent:
+            argv += [f"--parent={parent}"]
+        bead_id = json.loads(_bd(work, home, *argv).stdout)["id"]
+        if notes:
+            _bd(work, home, "update", bead_id, "--sandbox", "--notes", notes)
+        return bead_id
+
+    epic = create("the completed epic", issue_type="epic")
+    kids = [create(f"child {i} of the epic", parent=epic) for i in (1, 2, 3)]
+    # Real hierarchical ids are the whole point of layer 1 — if bd ever stops
+    # minting them this way the fixture is no longer reproducing the bug, and
+    # that must fail loudly rather than pass vacuously.
+    assert all(k.startswith(f"{epic}.") for k in kids), kids
+
+    child_referrers = [
+        create("names only child 1", notes=f"you must verify {kids[0]} before landing"),
+        create("names only child 2", notes=f"DO NOT CLOSE until {kids[1]} is merged"),
+        create("names only child 3", notes=f"this hold needs {kids[2]} to land first"),
+    ]
+    # A description-shaped paragraph: the instructional vocabulary is present on
+    # the line but several sentences away from the mention — the exact shape
+    # that made four of the seven live false positives fire.
+    citation = create("cites the epic as history", notes=(
+        f"The checker misfired here. This was first observed on {epic} during the "
+        f"2026-07-24 drain. We must check the tier budget before the next run."))
+    instruction = create("carries a live instruction about the epic", notes=(
+        f"hold_until: {epic} must land on the integration branch"))
+
+    # A separate hub identifier with more instructional referrers than the
+    # render cap, so the truncation line — and the remedy it prints — is
+    # exercised end to end against a real store.
+    hub = create("the hub identifier")
+    seed = root / "seed.jsonl"
+    seed.write_text("\n".join(
+        json.dumps({"title": f"hub referrer {i:02d} must verify {hub} before landing",
+                    "issue_type": "task", "priority": 2, "status": "open"})
+        for i in range(14)) + "\n")
+    imported = _run(["bd", "import", "--sandbox", "-i", str(seed)], work, home)
+    assert imported.returncode == 0, imported.stdout + imported.stderr
+
+    return {"work": work, "home": home, "epic": epic, "kids": kids,
+            "child_referrers": child_referrers, "citation": citation,
+            "instruction": instruction, "hub": hub, "hub_referrers": 14}
+
+
+def _sweep(scope_sandbox, *args):
+    cp = _run([sys.executable, str(SWEEPER), *args],
+              scope_sandbox["work"], scope_sandbox["home"])
+    assert cp.returncode == 0, f"rc={cp.returncode} {cp.stderr}"
+    return cp
+
+
+def _sweep_json(scope_sandbox, *args):
+    return json.loads(_sweep(scope_sandbox, "--json", *args).stdout)
+
+
+# ---- LAYER 1 against a real hierarchy ------------------------------------
+
+def test_retiring_a_parent_does_not_attribute_its_childrens_references(scope_sandbox):
+    """Retiring the epic retires nothing of its children's — they were closed on
+    their own schedule. None of the three child-only referrers may appear."""
+    referrers = {f["referrer_id"] for f in _sweep_json(scope_sandbox, scope_sandbox["epic"])["flags"]}
+    leaked = set(scope_sandbox["child_referrers"]) & referrers
+    assert not leaked, f"child references must not be attributed to the parent: {leaked}"
+
+
+def test_retiring_a_child_still_flags_that_childs_referrer(scope_sandbox):
+    """POSITIVE CONTROL for layer 1, same store: those referrers ARE findable —
+    they simply belong to a different retirement event. Without this the test
+    above would pass just as happily on a detector that found nothing at all."""
+    child, referrer = scope_sandbox["kids"][0], scope_sandbox["child_referrers"][0]
+    referrers = {f["referrer_id"] for f in _sweep_json(scope_sandbox, child)["flags"]}
+    assert referrer in referrers, (
+        f"retiring {child} must still flag its own referrer: {referrers}")
+
+
+# ---- LAYER 2 against real paragraph prose --------------------------------
+
+def test_a_real_citation_is_classed_apart_from_a_real_instruction(scope_sandbox):
+    """Both beads name the epic and both carry instructional vocabulary on the
+    line. Only the one whose mention sits in an instructional SENTENCE is decay;
+    the citation is still reported, in its own non-actionable class."""
+    kinds = {f["referrer_id"]: f["kind"]
+             for f in _sweep_json(scope_sandbox, scope_sandbox["epic"])["flags"]}
+    assert kinds.get(scope_sandbox["instruction"]) == "instruction"
+    assert kinds.get(scope_sandbox["citation"]) == "citation", (
+        f"the historical citation must not be counted as decay: {kinds}")
+
+
+def test_the_epic_close_reports_one_instruction_not_the_whole_prefix_family(scope_sandbox):
+    """The bead's headline number, reproduced in miniature against real beads:
+    five open beads name this identifier or its children, and exactly ONE is
+    something a closer can act on. That one is what the report counts."""
+    flags = _sweep_json(scope_sandbox, scope_sandbox["epic"])["flags"]
+    instructions = [f["referrer_id"] for f in flags if f["kind"] == "instruction"]
+    assert instructions == [scope_sandbox["instruction"]], instructions
+
+    report = _sweep(scope_sandbox, scope_sandbox["epic"]).stdout
+    assert "leaves 1 open instruction still naming it" in report, report
+    for child_ref in scope_sandbox["child_referrers"]:
+        assert child_ref not in report, f"{child_ref} is a child's referrer: {report}"
+    assert "citation" in report.lower(), "the citation is separated, not suppressed"
+
+
+# ---- LAYER 3: the printed remedy, executed against a real store ----------
+
+def test_see_them_all_actually_shows_them_all(scope_sandbox):
+    """Run the EXACT command the tool prints in its own 'see them all' line and
+    require the output to contain every hit.
+
+    Against the pre-fix tool this looped: the printed command was the bare
+    invocation that had just truncated, so following it produced the same ten
+    lines and the same message. POSITIVE CONTROL first — the default run really
+    is truncated, so the comparison below measures a real difference rather than
+    an empty one."""
+    default = _sweep(scope_sandbox, scope_sandbox["hub"]).stdout
+    n = scope_sandbox["hub_referrers"]
+    assert "more not shown" in default, (
+        f"the fixture must exceed the render cap for this test to mean anything: {default}")
+    assert f"leaves {n} open instructions" in default, default
+    # DISTINCT referrers — the report renders two lines per flag (the referrer
+    # and its matching line), so a raw match count double-counts and would make
+    # this control unable to fail.
+    shown_by_default = {m for m in re.findall(r"hub referrer (\d\d)", default)}
+    assert len(shown_by_default) < n, (
+        f"the default run must NOT already show them all: {sorted(shown_by_default)}")
+
+    m = re.search(r"see them all with:\s*(.+?)\s*$", default, re.M)
+    assert m, f"the truncation line must name a remedy: {default}"
+    remedy = shlex.split(m.group(1))
+    assert remedy[0] == "sable-identifier-decay", remedy
+
+    full = _sweep(scope_sandbox, *remedy[1:]).stdout
+    missing = [i for i in range(n) if f"hub referrer {i:02d}" not in full]
+    assert not missing, f"the printed remedy did not show referrers {missing}"
+    assert "more not shown" not in full, "the remedy must terminate, not re-truncate"
+
+
+def test_the_close_hook_reports_the_narrowed_count_end_to_end(scope_sandbox):
+    """The whole seam as an operator meets it: the REAL PreToolUse hook, the
+    REAL sweeper off PATH, closing the REAL epic. What reaches the screen must
+    be the one actionable instruction — not the prefix family."""
+    shim = scope_sandbox["work"].parent / "shimbin"
+    if not shim.exists():
+        shim.mkdir()
+        (shim / "sable-identifier-decay").symlink_to(SWEEPER)
+    rc, ctx = _fire_hook({**scope_sandbox, "shim": shim},
+                         f"bd close {scope_sandbox['epic']} --sandbox")
+    assert rc == 0, "the hook must never fail the tool call"
+    assert scope_sandbox["instruction"] in ctx, ctx
+    for child_ref in scope_sandbox["child_referrers"]:
+        assert child_ref not in ctx, f"prefix-collision noise reached the operator: {ctx}"
