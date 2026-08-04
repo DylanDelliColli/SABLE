@@ -400,3 +400,43 @@ execution runner. The portable mechanisms:
    conditional, lossless-only candidate.
 6. **bv evaluation and all §1–§7, §11–§13 proposals: held** pending operator
    scheduling.
+
+## 17. PR-native landing layer: retire the custom merge seat for consumer repos — ADOPTED (operator ruled 2026-08-04)
+
+**Source.** Not an external repo review — the 2026-08-03/04 fleet-debut
+validation wave (record: SABLE-3rv5r), plus the operator's two rulings that
+night: dogfood the machinery on other repos rather than SABLE itself, and the
+deflation question "isn't this just over-engineering the PR functionality?"
+The answer was yes, for the landing layer.
+
+**The finding.** SABLE's merge/landing stack — preview kicks, re-kick churn,
+exact-object promote, local coverage floor, hand-rolled push matcher,
+hand-rolled base resolution — substantially reimplements PR + merge queue +
+branch protection + required checks. The debut wave's own measurements are
+the evidence: plain GitHub CI was the cheapest, most reliable leg all night
+(median 5m14s, zero flakes across 40+ runs), while every major throughput
+sink and the worst instrument defects were in the custom duplicates:
+
+- Local coverage-floor grind at promote: ~30 min/landing (SABLE-0mtus, now P0)
+- Preview re-kick churn: 42% of eight hours of preview cycles spent on
+  branches that could not land (SABLE-ifsuc measurement)
+- Push matcher bypassed entirely by any command-position wrapper —
+  `timeout git push` runs ungated (SABLE-i265s, one real occurrence)
+- CI base resolution 188 commits stale via tracked .sable vs local config
+  divergence (SABLE-gfhx9)
+
+**The adoption.** Consumer repos land via native GitHub flow: PR per worker
+branch, merge queue (chained evaluation, red-only invalidation, lands the
+tested tree — the exact-object property preserved by the platform), branch
+protection rulesets (dissolves the i265s class: server-side enforcement
+cannot be bypassed client-side), required checks including patch coverage
+(reduces 0mtus to configuration). SABLE remains the opinion layer PRs know
+nothing about: beads, dispatch governance, worker conduct, messaging/wake,
+review discipline.
+
+**Consequences for existing beads.** SABLE-z3j28 (custom merge train) is
+candidate-retired — burden of proof now on building, not adopting; note on
+the bead. SABLE-0mtus and SABLE-gfhx9 survive for the SABLE repo itself,
+which keeps the custom seat at solo intensity because its landings mutate
+the host's own installed tooling (the self-hosting constraint consumer repos
+do not have).
