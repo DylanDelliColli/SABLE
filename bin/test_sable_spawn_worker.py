@@ -1771,6 +1771,73 @@ def test_successful_refresh_emits_no_warning_stanza():
     assert "DO NOT DISCARD" not in p
 
 
+def test_refresh_reports_rebased_shas_in_prompt(
+        monkeypatch, worktree_with_origin):
+    """SABLE-9u86l: a moving refresh names both object identities in prompt."""
+    work = worktree_with_origin
+    _git(work, "commit", "--allow-empty", "-m", "base moves")
+    _git(work, "push", "origin", "main")
+    _git(work, "reset", "--hard", "HEAD~1")
+    _git(work, "branch", "wk-refresh-notice", "HEAD")
+    wt = work.parent / "wk-refresh-notice"
+    _git(work, "worktree", "add", str(wt), "wk-refresh-notice")
+    before = _rev(wt)
+    notices = []
+    monkeypatch.delenv("SABLE_BASE_BRANCH", raising=False)
+    monkeypatch.delenv("SABLE_INTEGRATION_BRANCH", raising=False)
+
+    warning = ssw.refresh_worktree(str(wt), None, notices)
+    after = _rev(wt)
+    assert warning is None
+    assert before != after
+    assert len(notices) == 1
+    p = ssw.assemble_dispatch_prompt(
+        bead_id="X-1", title="Revise", description=f"preserve {before}",
+        worktree=str(wt), branch="wk-refresh-notice", model="sonnet",
+        refresh_notice=notices[0], worker_label="tarzan",
+    )
+    assert before in p
+    assert after in p
+    assert "WORKTREE REFRESHED AT SPAWN" in p
+
+
+def test_refresh_noop_emits_no_notice(
+        monkeypatch, worktree_with_origin):
+    """SABLE-9u86l negative control: an unchanged HEAD grows no banner."""
+    work = worktree_with_origin
+    _git(work, "branch", "wk-refresh-noop", "origin/main")
+    wt = work.parent / "wk-refresh-noop"
+    _git(work, "worktree", "add", str(wt), "wk-refresh-noop")
+    notices = []
+    monkeypatch.delenv("SABLE_BASE_BRANCH", raising=False)
+    monkeypatch.delenv("SABLE_INTEGRATION_BRANCH", raising=False)
+
+    warning = ssw.refresh_worktree(str(wt), None, notices)
+    assert warning is None
+    assert notices == []
+    p = ssw.assemble_dispatch_prompt(
+        bead_id="X-1", title="Revise", description="already current",
+        worktree=str(wt), branch="wk-refresh-noop", model="sonnet",
+    )
+    assert "WORKTREE REFRESHED AT SPAWN" not in p
+
+
+def test_dispatch_prompt_ends_with_actual_worker_inbox_check_single_and_bundle():
+    """SABLE-5w5bj: both forms end in the concrete durable read path."""
+    kwargs = dict(
+        bead_id="X-1", title="Thing", description="desc", worktree="/wt/wk-x",
+        branch="wk-x", model="sonnet", worker_label="tarzan")
+    single = ssw.assemble_dispatch_prompt(**kwargs)
+    bundled = ssw.assemble_dispatch_prompt(
+        **kwargs, bundle=[{"id": "Y-2", "title": "Sibling",
+                           "description": "sibling desc"}])
+    for prompt in (single, bundled):
+        assert prompt.rstrip().endswith(
+            "a message\nthat merely hopes to land is not a durable assignment channel.")
+        assert "bd list --label for-tarzan" in prompt
+        assert "for-{WORKER_LABEL}" not in prompt
+
+
 def test_worktree_dirty_paths_reads_git_status_porcelain(monkeypatch):
     """worktree_dirty_paths strips the two-char porcelain status prefix and
     returns the bare paths; a clean tree (no output) yields []."""
