@@ -539,10 +539,21 @@ def is_ancestor(repo: str, sha: str, ancestor_of: str):
     return None
 
 
+class OccupancyAssessmentError(RuntimeError):
+    """Git could not establish branch occupancy without guessing.
+
+    Occupancy is a dispatch constraint, so an unreadable diff must refuse the
+    assessment rather than collapse to an empty path set (release), while a
+    failed merge-base must not fall back to the integration tip (which turns
+    the comparison into a misleading two-dot diff of the integration side)."""
+
+
 def branch_diff_files(repo: str, base: str, tip: str) -> frozenset:
     cp = _git(repo, "diff", "--name-only", base, tip)
     if cp.returncode != 0:
-        return frozenset()
+        detail = cp.stderr.strip() or f"git diff exited {cp.returncode}"
+        raise OccupancyAssessmentError(
+            f"branch diff {base}..{tip} failed: {detail}")
     return frozenset(p for p in cp.stdout.splitlines() if p.strip())
 
 
@@ -567,7 +578,12 @@ def wk_branch_occupants(repo: str, integration_ref: str) -> dict:
         if contained:
             continue  # landed — not an occupant
         base_cp = _git(repo, "merge-base", integration_ref, tip)
-        base = base_cp.stdout.strip() if base_cp.returncode == 0 else integration_ref
+        base = base_cp.stdout.strip()
+        if base_cp.returncode != 0 or not base:
+            detail = base_cp.stderr.strip() or (
+                f"git merge-base exited {base_cp.returncode}")
+            raise OccupancyAssessmentError(
+                f"merge base for {integration_ref} and {ref} failed: {detail}")
         branch_name = ref[len("origin/"):] if ref.startswith("origin/") else ref
         files = branch_diff_files(repo, base, tip)
         if files:
@@ -1560,7 +1576,12 @@ def main(argv: list | None = None) -> int:
     if args.cmd == "occupants":
         integration_branch = git_lib.resolve_integration_branch(repo)
         integration_ref = f"origin/{integration_branch}"
-        occupants = build_occupants(repo, integration_ref, set(args.exclude))
+        try:
+            occupants = build_occupants(repo, integration_ref,
+                                        set(args.exclude))
+        except OccupancyAssessmentError as exc:
+            print(f"COULD NOT ASSESS OCCUPANCY — {exc}", file=sys.stderr)
+            return 2
         serializable = {label: sorted(paths)
                         for label, paths in sorted(occupants.items())}
         if args.format == "json":
@@ -1587,7 +1608,11 @@ def main(argv: list | None = None) -> int:
         return activation_exit_code(results)
 
     if args.cmd == "dispatch":
-        results, integration_ref = run_dispatch(repo, args.bead_ids)
+        try:
+            results, integration_ref = run_dispatch(repo, args.bead_ids)
+        except OccupancyAssessmentError as exc:
+            print(f"COULD NOT ASSESS OCCUPANCY — {exc}", file=sys.stderr)
+            return 2
         if args.format == "json":
             print(json.dumps({"integration_ref": integration_ref, "results": results}, indent=2))
         else:
