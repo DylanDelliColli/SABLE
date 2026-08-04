@@ -1,4 +1,4 @@
-d3b815d72f3b1141138dfb5852881d10a34dbe77912183ba3368f6a132fe090f  ./.sable-install-provenance
+cd2f143ad51e9b78e13d5ead6d3036e3f98b21bb31b11050c3d5bf9f9c639639  ./.sable-install-provenance
 6ad9a8c7c088f4750326a7dac7c751951860cc9dff127f23987115672d7a8351  ./CLAUDE.md
 f595d9fd7685073d898a8b80638e97e26dac98f4e117cf206771b2d5ac964bfe  ./agents/columbo.md
 8b4884da9b454bb5f55902944789de77438e5ba2daa40849317e4b18879e0f35  ./agents/rudy.md
@@ -26,7 +26,7 @@ cf263f46c916d834bce9c944d9ec2b0708f5349d128064ed185739eb38314aba  ./hooks/multi-
 9767a2f76c842dfec641b3fef5c8dac231911b88d694b6319c5947ddef575479  ./hooks/multi-manager/post-push-merge-notify.sh
 462d8ef002322073cbd39fe2b03f2852da86d37b38127a27c4661499603f3e63  ./hooks/multi-manager/pre-dispatch-claim.sh
 ddd4cfb9db11c9f17199ccb8470a37a185a68ef9f435da1d9d6d7efe120371dc  ./hooks/multi-manager/pre-dispatch-model-check.sh
-4c027de9e702ef6968d6bff4db7e102b0201d5d5fa44406783e5cb9b6f154702  ./hooks/multi-manager/pre-dispatch-overlap.sh
+761e17d4d6cddd4bafb5fcf620b0183f7833e7a0c140ae19a7abdf8754ac435b  ./hooks/multi-manager/pre-dispatch-overlap.sh
 0ce839ca0fbbd0a9ff60128296e8bc0dfe19fa9cff3ff0f2efa568e4aa2d8cdb  ./hooks/multi-manager/pre-dispatch-preempt.sh
 cbdea65644eff16c2c462ee855ba11106185927b7d2d0f2fe899740337973f4d  ./hooks/multi-manager/pre-dispatch-refresh.sh
 d609623bf1dba8f50ba3b02962af8014c90d679e31267bcf1f2d87dd4f042250  ./hooks/multi-manager/pre-push-rebase-test.sh
