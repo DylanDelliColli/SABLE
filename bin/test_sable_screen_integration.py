@@ -333,12 +333,14 @@ def test_dispatch_collides_with_in_progress_declared_write(tmp_path):
     assert r.returncode == 1
 
 
-def test_dispatch_catches_undeclared_collateral_via_branch_ground_truth(tmp_path):
-    """SABLE-krbxd: an uncontained wk-* branch whose bead declares NOTHING
-    still occupies the files it actually changed — a declaration-only
-    screen would be blind to this collision entirely."""
+def test_closed_bead_uncontained_branch_occupies_then_merge_releases(tmp_path):
+    """SABLE-m2fyf: close a REAL bead after pushing its REAL branch, then
+    prove the branch's attributable path remains occupied until that same
+    branch is merged into the integration ref."""
     origin, work, home = _setup(tmp_path)
-    collateral_bead = _create_bead(work, home, title="bead with no declared footprint")
+    collateral_bead = _create_bead(
+        work, home, title="closed authoring lifecycle with live branch",
+        status="closed")
     _push_branch(work, "wk-collateral", file_name="bin/undeclared.py")
     _bd(work, home, "update", collateral_bead, "--sandbox",
         "--set-metadata", "branch=wk-collateral")
@@ -346,11 +348,33 @@ def test_dispatch_catches_undeclared_collateral_via_branch_ground_truth(tmp_path
     candidate = _create_bead(work, home, title="candidate that would touch the same file",
                              metadata={"footprint_writes": "bin/undeclared.py"})
 
+    occupied = _screen(work, home, "occupants", "--exclude", candidate,
+                       "--format", "json")
+    occupied_payload = json.loads(occupied.stdout)
+    assert occupied_payload["occupants"]["branch:wk-collateral"] == [
+        "bin/undeclared.py"]
+
     r = _screen(work, home, "dispatch", candidate, "--format", "json")
     payload = json.loads(r.stdout)
     row = payload["results"][0]
     assert row["verdict"] == "collides", row
     assert any(label.startswith("branch:wk-collateral") for label in row["hits"]), row
+    assert row["hits"]["branch:wk-collateral"] == ["bin/undeclared.py"], row
+
+    _git(work, "checkout", BASE)
+    _git(work, "merge", "--ff-only", "wk-collateral")
+    _git(work, "push", "origin", BASE)
+
+    released_occupants = _screen(work, home, "occupants", "--exclude", candidate,
+                                 "--format", "json")
+    assert "branch:wk-collateral" not in json.loads(
+        released_occupants.stdout)["occupants"]
+
+    released = _screen(work, home, "dispatch", candidate, "--format", "json")
+    released_row = json.loads(released.stdout)["results"][0]
+    assert released_row["verdict"] == "clear", released_row
+    assert "branch:wk-collateral" not in released_row["hits"], released_row
+    assert released.returncode == 0
 
 
 def test_dispatch_negative_control_disjoint_candidate_clears(tmp_path):
