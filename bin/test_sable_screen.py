@@ -41,6 +41,8 @@ import sys
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
+import pytest
+
 _LOADER = SourceFileLoader(
     "sable_screen", str(Path(__file__).resolve().parent / "sable-screen")
 )
@@ -845,6 +847,66 @@ def test_closed_bead_with_uncontained_branch_still_occupies(tmp_path):
 
     occ = ss.wk_branch_occupants(str(repo), "origin/tmux-only")
     assert occ.get("branch:wk-uncontained") == frozenset({"uncontained.txt"})
+
+
+def test_failed_merge_base_refuses_occupancy_assessment(tmp_path, monkeypatch):
+    """A merge-base failure is unknown, never a two-dot fallback against the
+    integration ref that attributes integration-side changes to a worker."""
+    repo = _git_repo(tmp_path)
+    spine = _commit(repo, "base.txt")
+    _run("git", "checkout", "-qb", "wk-uncontained", cwd=str(repo))
+    tip = _commit(repo, "worker.txt")
+    _run("git", "checkout", "-q", "-", cwd=str(repo))
+    _fake_remote_ref(repo, "tmux-only", spine)
+    _fake_remote_ref(repo, "wk-uncontained", tip)
+
+    real_git = ss._git
+
+    def fail_merge_base(repo_path, *args):
+        if args and args[0] == "merge-base" and "--is-ancestor" not in args:
+            return subprocess.CompletedProcess(args, 128, "", "shallow history")
+        return real_git(repo_path, *args)
+
+    monkeypatch.setattr(ss, "_git", fail_merge_base)
+    with pytest.raises(ss.OccupancyAssessmentError, match="merge base.*shallow history"):
+        ss.wk_branch_occupants(str(repo), "origin/tmux-only")
+
+
+def test_failed_branch_diff_refuses_occupancy_assessment(tmp_path, monkeypatch):
+    """A failed diff is unknown, never an empty path set that releases the
+    branch and reports a false clean occupancy screen."""
+    repo = _git_repo(tmp_path)
+    spine = _commit(repo, "base.txt")
+    _run("git", "checkout", "-qb", "wk-uncontained", cwd=str(repo))
+    tip = _commit(repo, "worker.txt")
+    _run("git", "checkout", "-q", "-", cwd=str(repo))
+    _fake_remote_ref(repo, "tmux-only", spine)
+    _fake_remote_ref(repo, "wk-uncontained", tip)
+
+    real_git = ss._git
+
+    def fail_diff(repo_path, *args):
+        if args and args[0] == "diff":
+            return subprocess.CompletedProcess(args, 128, "", "missing object")
+        return real_git(repo_path, *args)
+
+    monkeypatch.setattr(ss, "_git", fail_diff)
+    with pytest.raises(ss.OccupancyAssessmentError, match="branch diff.*missing object"):
+        ss.wk_branch_occupants(str(repo), "origin/tmux-only")
+
+
+def test_occupants_cli_reports_could_not_assess(tmp_path, monkeypatch, capsys):
+    repo = _git_repo(tmp_path)
+    _commit(repo, "base.txt")
+
+    def refuse(*_args, **_kwargs):
+        raise ss.OccupancyAssessmentError("fixture git failure")
+
+    monkeypatch.setattr(ss, "build_occupants", refuse)
+    rc = ss.main(["occupants", "--repo", str(repo), "--format", "json"])
+
+    assert rc == 2
+    assert "COULD NOT ASSESS OCCUPANCY" in capsys.readouterr().err
 
 
 def test_contained_branch_stops_occupying(tmp_path, monkeypatch):
