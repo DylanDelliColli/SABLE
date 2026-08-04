@@ -87,6 +87,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
+import sable_activation_lib as activation_lib
 import sable_batch_admission_lib as admission
 import sable_batch_fold_lib as fold_lib
 import sable_batch_key_lib as batch_key
@@ -108,6 +109,29 @@ def _notify(target: str, message: str) -> None:
 def _append_evidence(repo: str, bead: str, note: str) -> None:
     git_lib._run(git_lib._tool("SABLE_MG_BD", "bd") + ["update", bead, "--append-notes", note],
                  cwd=repo, check=False)
+
+
+def _report_activation(repo: str, bead: str, base_sha: str, landed_sha: str) -> None:
+    """Print and persist post-landing activation obligations without blocking.
+
+    The promotion has already happened when this runs.  This is deliberately
+    an observability seam: an unreadable install or settings path must be loud,
+    but can never retroactively turn a verified green push red.
+    """
+    try:
+        paths = activation_lib.changed_paths(repo, base_sha, landed_sha)
+        settings = (
+            Path.home() / ".claude" / "settings.json",
+            Path(repo) / ".claude" / "settings.json",
+        )
+        report = activation_lib.activation_report(
+            paths, landed_sha, repo_root=repo, settings_paths=settings)
+        line = f"activation-obligations: {report}"
+        print(f"sable-merge-gate: {line}")
+        _append_evidence(repo, bead, line)
+    except Exception as exc:  # noqa: BLE001 — evidence must never block a green promote
+        print(f"sable-merge-gate: activation obligations could not be assessed: {exc}",
+              file=sys.stderr)
 
 
 # --------------------------------------------------------------------------
@@ -3580,6 +3604,7 @@ def _stale_base(bead: str, branch: str, base: str, repo: str, remote: str,
             f"to {current_base[:7]}. Footprints disjoint ({assessment.reason}). The combined tree "
             f"{combined_sha} was RE-VERIFIED on the real merge: {impact_detail}. Promoted that same "
             f"combined object byte-identical to {base} — NOT the stale preview.")
+        _report_activation(repo, bead, current_base, combined_sha)
         try:
             record = AttentionRecord(
                 bead=bead, branch=branch,
@@ -3881,6 +3906,7 @@ def promote(bead: str, branch: str, base: str, repo: str, remote: str,
                     f"merge-preview ci-verify gate GREEN: ref {ref}, run {url or 'n/a'}, "
                     f"preview {preview_sha}, promoted byte-identical to {base} "
                     f"(verdict {verdict.source}, preview {'adopted' if adopted else 'built'}).")
+            _report_activation(repo, bead, base_sha, preview_sha)
             # SABLE-21rug.1: a per-landing attention record joins the evidence
             # notes above — the epic's mandatory-first baseline input. Wrapped
             # like the cleanup below: observability must never block a green
@@ -4198,6 +4224,7 @@ def land_batch(repo: str, remote: str, base: str, base_sha: str, fold_tip: str,
         for bead_id in m.bead_ids:
             try:
                 _append_evidence(repo, bead_id, reason)
+                _report_activation(repo, bead_id, base_sha, landed)
             except Exception:  # noqa: BLE001 — evidence is best-effort
                 pass
     _notify(manager, reason)
