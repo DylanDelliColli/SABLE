@@ -234,7 +234,7 @@ def test_autostart_provider_boot_failure_removes_session(sock, tmp_path):
     }
     r = subprocess.run(
         ["python3", str(BIN), "--session", "sable", "--autostart"],
-        capture_output=True, text=True, env=env,
+        capture_output=True, text=True, env=env, cwd=tmp_path,
     )
 
     assert r.returncode == 5, f"stdout={r.stdout!r} stderr={r.stderr!r}"
@@ -250,9 +250,58 @@ def test_autostart_provider_boot_failure_removes_session(sock, tmp_path):
     state.write_text('{"mode":"execution"}')
     retry = subprocess.run(
         ["python3", str(BIN), "--session", "sable"],
-        capture_output=True, text=True, env=env,
+        capture_output=True, text=True, env=env, cwd=tmp_path,
     )
     assert retry.returncode == 0, retry.stderr
+
+
+@pytest.mark.parametrize("role_card_root", ["project", "home"])
+def test_autostart_provider_role_card_resolves_each_root(
+    sock, tmp_path, role_card_root
+):
+    """Either supported role-card root must bypass the missing-card guard."""
+    state = tmp_path / "mode.json"
+    state.write_text(
+        '{"mode":"execution","providers":{"optimus":"codex"}}'
+    )
+    empty_home = tmp_path / "home"
+    empty_home.mkdir()
+    root = tmp_path if role_card_root == "project" else empty_home
+    role_card = root / ".claude" / "sable" / "roles" / "optimus.md"
+    role_card.parent.mkdir(parents=True)
+    role_card.write_text("# Optimus\n")
+    rec = tmp_path / "rec"
+    rec.mkdir()
+    script = tmp_path / "provider-ready.sh"
+    script.write_text(
+        'printf "› "\n'
+        "IFS= read -r -n 1 byte\n"
+        'printf "%s" "$byte" > "$REC_DIR/optimus.txt"\n'
+        "sleep 2\n"
+    )
+    env = {
+        **os.environ,
+        "HOME": str(empty_home),
+        "SABLE_MODE_STATE": str(state),
+        "SABLE_TMUX_SOCKET": sock,
+        "SABLE_TMUX_PANE_CMD": f"bash --noprofile --norc {script}",
+        "REC_DIR": str(rec),
+        "SABLE_DISPATCH_READY_TIMEOUT": "2",
+        "SABLE_DISPATCH_POLL_INTERVAL": "0.1",
+        "SABLE_DISPATCH_SUBMIT_TRIES": "1",
+    }
+    r = subprocess.run(
+        ["python3", str(BIN), "--session", "sable", "--roles", "optimus",
+         "--autostart"],
+        capture_output=True, text=True, env=env, cwd=tmp_path,
+    )
+
+    assert (rec / "optimus.txt").read_text() == "B", (
+        f"{role_card_root} role card did not reach the delivery path"
+    )
+    assert r.returncode == 11, f"stdout={r.stdout!r} stderr={r.stderr!r}"
+    assert "delivery could not be verified" in r.stderr
+    assert "no installed role card" not in r.stderr
 
 
 def test_default_session_derives_from_repo(sock, tmp_path):
