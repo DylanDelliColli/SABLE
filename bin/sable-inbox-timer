@@ -87,6 +87,19 @@ def _run(argv: list[str], **kwargs) -> subprocess.CompletedProcess[str]:
     return subprocess.run(argv, capture_output=True, text=True, check=False, **kwargs)
 
 
+def _tmux_client_identity() -> str:
+    """Resolved client path/version for actionable enumeration diagnostics."""
+    path = shutil.which("tmux")
+    if not path:
+        return "tmux (unresolved on PATH)"
+    try:
+        version = _run([path, "-V"])
+    except OSError:
+        return f"{path} (version unavailable)"
+    detail = (version.stdout or version.stderr or "").strip()
+    return f"{path} ({detail or 'version unavailable'})"
+
+
 def resolve_socket(
     cli_socket: str | None,
     env: dict[str, str] | None = None,
@@ -136,10 +149,16 @@ def enumerate_registry(
     try:
         result = run(argv)
     except OSError as exc:
-        raise TimerCannotAssess(f"could not enumerate tmux panes: {exc}") from exc
+        raise TimerCannotAssess(
+            f"could not enumerate tmux panes with client "
+            f"{_tmux_client_identity()}: {exc}"
+        ) from exc
     if result.returncode != 0:
         detail = (result.stderr or "").strip() or f"exit {result.returncode}"
-        raise TimerCannotAssess(f"could not enumerate tmux panes: {detail}")
+        raise TimerCannotAssess(
+            f"could not enumerate tmux panes with client "
+            f"{_tmux_client_identity()}: {detail}"
+        )
     records = parse_registry(result.stdout or "")
     if not records:
         label = socket or "default"

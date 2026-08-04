@@ -99,20 +99,14 @@ def _already_pending(capture_text: str, snippet: str) -> bool:
 
 
 def _without_ghost(line: str, provider: str = "claude") -> str:
-    """Drop Codex's ghost-suggestion spans so an idle composer showing a hint
+    """Drop provider ghost-suggestion spans so an idle composer showing a hint
     compares equal to a bare prompt glyph.
-
-    CODEX ONLY, deliberately. Claude suppresses its own suggestions at the
-    source with CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0 (SABLE-ndaup), so a dim
-    span on a Claude composer is not a hint to skip — it is content, and
-    silently ignoring it would be the same over-type bug in the other
-    provider's clothes.
 
     Only DIM-STYLED text is dropped. Unstyled text after the glyph is input a
     human actually typed and must keep the pane out of ready state
-    (SABLE-6c391 / SABLE-r3fg0)."""
-    if normalize_provider(provider) != "codex":
-        return line
+    (SABLE-06r3j / SABLE-6c391 / SABLE-r3fg0). Both Claude and Codex render
+    idle suggestions dim, and capture-pane -e preserves that distinction."""
+    normalize_provider(provider)
     return _DIM_SPAN_RE.sub("", line)
 
 
@@ -123,7 +117,7 @@ def _composer_line(
 
     Prompt glyphs also occur in transcript text, so a bare glyph anywhere in
     the frame is not composer evidence. The editable composer is the last row
-    beginning with a provider glyph; Codex's dim ghost suggestion is removed
+    beginning with a provider glyph; a dim ghost suggestion is removed
     before deciding whether that row is empty.
     """
     glyphs = prompt_glyphs(provider)
