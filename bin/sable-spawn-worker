@@ -131,6 +131,7 @@ worker nothing to build from no matter how much evidence lives in notes.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import re
@@ -138,6 +139,7 @@ import signal
 import shutil
 import subprocess
 import sys
+from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from typing import NamedTuple
 
@@ -945,8 +947,48 @@ def declared_path_existence_check(repo: str,
     return DeclaredPathVerdict("allow", warnings=tuple(warnings))
 
 
+_OCCUPANCY_MODULE = None
+
+
+def _shared_occupancy_module():
+    """Load the extensionless sable-screen executable as an importable module."""
+    global _OCCUPANCY_MODULE
+    if _OCCUPANCY_MODULE is not None:
+        return _OCCUPANCY_MODULE
+    name = "_sable_screen_occupancy"
+    path = Path(os.path.realpath(__file__)).with_name("sable-screen")
+    loader = SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(name, loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    loader.exec_module(module)
+    _OCCUPANCY_MODULE = module
+    return module
+
+
+def _shared_occupants(repo: str, exclude_ids: set[str],
+                      in_progress: list[dict]) -> tuple[dict | None, str]:
+    """Read the canonical two-leg census from sable-screen.
+
+    This consumer deliberately owns candidate parsing and serialize-with
+    policy, but not the answer to "what occupies files now?".  Keeping that
+    answer behind one executable seam prevents close-at-push from deleting a
+    live branch's claim in one gate while another gate still sees it.
+    """
+    try:
+        screen = _shared_occupancy_module()
+        integration = screen.git_lib.resolve_integration_branch(repo)
+        occupants = screen.in_progress_occupants(in_progress, exclude_ids)
+        occupants.update(screen.wk_branch_occupants(
+            repo, f"origin/{integration}"))
+    except Exception as exc:
+        return None, f"sable-screen occupancy functions failed: {exc}"
+    return occupants, ""
+
+
 def overlap_check(bead_id: str, bead: dict, in_progress: list[dict],
-                  bundle: list[dict] | tuple[dict, ...] = ()) -> OverlapVerdict:
+                  bundle: list[dict] | tuple[dict, ...] = (),
+                  repo: str | None = None) -> OverlapVerdict:
     """SABLE-jd5fj.6: overlap flips from ADVISORY (re-homed pre-dispatch-overlap,
     SABLE-bldh.8) to a SCHEDULING CONSTRAINT. A declared footprint overlapping a
     DIFFERENT in-progress bead's footprint DENIES the dispatch. Two named outs:
@@ -1043,6 +1085,29 @@ def overlap_check(bead_id: str, bead: dict, in_progress: list[dict],
             "CLEAR verdict, only an absence of anything to check.",
             warnings=tuple(warnings))
     hits: list[tuple[str, str, list[str]]] = []
+    by_id = {other.get("id", ""): other for other in in_progress}
+    if repo is not None:
+        occupants, occupant_error = _shared_occupants(
+            repo, dispatch_ids, in_progress)
+        if occupants is None:
+            return OverlapVerdict(
+                "could-not-assess",
+                "OVERLAP CHECK COULD NOT RUN — the shared sable-screen "
+                f"occupancy census failed ({occupant_error}). A missing "
+                "occupancy answer is not a clear result.",
+                warnings=tuple(warnings))
+        for label, occupied_files in occupants.items():
+            shared = my_files & occupied_files
+            if not shared:
+                continue
+            if label.startswith("in_progress:"):
+                oid = label.removeprefix("in_progress:")
+                assignee = (by_id.get(oid, {}).get("assignee") or "unassigned")
+            else:
+                oid = label
+                assignee = "branch ground truth"
+            hits.append((oid, assignee, sorted(shared)))
+
     for other in in_progress:
         oid = other.get("id", "")
         # SABLE-fz8kd: `dispatch_ids`, not just `bead_id` — a bundle sibling in
@@ -1061,9 +1126,10 @@ def overlap_check(bead_id: str, bead: dict, in_progress: list[dict],
                 f"({', '.join(theirs.unreadable_sources)} present but naming no "
                 "path) — it could not be compared against, so an overlap with it "
                 "would NOT have been detected.")
-        shared = my_files & theirs.files
-        if shared:
-            hits.append((oid, other.get("assignee") or "unassigned", sorted(shared)))
+        if repo is None:
+            shared = my_files & theirs.files
+            if shared:
+                hits.append((oid, other.get("assignee") or "unassigned", sorted(shared)))
     if not hits:
         return OverlapVerdict("none", warnings=tuple(warnings))
 
@@ -1077,7 +1143,7 @@ def overlap_check(bead_id: str, bead: dict, in_progress: list[dict],
         return OverlapVerdict(
             "deny",
             "OVERLAP DETECTED — this dispatch shares declared footprint with "
-            f"active in-progress work:\n{lines}\n\nSCHEDULING CONSTRAINT: "
+            f"live occupied work:\n{lines}\n\nSCHEDULING CONSTRAINT: "
             "dispatch denied. Wait for the overlapping bead to clear, or add "
             "an explicit 'Serialize-with: <bead-id>' line naming it to proceed "
             "— both merges will be tagged serialize-together for Chuck.",
@@ -2595,8 +2661,10 @@ def main(argv: list[str] | None = None) -> int:
                 sys.stderr.write(f"sable-spawn-worker: preempt blocked — {preempt_err}\n")
                 return 6
 
-        in_progress = parse_bead_list(_run(["bd", "list", "--status=in_progress", "--json"]))
-        overlap_verdict = overlap_check(bid, bead, in_progress, bundle_beads)
+        in_progress = parse_bead_list(_run(
+            ["bd", "list", "--status=in_progress", "--json", "--limit", "0"]))
+        overlap_verdict = overlap_check(
+            bid, bead, in_progress, bundle_beads, repo=os.getcwd())
         # SABLE-47try: surfaced on EVERY decision, before any of them is acted
         # on — a degraded comparison must be visible even when it released.
         for warning in overlap_verdict.warnings:
