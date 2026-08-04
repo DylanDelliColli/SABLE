@@ -51,8 +51,10 @@ of a known-benign overlay is deferred so the probe never clears a legitimate
 mid-dialog pane (see SABLE-kkgt for the delivery failures a silent stall causes).
 
 The bead pool is the manager's RESULT channel (the manager reviews the closed
-bead). This tool is the janitor: it surfaces pane liveness and reaps panes
-whose occupant has flagged itself done — pure tmux, no bd coupling.
+bead). The tool joins each pane's registered worktree branch to in-progress
+bead metadata so bundled work is counted, and audits every registered git
+worktree for uncommitted bytes before reaping. If either git or bd cannot be
+read, that non-answer is reported explicitly rather than rendered as clean.
 
 By default the listing is scoped to the CALLER'S OWN lane — the panes stamped
 @sable_lane == $CLAUDE_AGENT_NAME (SABLE-dcw2). Without this scoping any
@@ -156,8 +158,12 @@ WINDOW_NAME_WORKER_PREFIX = "worker-"
 # of all without disturbing any tag column.
 _FORMAT = ("#{pane_id}\t#{@sable_role}\t#{@sable_bead}\t#{@sable_status}\t"
            "#{@sable_class}\t#{@sable_deliverable}\t#{@sable_lane}\t"
-           "#{window_name}")
-_QUIESCENCE_FORMAT = _FORMAT + "\t#{pane_pid}"
+           "#{window_name}\t#{pane_current_path}")
+# Keep the quiescence wire shape stable: its parser and injected unit fixtures
+# consume pane_pid at column 8. Ordinary status alone needs pane_current_path.
+_QUIESCENCE_FORMAT = ("#{pane_id}\t#{@sable_role}\t#{@sable_bead}\t#{@sable_status}\t"
+                      "#{@sable_class}\t#{@sable_deliverable}\t#{@sable_lane}\t"
+                      "#{window_name}\t#{pane_pid}")
 
 QUIESCENCE_LIVE = "LIVE"
 QUIESCENCE_EXITED = "EXITED"
@@ -225,6 +231,7 @@ def parse_worker_panes(output: str) -> list[dict]:
         deliverable = parts[5] if len(parts) >= 6 and parts[5] else ""
         lane = parts[6] if len(parts) >= 7 and parts[6] else ""
         window = parts[7] if len(parts) >= 8 and parts[7] else ""
+        worktree = parts[8] if len(parts) >= 9 and parts[8] else ""
 
         if cls == "manager":
             continue  # always-on manager loops are never surfaced/reaped
@@ -245,6 +252,8 @@ def parse_worker_panes(output: str) -> list[dict]:
                    "class": cls, "deliverable": deliverable}
         if lane:
             rec["lane"] = lane
+        if worktree:
+            rec["worktree"] = os.path.realpath(worktree)
         workers.append(rec)
     return workers
 
@@ -1150,6 +1159,184 @@ def empty_worker_message(view_lane: str | None, all_workers: list[dict]) -> str:
             f"({n} worker pane(s) in other lane(s) — use --all to see the fleet)")
 
 
+# --- fleet-wide worktree and running-work truth (SABLE-5c5fu/42k96) --------
+
+def parse_worktree_list(porcelain: str) -> list[dict]:
+    """Parse every stanza emitted by ``git worktree list --porcelain``.
+
+    The returned paths are canonical so a tmux pane's ``pane_current_path``
+    can be joined to the registry without spelling/symlink drift.  Detached
+    and bare worktrees remain in the census: absence of a branch must not make
+    an uncommitted tree invisible.
+    """
+    trees: list[dict] = []
+    current: dict = {}
+    for line in porcelain.splitlines() + [""]:
+        if not line:
+            if current.get("path"):
+                trees.append(current)
+            current = {}
+            continue
+        key, _, value = line.partition(" ")
+        if key == "worktree":
+            current["path"] = os.path.realpath(value)
+        elif key == "branch":
+            current["branch"] = value.removeprefix("refs/heads/")
+        elif key in ("detached", "bare"):
+            current[key] = True
+    return trees
+
+
+def registered_worktrees(repo: str, run=subprocess.run) -> tuple[list[dict], str | None]:
+    """Fleet-wide worktree census, or an explicit reason it was unavailable."""
+    try:
+        cp = run(["git", "-C", repo, "worktree", "list", "--porcelain"],
+                 capture_output=True, text=True)
+    except OSError as exc:
+        return [], f"git worktree list could not run: {exc}"
+    if cp.returncode != 0:
+        return [], (cp.stderr or "git worktree list failed").strip()
+    return parse_worktree_list(cp.stdout), None
+
+
+def inspect_worktree(path: str, run=subprocess.run) -> dict:
+    """Return dirty/clean/could-not-assess without collapsing any state."""
+    try:
+        cp = run(["git", "-C", path, "status", "--porcelain",
+                  "--untracked-files=all"], capture_output=True, text=True)
+    except OSError as exc:
+        return {"state": "could-not-assess", "reason": str(exc)}
+    if cp.returncode != 0:
+        return {"state": "could-not-assess",
+                "reason": (cp.stderr or "git status failed").strip()}
+    paths = [line[3:] if len(line) >= 4 else line
+             for line in cp.stdout.splitlines() if line]
+    return {"state": "dirty" if paths else "clean", "paths": paths}
+
+
+def inspect_registered_worktrees(trees: list[dict]) -> dict[str, dict]:
+    return {tree["path"]: inspect_worktree(tree["path"]) for tree in trees}
+
+
+def worktree_for_path(path: str, trees: list[dict]) -> str:
+    """Registered root containing pane cwd ``path`` (longest match), if any."""
+    if not path:
+        return ""
+    candidate = os.path.realpath(path)
+    matches = []
+    for tree in trees:
+        root = os.path.realpath(tree["path"])
+        try:
+            if os.path.commonpath([candidate, root]) == root:
+                matches.append(root)
+        except ValueError:
+            continue
+    return max(matches, key=len, default="")
+
+
+def build_worktree_audit(trees: list[dict], states: dict[str, dict],
+                         live_worktrees: set[str]) -> list[dict]:
+    """Classify every enumerated tree, preserving inspected bounds in output."""
+    audit: list[dict] = []
+    live = {os.path.realpath(path) for path in live_worktrees}
+    for tree in trees:
+        path = os.path.realpath(tree["path"])
+        state = states.get(path, {"state": "could-not-assess",
+                                  "reason": "worktree was not inspected"})
+        row = {**tree, **state, "path": path, "live_pane": path in live,
+               "finding": None}
+        if state["state"] == "could-not-assess":
+            row["finding"] = "could-not-assess"
+        elif state["state"] == "dirty":
+            row["finding"] = ("work-in-progress" if path in live
+                              else "stranded-uncommitted")
+        audit.append(row)
+    return audit
+
+
+def load_in_progress_beads(run=subprocess.run) -> tuple[list[dict], str | None]:
+    """Read the durable spawn-time branch binding for every active bead."""
+    try:
+        cp = run(["bd", "list", "--status", "in_progress", "--limit", "0",
+                  "--json"], capture_output=True, text=True)
+    except OSError as exc:
+        return [], f"bd list could not run: {exc}"
+    if cp.returncode != 0:
+        return [], (cp.stderr or "bd list failed").strip()
+    try:
+        records = json.loads(cp.stdout)
+    except ValueError as exc:
+        return [], f"bd list returned malformed JSON: {exc}"
+    return (records if isinstance(records, list) else []), None
+
+
+def _bead_branch(record: dict) -> str:
+    metadata = record.get("metadata") or {}
+    return str(metadata.get("branch") or "") if isinstance(metadata, dict) else ""
+
+
+def annotate_worker_beads(workers: list[dict], trees: list[dict],
+                          beads: list[dict]) -> list[dict]:
+    """Attach the complete active bead set sharing each pane's branch."""
+    branch_by_path = {os.path.realpath(t["path"]): t.get("branch", "") for t in trees}
+    beads_by_branch: dict[str, list[str]] = {}
+    for bead in beads:
+        branch = _bead_branch(bead)
+        bead_id = bead.get("id")
+        if branch and bead_id:
+            beads_by_branch.setdefault(branch, []).append(bead_id)
+    annotated = []
+    for worker in workers:
+        worktree = worker.get("worktree", "")
+        root = worktree_for_path(worktree, trees)
+        branch = branch_by_path.get(root, "")
+        members = list(beads_by_branch.get(branch, []))
+        lead = worker.get("bead")
+        if lead and lead not in members:
+            members = [lead, *sorted(members)]
+        elif lead in members:
+            members.remove(lead)
+            members = [lead, *sorted(members)]
+        else:
+            members.sort()
+        annotated.append({**worker, "branch": branch,
+                          "beads": members or ([lead] if lead else [])})
+    return annotated
+
+
+def running_counts(workers: list[dict]) -> tuple[int, int]:
+    active = [w for w in workers if w.get("status") not in ("done", "done-unconfirmed")]
+    return len(active), sum(len(w.get("beads") or ([w["bead"]] if w.get("bead") else []))
+                            for w in active)
+
+
+def stranded_in_progress(beads: list[dict], live_branches: set[str]) -> list[dict]:
+    """Active bead claims whose recorded branch has no live pane."""
+    return [{"id": bead["id"], "branch": branch}
+            for bead in beads
+            if (branch := _bead_branch(bead)) and branch not in live_branches]
+
+
+def block_unsafe_reaps(doomed: list[str], workers: list[dict],
+                       audit: list[dict]) -> tuple[list[str], list[dict]]:
+    """Refuse pane destruction when its worktree is dirty or unassessable."""
+    by_pane = {w["pane"]: w for w in workers}
+    by_path = {row["path"]: row for row in audit}
+    safe: list[str] = []
+    blocked: list[dict] = []
+    for pane in doomed:
+        raw_path = by_pane.get(pane, {}).get("worktree", "")
+        path = worktree_for_path(raw_path, audit)
+        if raw_path and not path:
+            path = os.path.realpath(raw_path)
+        row = by_path.get(path)
+        if row and row.get("state") in ("dirty", "could-not-assess"):
+            blocked.append({"pane": pane, **row})
+        else:
+            safe.append(pane)
+    return safe, blocked
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="sable-worker-status")
     p.add_argument("--reap", action="store_true",
@@ -1225,6 +1412,18 @@ def main(argv: list[str] | None = None) -> int:
 
     interval = float(os.environ.get("SABLE_STATUS_SAMPLE_INTERVAL", _DEFAULT_SAMPLE_INTERVAL))
     all_workers = list_workers_confirmed(socket, session=session, interval=interval)
+    # This census is deliberately fleet-wide even when the pane table below is
+    # lane-scoped. A lane-bound dirty-tree search would reproduce SABLE-5c5fu.
+    trees, tree_scope_error = registered_worktrees(os.getcwd())
+    tree_states = inspect_registered_worktrees(trees)
+    live_worktrees = {
+        root for w in all_workers
+        if w.get("status") not in ("done", "done-unconfirmed")
+        and (root := worktree_for_path(w.get("worktree", ""), trees))
+    }
+    worktree_audit = build_worktree_audit(trees, tree_states, live_worktrees)
+    in_progress, bead_scope_error = load_in_progress_beads()
+    all_workers = annotate_worker_beads(all_workers, trees, in_progress)
     # SABLE-dcw2: scope to the caller's own lane BEFORE anything reads or reaps,
     # so the display, the done-no-deliverable flags AND reaping_decision all
     # operate on the owned subset — a manager's --reap can never touch (and so
@@ -1240,14 +1439,31 @@ def main(argv: list[str] | None = None) -> int:
 
     if ns.reap:
         doomed = reaping_decision(workers)
-        protected_count = len(doomed)
+        before_protected = len(doomed)
         doomed = filter_protected(doomed, socket)
+        protected_count = before_protected - len(doomed)
         # SABLE-to8m/k8o5: after the attached-client guard, drop any candidate
         # whose live process is an interactive agent (cockpit OR manager) resumed
         # into a stale-done window — never kill a live claude we didn't spawn as a
         # worker.
         doomed = filter_live_agents(doomed, socket)
-        protected_count -= len(doomed)
+        workers_by_pane = {w["pane"]: w for w in workers}
+        if tree_scope_error:
+            dirty_blocked = [
+                {"pane": pane, "path": workers_by_pane.get(pane, {}).get("worktree", "?"),
+                 "state": "could-not-assess", "reason": tree_scope_error}
+                for pane in doomed
+            ]
+            doomed = []
+        else:
+            doomed, dirty_blocked = block_unsafe_reaps(doomed, workers, worktree_audit)
+        for blocked in dirty_blocked:
+            detail = (", ".join(blocked.get("paths", []))
+                      or blocked.get("reason", "inspection failed"))
+            sys.stderr.write(
+                f"sable-worker-status: NOT reaping {blocked['pane']} — worktree "
+                f"{blocked['path']} is {blocked['state']} ({detail}); preserving "
+                "the pane until its uncommitted work is made durable.\n")
         flagged = reap(doomed, socket)
         note = f", {len(flagged)} had pending input cleared+flagged" if flagged else ""
         dnd_note = (f", {len(dnd_panes)} producer(s) done-no-deliverable (not reaped)"
@@ -1263,6 +1479,7 @@ def main(argv: list[str] | None = None) -> int:
         # Read and classify the live state again rather than merely filtering
         # doomed pane IDs: surviving panes may have changed state concurrently.
         all_workers = list_workers_confirmed(socket, session=session, interval=interval)
+        all_workers = annotate_worker_beads(all_workers, trees, in_progress)
         workers = scoped_workers(all_workers, view_lane)
         workers = flag_rate_limit_stalls(workers, socket)
         dnd_panes = {w["pane"] for w in done_no_deliverable(workers)}
@@ -1271,6 +1488,11 @@ def main(argv: list[str] | None = None) -> int:
     # show, computed BEFORE anything prints — on every invocation, not just
     # the already-empty case empty_worker_message covers.
     scope_line = scope_summary(view_lane, len(workers), len(all_workers))
+    pane_count, work_count = running_counts(workers)
+    stranded_claims = stranded_in_progress(
+        in_progress, {w.get("branch", "") for w in all_workers
+                      if w.get("branch") and w.get("status") not in
+                      ("done", "done-unconfirmed")})
 
     # SABLE-axp0: the fleet-wide dialog/overlay liveness probe. It is INTENTIONALLY
     # NOT scoped to view_lane and INTENTIONALLY spans managers: the motivating
@@ -1287,10 +1509,16 @@ def main(argv: list[str] | None = None) -> int:
             "shown": len(workers),
             "hidden": (len(all_workers) - len(workers)) if view_lane is not None else 0,
         }
-        print(json.dumps({"scope": scope_meta, "workers": workers,
+        print(json.dumps({"scope": scope_meta,
+                          "running": {"panes": pane_count, "beads": work_count},
+                          "workers": workers, "worktrees": worktree_audit,
+                          "worktree_scope_error": tree_scope_error,
+                          "stranded_in_progress": stranded_claims,
+                          "bead_scope_error": bead_scope_error,
                           "dialog_stalls": dialog_stalls}, indent=2))
     else:
         print(scope_line)
+        print(f"running work: {pane_count} pane(s) / {work_count} bead(s)")
         if not workers:
             print(empty_worker_message(view_lane, all_workers))
         for w in workers:
@@ -1298,7 +1526,26 @@ def main(argv: list[str] | None = None) -> int:
             if w["status"] == "stalled-rate-limit":
                 flag += f" [resets={w.get('reset', '?')}]"
             lane = w.get("lane", "-")  # SABLE-dcw2 owner column; "-" if unstamped
-            print(f"{w['pane']:<8} {lane:<10} {w['bead']:<16} {w['status']}{flag}")
+            bead_text = ",".join(w.get("beads") or [w.get("bead", "")])
+            print(f"{w['pane']:<8} {lane:<10} {bead_text:<16} {w['status']}{flag}")
+        if tree_scope_error:
+            print(f"⚠ WORKTREE COULD-NOT-ASSESS fleet census: {tree_scope_error}")
+        else:
+            inspected = ", ".join(row["path"] for row in worktree_audit) or "(none)"
+            print(f"worktree audit: inspected {len(worktree_audit)} registered tree(s): "
+                  f"{inspected}")
+            for row in worktree_audit:
+                if row["finding"] in ("stranded-uncommitted", "work-in-progress"):
+                    paths = ", ".join(row.get("paths", []))
+                    print(f"⚠ {row['finding'].upper()} {row['path']}: {paths}")
+                elif row["finding"] == "could-not-assess":
+                    print(f"⚠ WORKTREE COULD-NOT-ASSESS {row['path']}: "
+                          f"{row.get('reason', 'unknown error')}")
+        if bead_scope_error:
+            print(f"⚠ RUNNING-WORK COULD-NOT-ASSESS: {bead_scope_error}")
+        for claim in stranded_claims:
+            print(f"⚠ STRANDED-IN-PROGRESS {claim['id']} branch={claim['branch']} "
+                  "has no live pane")
         for s in dialog_stalls:
             who = s.get("lane") or s.get("role") or "?"
             ev = s.get("evidence") or ""

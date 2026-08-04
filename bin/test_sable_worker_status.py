@@ -1653,6 +1653,11 @@ def test_main_reap_refreshes_the_listed_snapshot_after_mutation(monkeypatch, cap
     monkeypatch.setattr(sws, "filter_protected", lambda panes, socket: panes)
     monkeypatch.setattr(sws, "filter_live_agents", lambda panes, socket: panes)
     monkeypatch.setattr(sws, "reap", fake_reap)
+    # Keep this unit at the snapshot/reap seam it names. Fleet-wide git/bd
+    # boundaries have dedicated pure + real integration coverage below.
+    monkeypatch.setattr(sws, "registered_worktrees", lambda repo: ([], None))
+    monkeypatch.setattr(sws, "inspect_registered_worktrees", lambda trees: {})
+    monkeypatch.setattr(sws, "load_in_progress_beads", lambda: ([], None))
     monkeypatch.setattr(sws, "list_fleet_panes", lambda socket, session=None: [])
     monkeypatch.setattr(sws, "flag_dialog_stalls", lambda panes, socket: [])
     monkeypatch.setenv("SABLE_AGENT_NAME", "")
@@ -1668,6 +1673,75 @@ def test_main_reap_refreshes_the_listed_snapshot_after_mutation(monkeypatch, cap
     assert "survivor-before" not in captured.out
     assert "survivor-refreshed" in captured.out
     assert "reaped 1 done pane(s)" in captured.err
+
+
+# --- SABLE-5c5fu / SABLE-42k96: worktree truth + bundled work truth ---------
+
+def test_dirty_worktree_without_a_live_pane_is_reported():
+    trees = [{"path": "/repo/wk-a", "branch": "wk-a"}]
+    states = {"/repo/wk-a": {"state": "dirty", "paths": ["src/a.py"]}}
+    audit = sws.build_worktree_audit(trees, states, live_worktrees=set())
+    assert audit[0]["finding"] == "stranded-uncommitted"
+    assert audit[0]["path"] == "/repo/wk-a"
+    assert audit[0]["paths"] == ["src/a.py"]
+
+
+def test_dirty_worktree_with_live_pane_is_not_stranded():
+    trees = [{"path": "/repo/wk-a", "branch": "wk-a"}]
+    states = {"/repo/wk-a": {"state": "dirty", "paths": ["src/a.py"]}}
+    audit = sws.build_worktree_audit(trees, states, live_worktrees={"/repo/wk-a"})
+    assert audit[0]["finding"] == "work-in-progress"
+
+
+def test_clean_worktree_without_live_pane_is_not_stranded():
+    trees = [{"path": "/repo/wk-a", "branch": "wk-a"}]
+    states = {"/repo/wk-a": {"state": "clean", "paths": []}}
+    audit = sws.build_worktree_audit(trees, states, live_worktrees=set())
+    assert audit[0]["finding"] is None
+
+
+def test_uninspectable_worktree_is_could_not_assess_not_clean():
+    trees = [{"path": "/repo/wk-a", "branch": "wk-a"}]
+    states = {"/repo/wk-a": {"state": "could-not-assess", "reason": "git failed"}}
+    audit = sws.build_worktree_audit(trees, states, live_worktrees=set())
+    assert audit[0]["state"] == "could-not-assess"
+    assert audit[0]["finding"] == "could-not-assess"
+
+
+def test_bundled_siblings_are_all_reported_for_one_pane():
+    workers = [{"pane": "%1", "bead": "SABLE-lead", "status": "running",
+                "worktree": "/repo/wk-bundle"}]
+    trees = [{"path": "/repo/wk-bundle", "branch": "wk-bundle"}]
+    beads = [
+        {"id": "SABLE-lead", "metadata": {"branch": "wk-bundle"}},
+        {"id": "SABLE-a", "metadata": {"branch": "wk-bundle"}},
+        {"id": "SABLE-b", "metadata": {"branch": "wk-bundle"}},
+    ]
+    annotated = sws.annotate_worker_beads(workers, trees, beads)
+    assert annotated[0]["beads"] == ["SABLE-lead", "SABLE-a", "SABLE-b"]
+
+
+def test_pane_subdirectory_resolves_to_registered_worktree():
+    trees = [{"path": "/repo/wk-bundle", "branch": "wk-bundle"}]
+    assert sws.worktree_for_path("/repo/wk-bundle/src/pkg", trees) == "/repo/wk-bundle"
+    assert sws.worktree_for_path("/repo/wk-other", trees) == ""
+
+
+def test_work_count_and_pane_count_are_reported_separately():
+    bundled = [{"pane": "%1", "status": "running", "beads": ["a", "b", "c"]}]
+    assert sws.running_counts(bundled) == (1, 3)
+    singletons = [{"pane": "%1", "status": "running", "beads": ["a"]}]
+    assert sws.running_counts(singletons) == (1, 1)
+
+
+def test_inprogress_bead_with_no_live_pane_is_reported_as_stranded():
+    beads = [
+        {"id": "SABLE-live", "metadata": {"branch": "wk-live"}},
+        {"id": "SABLE-lost", "metadata": {"branch": "wk-lost"}},
+    ]
+    assert sws.stranded_in_progress(beads, {"wk-live"}) == [
+        {"id": "SABLE-lost", "branch": "wk-lost"}
+    ]
 
 
 if __name__ == "__main__":
