@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+"""Read-only corpus sweep for shell-substitution corruption (SABLE-wf7rx)."""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from sable_corruption_sweep_lib import report, signature_names  # noqa: E402
+
+
+def _bd_json(arguments: list[str]) -> object:
+    result = subprocess.run(
+        ["bd", *arguments, "--json"], capture_output=True, text=True, check=False
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"exit {result.returncode}"
+        raise RuntimeError(f"bd {' '.join(arguments)} failed: {detail}")
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"bd {' '.join(arguments)} returned invalid JSON: {exc}") from exc
+
+
+def _enabled(disabled: str) -> frozenset[str]:
+    if not disabled:
+        return signature_names()
+    values = {value.strip() for value in disabled.split(",") if value.strip()}
+    if "all" in values:
+        return frozenset()
+    unknown = values - signature_names()
+    if unknown:
+        raise ValueError("unknown signatures: " + ", ".join(sorted(unknown)))
+    return signature_names() - values
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Rank possible shell-substitution corruption in all beads and memories; never repair automatically."
+    )
+    parser.add_argument("--json", action="store_true", help="emit the complete machine-readable report")
+    parser.add_argument(
+        "--disable-signatures",
+        default="",
+        metavar="NAME[,NAME...]",
+        help="diagnostic/negative-control seam; use 'all' to disable every detector",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    try:
+        issues = _bd_json(["list", "--all", "--limit", "0"])
+        memories = _bd_json(["memories"])
+        if not isinstance(issues, list) or not isinstance(memories, dict):
+            raise RuntimeError("bd returned an unexpected corpus schema")
+        result = report(issues, memories, enabled=_enabled(args.disable_signatures))
+    except (OSError, RuntimeError, ValueError) as exc:
+        sys.stderr.write(f"sable-corruption-sweep: CANNOT-ASSESS: {exc}\n")
+        return 2
+
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        scanned = result["scanned"]
+        print(
+            f"scanned {scanned['beads']} beads and {scanned['memories']} memories; "
+            f"{result['candidate_count']} triage candidate(s); READ-ONLY"
+        )
+        for candidate in result["candidates"]:
+            signatures = ", ".join(
+                finding["signature"] for finding in candidate["findings"]
+            )
+            print(
+                f"{candidate['score']:>3}  {candidate['source_type']}:"
+                f"{candidate['source_id']}  {signatures}"
+            )
+        print("boundary: candidates are not verdicts; fluent scar-free corruption is undetectable")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
