@@ -1916,6 +1916,106 @@ def test_respawn_reopens_closed_bead_and_releases_stale_tree_claim(sock):
         assert "TRIGGERED AND DEMONSTRATED" in body
 
 
+def test_respawn_into_stale_worktree_announces_the_replay(sock):
+    """SABLE-9u86l: real spawn refresh binds prompt SHA to actual HEAD."""
+    with tempfile.TemporaryDirectory() as stub_dir, \
+         tempfile.TemporaryDirectory() as dd, \
+         tempfile.TemporaryDirectory() as gitdir:
+        root = Path(gitdir)
+        origin = root / "origin.git"
+        _git(root, "init", "--bare", str(origin))
+        work = root / "work"
+        work.mkdir()
+        _git(work, "init", "-b", "main")
+        _git(work, "config", "user.email", "t@example.com")
+        _git(work, "config", "user.name", "T")
+        (work / "f.txt").write_text("base\n")
+        _git(work, "add", "f.txt")
+        _git(work, "commit", "-m", "base")
+        _git(work, "remote", "add", "origin", str(origin))
+        _git(work, "push", "-u", "origin", "main")
+        _git(work, "branch", "wk-stale", "HEAD")
+        wt = root / "wk-stale"
+        _git(work, "worktree", "add", str(wt), "wk-stale")
+        (wt / "worker.txt").write_text("implementation\n")
+        _git(wt, "add", "worker.txt")
+        _git(wt, "commit", "-m", "worker implementation")
+        before = subprocess.run(
+            ["git", "-C", str(wt), "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=True).stdout.strip()
+        (work / "spine.txt").write_text("spine moved\n")
+        _git(work, "add", "spine.txt")
+        _git(work, "commit", "-m", "spine moves")
+        _git(work, "push", "origin", "main")
+
+        bead_id = "FAKE-respawn-replay"
+        db_path = Path(stub_dir) / "beads.json"
+        db_path.write_text(json.dumps([{
+            "id": bead_id, "title": "Revise implementation",
+            "description": f"Preserve implementation commit {before}",
+            "labels": [], "status": "in_progress", "assignee": "tarzan",
+        }]))
+        _write_fake_bd(Path(stub_dir), db_path)
+        env = {
+            **_clean_env(),
+            "PATH": f"{stub_dir}:{os.environ.get('PATH', '')}",
+            "CLAUDE_AGENT_NAME": "tarzan",
+            "SABLE_MAX_LOAD_PER_CORE": "0",
+            "SABLE_TMUX_SOCKET": sock,
+            "SABLE_TMUX_SESSION": "sable",
+            "SABLE_WORKER_CMD": "bash --noprofile --norc",
+            "SABLE_DISPATCH_DIR": dd,
+            "SABLE_DISPATCH_READY_TIMEOUT": "0",
+            "SABLE_DISPATCH_POLL_INTERVAL": "0.05",
+            "SABLE_DISPATCH_SUBMIT_TRIES": "2",
+        }
+        result = subprocess.run(
+            ["python3", str(BIN), bead_id, "--respawn", "--worktree", str(wt),
+             "--model", "haiku"], capture_output=True, text=True, env=env)
+        assert result.returncode == 0, result.stderr
+        after = subprocess.run(
+            ["git", "-C", str(wt), "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=True).stdout.strip()
+        body = (Path(dd) / f"{bead_id}.md").read_text()
+        assert before != after
+        assert before in body  # known-positive: the probe sees the brief SHA
+        assert after in body
+        assert after == subprocess.run(
+            ["git", "-C", str(wt), "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=True).stdout.strip()
+        assert "WORKTREE REFRESHED AT SPAWN" in body
+        assert "bd list --label for-tarzan" in body
+
+
+def test_worker_inbox_clause_surfaces_real_fallback_bead(tmp_path):
+    """SABLE-5w5bj: run the prompt's exact command against a real bd store."""
+    work = tmp_path / "inbox-store"
+    home = tmp_path / "home"
+    work.mkdir()
+    home.mkdir()
+    subprocess.run(["git", "init", "-q", str(work)], check=True)
+    env = {k: v for k, v in _clean_env().items() if k != "BEADS_DB"}
+    env.update({"HOME": str(home), "BD_NON_INTERACTIVE": "1", "CI": "true"})
+    init = subprocess.run(
+        ["bd", "init", "--non-interactive", "--prefix", "INBX"], cwd=work,
+        env=env, capture_output=True, text=True)
+    if init.returncode != 0 or not (work / ".beads" / "config.yaml").is_file():
+        pytest.skip(f"bd init unavailable here: {init.stderr.strip()[:200]}")
+    title = "durable correction marker 9f1b"
+    created = subprocess.run(
+        ["bd", "create", f"--title={title}", "--description=act on correction",
+         "--type=task", "--labels=for-tarzan"], cwd=work, env=env,
+        capture_output=True, text=True)
+    assert created.returncode == 0, created.stderr
+
+    # Exact argv rendered by the dispatch prompt; this is the lifecycle reader.
+    listed = subprocess.run(
+        ["bd", "list", "--label", "for-tarzan"], cwd=work, env=env,
+        capture_output=True, text=True)
+    assert listed.returncode == 0, listed.stderr
+    assert title in listed.stdout
+
+
 def test_respawn_refused_when_live_pane_carries_bead_tag(sock):
     """SABLE-3eax (wall 3 inverse): a respawn must STILL be refused when a LIVE
     worker pane already carries the bead tag — two workers racing the same push.

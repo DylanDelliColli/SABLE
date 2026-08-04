@@ -123,6 +123,13 @@ fixing.
 
 ## Report back
 
+Immediately before closing any bead, drain the worker's durable correction
+inbox with `bd list --label for-{WORKER_LABEL}` and act on every result. Route
+corrections through a claim or an update to a bead the worker already holds
+whenever possible; a message that merely hopes to land is not a durable
+assignment channel. The live dispatcher substitutes the worker's actual label
+and appends this check as the final prompt section (SABLE-5w5bj).
+
 Return:
 - PR URL (or "no PR — bead closed locally" if doc-only)
 - Bead IDs you closed
