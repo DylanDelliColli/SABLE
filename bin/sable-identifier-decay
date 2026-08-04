@@ -32,7 +32,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from sable_identifier_decay_lib import (  # noqa: E402
-    KNOWN_LIMIT, format_flags, format_unassessed, sweep,
+    MAX_RENDERED, KNOWN_LIMIT, format_flags, format_unassessed, sweep,
 )
 
 try:
@@ -153,6 +153,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="treat the identifiers as branch names (no bare-suffix matching)")
     ap.add_argument("-C", "--repo", default=None, help="run bd against this repo")
     ap.add_argument("--json", action="store_true", help="emit flags as JSON")
+    ap.add_argument("--all", action="store_true",
+                    help="render every hit, including historical citations, with no "
+                         "truncation (this is what the report's own 'see them all' "
+                         "line names)")
     args = ap.parse_args(argv)
 
     identifiers = [i for i in args.identifiers if i]
@@ -175,7 +179,18 @@ def main(argv: list[str] | None = None) -> int:
             "flags": [f.__dict__ for f in flags],
         }))
     else:
-        report = format_flags(flags, identifiers)
+        # SABLE-l662t layer 3: the "see them all" line must name a command that
+        # ACTUALLY shows them all. Rebuild the caller's own invocation plus
+        # --all, so the printed remedy sweeps for the same thing this report
+        # describes instead of looping back to this same truncated output.
+        remedy_flags = ["--all"]
+        if args.branch:
+            remedy_flags.append("--branch")
+        if args.repo:
+            remedy_flags += ["-C", args.repo]
+        report = format_flags(flags, identifiers,
+                              max_rendered=0 if args.all else MAX_RENDERED,
+                              remedy_flags=remedy_flags)
         if report:
             print(report)
     return EXIT_OK
