@@ -214,6 +214,7 @@ declare -A EXCLUDE=(
 declare -A ZERO_IMPACT=(
   [.beads/.gitignore]="bd-managed store config; maintained by bd tooling, no repo suite consumes it"
   [.beads/README.md]="bd-managed store doc"
+  [.claude/sable/state/frozen-branches.txt]="tracked freeze ruling is read by bin/sable-recover and exercised by bin/test_sable_recover.py + bin/test_sable_recover_integration.py; no shell suite consumes it"
   [.claude/sable/state/merge-gate/README.md]="state-dir doc"
   [.claude/sable/state/night-stall-probe.py]="tracked operator driver is exercised as a real subprocess by bin/test_sable_stall_probe.py; no shell suite consumes it"
   [.github/ci/test-requirements.txt]="python lane owns it: test_clean_room_dep_parity selects on change"

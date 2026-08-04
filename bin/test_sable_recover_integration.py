@@ -205,6 +205,12 @@ def _durable_worktree_picture(report):
     """The git-owned fields that survive independently of pane annotations."""
     keys = ("path", "branch", "detached", "dirty", "push_state")
     return [{key: row[key] for key in keys} for row in report["worktrees"]]
+def _ls_remote(repo, branch):
+    """The sha origin ACTUALLY holds for `branch`, or "" — asked of the remote,
+    not of a remote-tracking ref, because a stale local ref is exactly what a
+    "did --fix push this?" assertion must not be able to read."""
+    out = _git(repo, "ls-remote", "origin", branch).stdout.strip()
+    return out.split("\t")[0] if out else ""
 
 
 def test_report_names_all_three_states(tmp_path):
@@ -420,6 +426,319 @@ def test_production_collectors_distinguish_manager_clear_from_host_crash(tmp_pat
         assert crashed_worker["bead_source"] is None
     finally:
         _tmux(socket, "kill-server", check=False)
+# ============================================================================
+# SABLE-su3j3 — DIVERGED, built with real git rather than asserted into being.
+# ============================================================================
+
+def _empty_state(tmp_path, frozen_text="# nothing frozen\n"):
+    """The two captured-fixture inputs plus a real frozen-branch file, so a scene
+    that is not about freezes produces no freeze warnings to read past."""
+    beads_file = tmp_path / "beads.json"
+    beads_file.write_text("[]")
+    panes_file = tmp_path / "panes.txt"
+    panes_file.write_text("")
+    frozen_file = tmp_path / "frozen.txt"
+    frozen_file.write_text(frozen_text)
+    return beads_file, panes_file, frozen_file
+
+
+def _build_divergence_scene(tmp_path):
+    """A REAL diverged branch and a REAL merely-ahead one, in one repo.
+
+    Divergence cannot be faked by writing `behind: 1` into a fixture — that is
+    the state this bug hid inside, so it is built out of actual commits:
+
+      wk-diverged — pushed, then a PEER CLONE pushed a commit on top, then this
+                    side committed without ever reconciling. Both sides now hold
+                    a commit the other lacks: 1 ahead / 1 behind.
+      wk-ahead    — pushed, then committed on top and left alone. origin's tip is
+                    a strict ancestor: 1 ahead / 0 behind. The negative control,
+                    without which "never propose a push" passes by doing nothing.
+    """
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(origin)],
+                   capture_output=True, check=True)
+    main = tmp_path / "main"
+    subprocess.run(["git", "init", "-b", "main", str(main)],
+                   capture_output=True, check=True)
+    _git(main, "config", "user.email", "t@t")
+    _git(main, "config", "user.name", "t")
+    _git(main, "remote", "add", "origin", str(origin))
+    (main / "README").write_text("base\n")
+    _git(main, "add", "-A")
+    _git(main, "commit", "-m", "base")
+    _git(main, "push", "-u", "origin", "main")
+
+    def add_worktree(branch):
+        path = tmp_path / branch
+        _git(main, "worktree", "add", "-b", branch, str(path), "main")
+        _git(path, "config", "user.email", "t@t")
+        _git(path, "config", "user.name", "t")
+        return path
+
+    def commit(path, text, msg):
+        (path / "f.txt").write_text(text)
+        _git(path, "add", "-A")
+        _git(path, "commit", "-m", msg)
+
+    # --- wk-diverged
+    diverged = add_worktree("wk-diverged")
+    commit(diverged, "A\n", "A — shared")
+    _git(diverged, "push", "-u", "origin", "wk-diverged")
+
+    # a peer clone advances origin behind this worktree's back
+    peer = tmp_path / "peer"
+    subprocess.run(["git", "clone", str(origin), str(peer)],
+                   capture_output=True, check=True)
+    _git(peer, "config", "user.email", "p@p")
+    _git(peer, "config", "user.name", "p")
+    _git(peer, "checkout", "wk-diverged")
+    commit(peer, "A then R\n", "R — only on origin")
+    _git(peer, "push", "origin", "wk-diverged")
+
+    # this side learns the remote moved, and commits anyway without reconciling
+    _git(main, "fetch", "origin")
+    commit(diverged, "A then B\n", "B — only local")
+
+    # --- wk-ahead (control): origin stays a strict ancestor
+    ahead = add_worktree("wk-ahead")
+    commit(ahead, "A\n", "A")
+    _git(ahead, "push", "-u", "origin", "wk-ahead")
+    commit(ahead, "A then B\n", "B — local only, fast-forwardable")
+
+    return main, diverged, ahead
+
+
+def test_real_diverged_worktree_is_reported_diverged_not_ahead(tmp_path):
+    main, diverged, ahead = _build_divergence_scene(tmp_path)
+    beads_file, panes_file, frozen_file = _empty_state(tmp_path)
+
+    # the fixture proves itself first: assert the scene really is diverged, with
+    # the same two commands the bead used to measure the live instance.
+    counts = _git(main, "rev-list", "--left-right", "--count",
+                  "refs/remotes/origin/wk-diverged...refs/heads/wk-diverged")
+    assert counts.stdout.split() == ["1", "1"], counts.stdout
+    anc = _git(main, "merge-base", "--is-ancestor",
+               "refs/remotes/origin/wk-diverged", "refs/heads/wk-diverged",
+               check=False)
+    assert anc.returncode != 0, "origin must NOT be an ancestor — scene is not diverged"
+    # and that the control genuinely IS fast-forwardable
+    anc_ok = _git(main, "merge-base", "--is-ancestor",
+                  "refs/remotes/origin/wk-ahead", "refs/heads/wk-ahead", check=False)
+    assert anc_ok.returncode == 0
+
+    r = _run_recover(main, beads_file, panes_file,
+                     "--frozen-file", str(frozen_file), "--json")
+    assert r.returncode == 0, r.stderr
+    report = json.loads(r.stdout)
+    rows = {row["branch"]: row for row in report["worktrees"]}
+
+    assert rows["wk-diverged"]["push_state"] == "diverged"
+    assert (rows["wk-diverged"]["ahead"], rows["wk-diverged"]["behind"]) == (1, 1)
+
+    # NEGATIVE CONTROL: the fix did not simply stop classifying anything AHEAD
+    assert rows["wk-ahead"]["push_state"] == "ahead"
+    assert (rows["wk-ahead"]["ahead"], rows["wk-ahead"]["behind"]) == (1, 0)
+
+    pushes = [s["target"] for s in report["plan"] if s["action"] == "push"]
+    assert "wk-diverged" not in pushes
+    assert "wk-ahead" in pushes          # ...and still recommends the real one
+
+    div_review = [s for s in report["plan"]
+                  if s["action"] == "review" and s["target"] == "wk-diverged"]
+    assert len(div_review) == 1
+    assert "1 ahead" in div_review[0]["detail"]
+    assert "1 behind" in div_review[0]["detail"]
+    assert "REJECTED" in div_review[0]["detail"]
+
+
+def test_real_fix_run_pushes_the_ahead_branch_and_never_the_diverged_one(tmp_path):
+    """The acceptance criterion `--fix` must satisfy, measured at origin itself."""
+    main, diverged, ahead = _build_divergence_scene(tmp_path)
+    beads_file, panes_file, frozen_file = _empty_state(tmp_path)
+
+    before_div = _ls_remote(main, "wk-diverged")
+    before_ahead = _ls_remote(main, "wk-ahead")
+    local_ahead = _git(ahead, "rev-parse", "HEAD").stdout.strip()
+    assert before_ahead != local_ahead   # there is genuinely something to push
+
+    r = _run_recover(main, beads_file, panes_file,
+                     "--frozen-file", str(frozen_file), "--fix", "--json")
+    assert r.returncode == 0, r.stderr
+    report = json.loads(r.stdout)
+
+    assert "wk-diverged" not in report["fix"]["pushed"]
+    assert "wk-diverged" not in report["fix"]["failed"]   # never even attempted
+    assert "wk-ahead" in report["fix"]["pushed"]
+
+    # origin is the witness, not the report
+    assert _ls_remote(main, "wk-diverged") == before_div      # UNCHANGED
+    assert _ls_remote(main, "wk-ahead") == local_ahead        # really pushed
+
+
+# ============================================================================
+# SABLE-xgb29 — a real freeze, read from a real file, honoured by a real --fix.
+# ============================================================================
+
+def _build_freeze_scene(tmp_path):
+    """Two branches that are IDENTICAL in git's eyes — both pushed, both with one
+    unpushed commit on top, both clean. The only difference between them is a
+    line in a file. That is the point: freeze is not a git property, so the
+    control has to be indistinguishable except by the declaration."""
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(origin)],
+                   capture_output=True, check=True)
+    main = tmp_path / "main"
+    subprocess.run(["git", "init", "-b", "main", str(main)],
+                   capture_output=True, check=True)
+    _git(main, "config", "user.email", "t@t")
+    _git(main, "config", "user.name", "t")
+    _git(main, "remote", "add", "origin", str(origin))
+    (main / "README").write_text("base\n")
+    _git(main, "add", "-A")
+    _git(main, "commit", "-m", "base")
+    _git(main, "push", "-u", "origin", "main")
+
+    paths = {}
+    for branch in ("wk-frozen", "wk-notfrozen"):
+        path = tmp_path / branch
+        _git(main, "worktree", "add", "-b", branch, str(path), "main")
+        _git(path, "config", "user.email", "t@t")
+        _git(path, "config", "user.name", "t")
+        (path / "f.txt").write_text("published\n")
+        _git(path, "add", "-A")
+        _git(path, "commit", "-m", "published")
+        _git(path, "push", "-u", "origin", branch)
+        (path / "f.txt").write_text("unpushed work\n")
+        _git(path, "add", "-A")
+        _git(path, "commit", "-m", "unpushed work")
+        paths[branch] = path
+    return main, paths
+
+
+def test_real_frozen_branch_survives_a_fix_run(tmp_path):
+    main, paths = _build_freeze_scene(tmp_path)
+    beads_file = tmp_path / "beads.json"
+    beads_file.write_text("[]")
+    panes_file = tmp_path / "panes.txt"
+    panes_file.write_text("")
+
+    # a REAL freeze list, at the REAL default path inside the repo — so this
+    # exercises the path resolution an operator gets, not only the test seam.
+    state_dir = main / ".claude" / "sable" / "state"
+    state_dir.mkdir(parents=True)
+    (state_dir / "frozen-branches.txt").write_text(
+        "# standing cockpit ruling\n"
+        "wk-frozen  SABLE-wvxb4  do-not-merge, never force-push, retires unmerged\n"
+    )
+
+    before_frozen = _ls_remote(main, "wk-frozen")
+    before_free = _ls_remote(main, "wk-notfrozen")
+    local_frozen = _git(paths["wk-frozen"], "rev-parse", "HEAD").stdout.strip()
+    local_free = _git(paths["wk-notfrozen"], "rev-parse", "HEAD").stdout.strip()
+    # both genuinely have something to push — otherwise "unchanged" proves nothing
+    assert before_frozen not in ("", local_frozen)
+    assert before_free not in ("", local_free)
+
+    r = _run_recover(main, beads_file, panes_file, "--fix", "--json")
+    assert r.returncode == 0, r.stderr
+    report = json.loads(r.stdout)
+
+    # no warnings: the list was found at the default path and parsed cleanly
+    assert report["warnings"] == [], report["warnings"]
+
+    assert report["fix"]["pushed"] == ["wk-notfrozen"]
+    assert "wk-frozen" not in report["fix"]["failed"]
+
+    # *** the assertion the bead asks for: origin's frozen ref is UNTOUCHED ***
+    assert _ls_remote(main, "wk-frozen") == before_frozen
+    # NEGATIVE CONTROL: --fix still does its job in the same run
+    assert _ls_remote(main, "wk-notfrozen") == local_free
+
+    # and the freeze is VISIBLE, citing the ruling that imposed it
+    section = {f["branch"]: f for f in report["frozen_branches"]}
+    assert section["wk-frozen"]["bead"] == "SABLE-wvxb4"
+    assert "do-not-merge" in section["wk-frozen"]["reason"]
+
+    out = _run_recover(main, beads_file, panes_file).stdout
+    assert "FROZEN BRANCHES" in out
+    assert "SABLE-wvxb4" in out
+
+
+def test_absent_freeze_list_warns_loudly_on_stderr(tmp_path):
+    """An absent list must never be silently equivalent to "nothing is frozen".
+    Asserted on the real CLI's real stderr, because "loudly" is a property of
+    the output stream, not of a return value."""
+    main, _paths = _build_freeze_scene(tmp_path)
+    beads_file = tmp_path / "beads.json"
+    beads_file.write_text("[]")
+    panes_file = tmp_path / "panes.txt"
+    panes_file.write_text("")
+
+    r = _run_recover(main, beads_file, panes_file, "--json")   # no list on disk
+    assert r.returncode == 0
+    assert "WARNING" in r.stderr
+    assert "FROZEN-BRANCH LIST NOT FOUND" in r.stderr
+    report = json.loads(r.stdout)
+    assert report["warnings"] and "NOT FOUND" in report["warnings"][0]
+    # stdout stays clean JSON for --json callers
+    assert report["frozen_branches"] == []
+
+
+def test_this_repos_freeze_list_is_tracked_not_merely_present(tmp_path):
+    """*** READABILITY ON THIS BOX AND TRACKEDNESS ARE DIFFERENT FACTS AND THIS
+    TEST EXISTS TO TELL THEM APART (SABLE-gb5lo). *** .gitignore ignores
+    `.claude/sable/state/*`; an untracked freeze list would satisfy every other
+    test here while being absent from every fresh checkout, every linked
+    worktree, and every clone — which is precisely the post-crash situation the
+    consumer runs in."""
+    rel = ".claude/sable/state/frozen-branches.txt"
+    assert (REPO / rel).exists(), "the freeze list is missing from the working tree"
+
+    tracked = _git(REPO, "ls-files", "--error-unmatch", rel, check=False)
+    assert tracked.returncode == 0, f"{rel} is NOT tracked by git: {tracked.stderr}"
+
+    # NOT ignored either — the distinction between a .gitignore NEGATION and a
+    # `git add -f` on a still-ignored path. Force-adding tracks THIS copy while
+    # leaving the path ignored, so the next author's freeze silently never
+    # enters the tree. `check-ignore -q` exits 0 for an ignored path (see the
+    # sibling state files one level up, which correctly do) and 1 for this one.
+    ignored = _git(REPO, "check-ignore", "-q", rel, check=False)
+    assert ignored.returncode != 0, (
+        f"{rel} is tracked but still IGNORED — it was force-added rather than "
+        f"un-ignored, so future edits to the freeze list can vanish silently"
+    )
+
+    # the shipped list must itself parse without warnings — a malformed line in
+    # the real file is a freeze nobody can lift on the record
+    beads_file = tmp_path / "beads.json"
+    beads_file.write_text("[]")
+    panes_file = tmp_path / "panes.txt"
+    panes_file.write_text("")
+    r = subprocess.run(
+        [sys.executable, str(RECOVER), "--repo", str(REPO), "--json",
+         "--beads-file", str(beads_file), "--panes-file", str(panes_file),
+         "--frozen-file", str(REPO / rel)],
+        capture_output=True, text=True,
+    )
+    assert r.returncode == 0, r.stderr
+    report = json.loads(r.stdout)
+    assert report["warnings"] == [], report["warnings"]
+
+    # The report must name exactly what the file declares. Read the file
+    # INDEPENDENTLY here rather than trusting the tool's own parse: a
+    # "every entry cites a bead" loop over a list the tool returned empty is
+    # vacuously true, which is how a broken parser passes a freeze-list test.
+    # Deliberately NOT asserting the list is non-empty — lifting the last freeze
+    # is a legitimate operator ruling, and a test forbidding it is a lock nobody
+    # voted for. This compares against the file, so an empty file and an
+    # empty-returning parser still cannot be confused.
+    declared = [ln.split()[0] for ln in (REPO / rel).read_text().splitlines()
+                if ln.strip() and not ln.lstrip().startswith("#")]
+    assert sorted(e["branch"] for e in report["frozen_branches"]) == sorted(declared)
+
+    for entry in report["frozen_branches"]:
+        assert entry["bead"], f"{entry['branch']} cites no ruling bead"
 
 
 if __name__ == "__main__":
