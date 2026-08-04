@@ -480,3 +480,81 @@ def test_uninstall_removes_the_installed_sibling_libs(tmp_path):
     assert result.returncode == 0, result.stderr
 
     assert not target.exists(), "uninstall left the hook's sibling library behind"
+
+
+def test_role_cards_are_derived_from_templates_for_install_and_uninstall(tmp_path):
+    repo = make_repo(tmp_path / "repo", {"plain.sh": PLAIN_HOOK})
+    roles = repo / "templates" / "multi-manager" / "roles"
+    (roles / "victor.md").write_text("# victor pane producer\n")
+    (roles / "scratch-role.md").write_text("# future role\n")
+    project = tmp_path / "proj"
+    project.mkdir()
+
+    run_install(repo, project)
+
+    installed = project / ".claude" / "sable" / "roles"
+    for name in ("victor.md", "scratch-role.md"):
+        assert (installed / name).read_bytes() == (roles / name).read_bytes()
+
+    result = subprocess.run(
+        ["bash", str(INSTALLER), "--project", "--uninstall"],
+        env={
+            **os.environ,
+            "SABLE_REPO_DIR": str(repo),
+            "SABLE_PROJECT_DIR": str(project),
+        },
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert not (installed / "victor.md").exists()
+    assert not (installed / "scratch-role.md").exists()
+
+
+def test_inbox_timer_path_starts_with_install_time_tmux_directory(tmp_path):
+    repo = make_repo(tmp_path / "repo", {"plain.sh": PLAIN_HOOK})
+    project = tmp_path / "proj"
+    project.mkdir()
+    fakebin = tmp_path / "brew-bin"
+    fakebin.mkdir()
+    tmux = fakebin / "tmux"
+    tmux.write_text("#!/bin/sh\necho 'tmux 3.6b'\n")
+    tmux.chmod(0o755)
+
+    run_install(
+        repo,
+        project,
+        env={"PATH": f"{fakebin}:{os.environ['PATH']}"},
+    )
+
+    service = (
+        project / ".claude" / "sable" / "inbox-timer"
+        / "sable-inbox-timer.service"
+    ).read_text()
+    assert f"Environment=PATH={fakebin}:" in service
+
+
+def test_inbox_timer_install_warns_when_tmux_is_absent(tmp_path):
+    repo = make_repo(tmp_path / "repo", {"plain.sh": PLAIN_HOOK})
+    project = tmp_path / "proj"
+    project.mkdir()
+    toolbin = tmp_path / "toolbin"
+    toolbin.mkdir()
+    for source_dir in (Path("/usr/bin"), Path("/bin")):
+        for source in source_dir.iterdir():
+            destination = toolbin / source.name
+            if source.name == "tmux" or destination.exists():
+                continue
+            if source.is_file() and os.access(source, os.X_OK):
+                destination.symlink_to(source)
+
+    result = run_install(
+        repo,
+        project,
+        env={"PATH": str(toolbin)},
+    )
+
+    assert "WARNING" in result.stderr
+    assert "tmux" in result.stderr
+    assert "not found" in result.stderr

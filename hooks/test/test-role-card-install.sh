@@ -10,17 +10,10 @@
 # a change to the template could silently fail to reach the installed copy
 # and nothing would catch it.
 #
-# bin/sable-orchestration-install (--user scope) copy-installs exactly FOUR
-# role cards to $CLAUDE_USER_DIR/sable/roles/: lincoln, optimus, tarzan,
-# chuck — the warm tmux-pane execution roles (session-role-anchor injects
-# their identity from these files). The other four cards (columbo, rudy,
-# sherlock, victor) are session-scoped Agent-tool "producers": they are never
-# copy-installed here at all — bin/sable-build-agents wraps them into
-# templates/agents/<name>.md instead (verified by
-# hooks/test/test-agent-definitions.sh, a separate distribution path). A test
-# asserting byte-equality for all eight roles against $CLAUDE_USER_DIR would
-# fail by construction for those four — this test locks the REAL install
-# surface, not an assumed one.
+# bin/sable-orchestration-install (--user scope) derives its copy-installed
+# role-card set from templates/multi-manager/roles/*.md. This keeps bounded
+# producer panes such as victor on the same role-anchor path and makes a newly
+# shipped card installable without a second hand-maintained enumeration.
 #
 # Runs the REAL install.sh against a temp HOME (CLAUDE_USER_DIR), no mocked
 # copy step, and diffs every installed pane-role card against its template
@@ -52,9 +45,9 @@ CLAUDE_USER_DIR="$TMPHOME/.claude" bash "$INSTALLER" --user >/dev/null 2>&1
 
 INSTALLED_ROLES="$TMPHOME/.claude/sable/roles"
 
-# --- the four warm tmux-pane execution roles: MUST be installed, byte-identical ---
-for role in lincoln optimus tarzan chuck; do
-  template="$ROLES_DIR/$role.md"
+# --- every shipped role card: MUST be installed, byte-identical ---
+for template in "$ROLES_DIR"/*.md; do
+  role="$(basename "$template" .md)"
   installed="$INSTALLED_ROLES/$role.md"
   if [ ! -f "$installed" ]; then
     fail "$role.md copy-installed to \$CLAUDE_USER_DIR/sable/roles/" "missing: $installed"
@@ -77,16 +70,6 @@ else
   fail "agents.yaml installed byte-identical to its template" \
     "$(diff "$REGISTRY" "$INSTALLED_REGISTRY" | head -5)"
 fi
-
-# --- the four session-scoped Agent-tool producers: never copy-installed here ---
-for role in columbo rudy sherlock victor; do
-  installed="$INSTALLED_ROLES/$role.md"
-  if [ -e "$installed" ]; then
-    fail "$role.md correctly absent from the pane-role install (producer, not a pane)" "unexpectedly present: $installed"
-  else
-    pass "$role.md correctly absent from the pane-role install (producer, not a pane)"
-  fi
-done
 
 echo
 echo "== Results: $PASS passed, $FAIL failed =="

@@ -11,6 +11,7 @@ STATUS="${SABLE_WORKER_STATUS_COMMAND:-$BIN/sable-worker-status}"
 SOCK="inbox-timer-$$"
 SESS="timer-test"
 ROOT="$(mktemp -d "${TMPDIR:-/tmp}/sable-inbox-timer.XXXXXX")/inbox"
+WRONG_TMUX_BIN="$(dirname "$ROOT")/wrong-tmux-bin"
 MANAGER="timer-manager-$$"
 WORKER="timer-worker-$$"
 POKE='⟦SABLE-MSG⟧ Run sable-inbox read: 1 pending.'
@@ -27,6 +28,18 @@ cleanup() {
 trap cleanup EXIT
 
 command -v tmux >/dev/null 2>&1 || { echo "SKIP: tmux not installed"; exit 0; }
+
+mkdir -p "$WRONG_TMUX_BIN"
+cat > "$WRONG_TMUX_BIN/tmux" <<'FAKE_TMUX'
+#!/usr/bin/env bash
+if [ "${1:-}" = "-V" ]; then
+  echo "tmux 3.4-incompatible"
+  exit 0
+fi
+echo "server exited unexpectedly" >&2
+exit 1
+FAKE_TMUX
+chmod +x "$WRONG_TMUX_BIN/tmux"
 
 inbox_python() {
   SABLE_TEST=1 SABLE_TEST_INBOX_ROOT="$ROOT" PYTHONPATH="$BIN" python3 - "$@"
@@ -103,6 +116,18 @@ tmux_ send-keys -t "$WORKER_PANE" -l "operator draft held here"
 
 enqueue "$MANAGER"
 enqueue "$WORKER"
+
+wrong_client_out="$(PATH="$WRONG_TMUX_BIN:$PATH" run_timer "$STATUS")"
+wrong_client_rc=$?
+if [ "$wrong_client_rc" -eq 2 ] \
+   && printf '%s' "$wrong_client_out" | grep -Fq "CANNOT-ASSESS" \
+   && printf '%s' "$wrong_client_out" | grep -Fq "$WRONG_TMUX_BIN/tmux" \
+   && printf '%s' "$wrong_client_out" | grep -Fq "tmux 3.4-incompatible"; then
+  pass "wrong tmux client cannot assess and names its path plus version"
+else
+  fail "wrong tmux client cannot assess and names its path plus version" \
+    "rc=$wrong_client_rc out=$wrong_client_out"
+fi
 
 first_out="$(run_timer "$STATUS")"
 first_rc=$?

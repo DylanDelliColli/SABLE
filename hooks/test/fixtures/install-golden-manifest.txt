@@ -48,9 +48,13 @@ beda66a5848fac2df084ff074b3acfbc11bf0a28931d3e16ced22f8b01d8ba8e  ./sable/agents
 b394155acb17e7467189c7934402cff7758228f2c5e74d00ae8de013c250a071  ./sable/reconcile-timer/sable-reconcile-timer.service
 7078a55b8318c640afd65ae6537024148c33cd0ee5fa89c82ee2f340573b68b3  ./sable/reconcile-timer/sable-reconcile-timer.timer
 c02726b1655be80cc7e70291d60172855f03c5ff0ee5870b11468d06191946bd  ./sable/roles/chuck.md
+98a0313533218e2f41c718d23dc22adbb95ab61c95c8a9acdaa2d820ef61525d  ./sable/roles/columbo.md
 2b6e03b60831059f40d14709ea88ccf8d34bf258e2357845413ac7036fa1ac21  ./sable/roles/lincoln.md
 329df3b91ee8cd48f065de3b8aadc875049369f9602a0723eb2c15227d70a1a1  ./sable/roles/optimus.md
+a535333736b2071b2962f1e7c722f0d5f91ef8c0e4053bce53d41d30abbd4e42  ./sable/roles/rudy.md
+a752579f10d89b02f065c9ad75c1de5c6c6a820e155ab2089e17988053eda8f6  ./sable/roles/sherlock.md
 bc39b2bfb53ce2c938bf63fb846bda35d33d81a0d850ccbab42e7203c859d98a  ./sable/roles/tarzan.md
+c4bd536708e63dc92fb235c61dc06e630c576d53b2e489bc26f6ac598f761655  ./sable/roles/victor.md
 b793b490e79cfd51e0ae202565ba95559391e6f5403b8047cd40bedb007de157  ./skills/audit-deep-dive/SKILL.md
 e9f574b38ca7ab28ad32e644c4b2d5fb30e9f36484dce3258857aabc74b4070b  ./skills/columbo/SKILL.md
 0fa391ad408285219237da088c3d05f8666cd004fcab7449959333f4d5a29dac  ./skills/columbo/columbo-prefilter.py

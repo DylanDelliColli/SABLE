@@ -60,6 +60,18 @@ def test_registry_rejects_malformed_rows_and_registered_panes_without_provider()
         timer.parse_registry("%1\tsable-a\toptimus\t\t\n")
 
 
+def test_registry_enumeration_failure_names_the_resolved_tmux_client(monkeypatch):
+    monkeypatch.setattr(timer.shutil, "which", lambda _name: "/opt/wrong/tmux")
+
+    with pytest.raises(timer.TimerCannotAssess, match=r"/opt/wrong/tmux"):
+        timer.enumerate_registry(
+            "fleet",
+            run=lambda argv: _cp(
+                argv, rc=1, stderr="server exited unexpectedly\n"
+            ),
+        )
+
+
 def test_resolve_socket_ignores_pane_and_cwd_context():
     env = {
         "TMUX_PANE": "%wrong",

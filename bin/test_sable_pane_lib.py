@@ -625,18 +625,21 @@ def test_codex_midturn_pane_is_busy_and_not_idle():
 
 def test_styled_capture_does_not_change_claude_semantics():
     """REGRESSION (SABLE-6c391): stripping SGR so styled captures parse must
-    leave the Claude path byte-identical, and must NOT extend ghost tolerance
-    to Claude — Claude suppresses suggestions at the source via
-    CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0 (SABLE-ndaup)."""
+    leave the Claude path byte-identical while distinguishing dim ghost text
+    from real unsubmitted input (SABLE-06r3j)."""
     styled_bare = "● prior result\n\x1b[1m❯\x1b[0m \n  ddc@host:~/repo"
     assert lib.pane_ready(styled_bare, "claude")
 
     plain_bare = "● prior result\n❯ \n  ddc@host:~/repo"
     assert lib.pane_ready(plain_bare, "claude")
 
-    # A dim span on the Claude path is still held text, not a ghost to skip.
-    claude_dim = "● prior\n\x1b[1m❯\x1b[0m \x1b[2mleftover text\x1b[0m"
-    assert not lib.pane_ready(claude_dim, "claude")
+    claude_dim = "● prior\n\x1b[1m❯\x1b[0m \x1b[2mcheck the summary\x1b[0m"
+    assert lib.pane_ready(claude_dim, "claude")
+    assert lib.pane_idle(claude_dim, "claude")
+
+    claude_typed = "● prior\n\x1b[1m❯\x1b[0m operator draft"
+    assert not lib.pane_ready(claude_typed, "claude")
+    assert not lib.pane_idle(claude_typed, "claude")
 
 
 # --- Codex queued-message footer (SABLE-yuwrs) ------------------------------
