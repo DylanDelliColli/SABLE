@@ -455,14 +455,24 @@ def test_manager_command_always_pins_opus(monkeypatch):
 
 def test_manager_command_launches_deep_interactive_codex(monkeypatch):
     monkeypatch.delenv("SABLE_TMUX_PANE_CMD", raising=False)
+    monkeypatch.setenv(
+        "SABLE_CODEX_BOOT_ANCHOR", "/installed/session-role-anchor.sh"
+    )
     command = sm.manager_command("codex")
-    assert command.startswith("codex --no-alt-screen")
+    assert command.startswith("printf '%s\\n'")
+    assert (
+        "bash /installed/session-role-anchor.sh >/dev/null; "
+        "codex --no-alt-screen"
+    ) in command
     assert "--model gpt-5.6-sol" in command
     assert 'model_reasoning_effort="high"' in command
 
 
 def test_codex_manager_can_create_sibling_worker_worktrees(monkeypatch):
     monkeypatch.delenv("SABLE_TMUX_PANE_CMD", raising=False)
+    monkeypatch.setenv(
+        "SABLE_CODEX_BOOT_ANCHOR", "/installed/session-role-anchor.sh"
+    )
     command = sm.manager_command("codex", "/work/projects/repo")
     assert "--cd /work/projects/repo" in command
     assert "--add-dir /work/projects" in command
@@ -484,6 +494,36 @@ def test_manager_command_pane_cmd_override_bypasses_opus_pin(monkeypatch):
     # The one intentional exemption: tests stand in a fake pane command.
     monkeypatch.setenv("SABLE_TMUX_PANE_CMD", "bash")
     assert sm.manager_command() == "bash"
+
+
+def test_codex_manager_wraps_test_tui_with_in_pane_epoch_source(monkeypatch):
+    monkeypatch.setenv("SABLE_TMUX_PANE_CMD", "fake-codex")
+    monkeypatch.setenv(
+        "SABLE_CODEX_BOOT_ANCHOR", "/test/session-role-anchor.sh"
+    )
+
+    command = sm.manager_command("codex", "/work/repo")
+
+    assert '"hook_event_name":"SessionStart"' in command
+    assert '"source":"startup"' in command
+    assert "bash /test/session-role-anchor.sh >/dev/null; fake-codex" in command
+
+
+def test_codex_manager_without_boot_mechanism_cannot_produce_epoch(monkeypatch):
+    monkeypatch.setenv("SABLE_TMUX_PANE_CMD", "fake-codex")
+    monkeypatch.setenv("SABLE_CODEX_BOOT_ANCHOR", "disabled")
+
+    assert sm.manager_command("codex", "/work/repo") == "fake-codex"
+    delivered = []
+    ok, reason = sm.stabilize_manager_kick(
+        ready=lambda: True,
+        read_epoch=lambda: "",
+        deliver=lambda epoch: delivered.append(epoch) or True,
+        record=lambda _epoch: True,
+        attempts=1,
+    )
+    assert (ok, reason) == (False, "missing-agent-boot-epoch")
+    assert delivered == []
 
 
 # --- SABLE-59t6.4: v1 fleet boundary — project-only install refuses ---------

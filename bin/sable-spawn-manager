@@ -23,6 +23,7 @@ Usage:
 
 Env: SABLE_TMUX_SESSION (default: sable), SABLE_TMUX_SOCKET (tmux -L),
      SABLE_TMUX_PANE_CMD (stand-in command; tests), SABLE_WORKER_PERMISSION,
+     SABLE_CODEX_BOOT_ANCHOR (anchor path, or "disabled" for diagnostics),
      SABLE_DISPATCH_READY_TIMEOUT / _SUBMIT_TRIES / _POLL_INTERVAL.
 """
 from __future__ import annotations
@@ -30,6 +31,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import shlex
 import subprocess
 import sys
 from enum import Enum, auto
@@ -452,6 +454,47 @@ def stabilize_manager_kick(
     return False, "boot-epoch-changed-during-every-delivery-attempt"
 
 
+def codex_boot_anchor(cwd: str | None = None) -> Path | None:
+    """Resolve the role anchor Codex must invoke from inside its pane.
+
+    Codex 0.146 accepts the installed hook graph but does not dispatch its
+    ``SessionStart`` command entries.  The shared role anchor therefore never
+    gets a chance to publish the agent-written boot epoch that gates the first
+    kick.  Project-first resolution mirrors the normal hook install, while the
+    override keeps the integration discriminator hermetic.  ``disabled`` is a
+    deliberate negative diagnostic arm, not a production fallback.
+    """
+    override = os.environ.get("SABLE_CODEX_BOOT_ANCHOR", "").strip()
+    if override.lower() == "disabled":
+        return None
+    if override:
+        return Path(override).expanduser()
+
+    candidates = []
+    if cwd:
+        candidates.append(
+            Path(cwd) / ".claude" / "hooks" / "multi-manager"
+            / "session-role-anchor.sh"
+        )
+    candidates.append(
+        Path.home() / ".claude" / "hooks" / "multi-manager"
+        / "session-role-anchor.sh"
+    )
+    return next((path for path in candidates if path.is_file()), candidates[-1])
+
+
+def codex_boot_command(command: str, cwd: str | None = None) -> str:
+    """Run the SessionStart anchor in-pane before starting a Codex manager."""
+    anchor = codex_boot_anchor(cwd)
+    if anchor is None:
+        return command
+    payload = '{"hook_event_name":"SessionStart","source":"startup"}'
+    return (
+        f"printf '%s\\n' {shlex.quote(payload)} | "
+        f"bash {shlex.quote(str(anchor))} >/dev/null; {command}"
+    )
+
+
 def manager_command(provider: str = "claude", cwd: str | None = None) -> str:
     """The command used to launch a manager pane. Managers ALWAYS run on Opus
     (SABLE-gbd) — the per-bead model ladder (SABLE.md 6.9) governs the workers
@@ -459,7 +502,11 @@ def manager_command(provider: str = "claude", cwd: str | None = None) -> str:
     a full override for tests only and is exempt from the pin."""
     override = os.environ.get("SABLE_TMUX_PANE_CMD")
     if override:
-        return override
+        return (
+            codex_boot_command(override, cwd)
+            if provider == "codex"
+            else override
+        )
     perm = os.environ.get("SABLE_WORKER_PERMISSION", "--permission-mode bypassPermissions")
     add_dirs = [str(Path(cwd).parent)] if provider == "codex" and cwd else []
     # Codex's workspace-write sandbox blocks .git even inside the workspace, so
@@ -470,10 +517,11 @@ def manager_command(provider: str = "claude", cwd: str | None = None) -> str:
         common = git_common_dir(cwd)
         if common:
             roots = [common]
-    return interactive_command(
+    command = interactive_command(
         provider, "opus", claude_permission=perm, cwd=cwd, add_dirs=add_dirs,
         writable_roots=roots,
     )
+    return codex_boot_command(command, cwd) if provider == "codex" else command
 
 
 def producer_command(

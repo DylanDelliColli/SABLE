@@ -146,6 +146,7 @@ ALLOW=(
   test-worker-flag-done.sh
   test-worktree-isolation.sh
   test-worktree-placement-guard.sh
+  test-spawn-manager-codex-boot.sh
 )
 
 # --- Excluded from the run-set, each WITH reason + tracking tag. ---------------
@@ -371,6 +372,7 @@ declare -A COVERS=(
   [test-tier-ssot.sh]=".github/ci/test-tiers.sh"
   [test-worker-dispatch-template.sh]="templates/worker-dispatch.md"
   [test-worker-flag-done.sh]="hooks/test/lib-identity-isolation.sh"
+  [test-spawn-manager-codex-boot.sh]="bin/sable-spawn-manager hooks/multi-manager/session-role-anchor.sh"
 )
 
 # --- Iron-rule real-bd suites (SABLE-jd5fj.16) ------------------------------
