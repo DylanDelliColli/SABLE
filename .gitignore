@@ -57,6 +57,16 @@ __pycache__/
 # not ephemeral state. It stays at the existing operator-contract path so the
 # tracked fix does not require rewriting live active-contracts state.
 !.claude/sable/state/night-stall-probe.py
+# FOURTH exception (SABLE-xgb29): the frozen-branch list. Same class as
+# active-contracts.md and NOT the same class as merge-gate/freeze.json one level
+# down, which is ignored — the distinction is what makes this a negation rather
+# than a force-add. A merge-gate freeze is a fact about a moment on one machine
+# (that repo's tests are red now); a BRANCH freeze is a fact about shared
+# history, so it must reach every clone, every fresh checkout, and every linked
+# worktree — including the post-crash one where sable-recover reads it. A
+# negation, not `git add -f`: force-adding leaves the path ignored, so nothing
+# stops the next author from writing a freeze the tree never records.
+!.claude/sable/state/frozen-branches.txt
 !.claude/sable/state/merge-gate/
 .claude/sable/state/merge-gate/*
 !.claude/sable/state/merge-gate/README.md
