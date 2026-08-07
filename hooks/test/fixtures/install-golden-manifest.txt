@@ -68,3 +68,4 @@ e1f19735c92612d20fd31cd4172904dfa8a2cc84864a88d5bfc220fe734ad266  ./skills/sable
 96162dfce4412a6b464c66977c16492e1ac8fe749e2f60ca7adfc5203ca8463a  ./skills/sable-onboarding/SKILL.md
 1b2c6e19eb466b95422bfd9e15d9be4c7cdeab0fc923abde91464929603272cd  ./skills/sable-plan/SKILL.md
 2e32e54c16bd3bd4f21f05bc1e80ae08d83332c1538337cc59ec6de5179816cd  ./skills/sable-review/SKILL.md
+b3a9b1243eb92409b9c709c5776044e8c7f7332874a125d8fb13f1670cb0edb4  ./skills/sable-shift-change/SKILL.md
