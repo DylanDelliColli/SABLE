@@ -43,8 +43,9 @@
 # blob, wip_claims included — is out of scope for this hook and is recorded on
 # SABLE-6la1 item (3).
 #
-# `bd` absent from PATH is treated as "no write can happen" and exits silently:
-# the guarded command would itself fail, so there is nothing to protect.
+# `bd` absent from the hook's PATH is unresolved, not proof that no write can
+# happen: the guarded command may supply a different PATH. Fail open, but emit
+# a valid ALLOW decision that says the notes could not be assessed.
 
 set -uo pipefail
 
@@ -220,8 +221,7 @@ esac
 
 # --- TARGETS: resolve each bead's current notes -----------------------------
 if ! command -v bd >/dev/null 2>&1; then
-  # No bd means the guarded command cannot write anything either.
-  exit 0
+  allow_with_context "notes-clobber-guard: COULD NOT ASSESS — 'bd' is not available on the hook's PATH, so the guard could not read the target bead's current notes. ALLOWING (fail-open), but the guard did NOT verify that this '--notes' write destroys nothing; the guarded command may resolve 'bd' through a different PATH. $APPEND_HINT"
 fi
 
 # notes_of <bead-id> — prints the current notes; exit 3 = could not assess.

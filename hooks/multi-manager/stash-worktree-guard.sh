@@ -77,6 +77,17 @@ except Exception:
 print((d.get('tool_input') or {}).get('command', '') or '')
 " 2>/dev/null) || COMMAND=""
 
+HOOK_CWD_B64=$(printf '%s' "$HOOK_INPUT" | python3 -c "
+import base64, json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    d = {}
+cwd = d.get('cwd', '') or ''
+cwd = cwd if isinstance(cwd, str) else str(cwd)
+sys.stdout.write(base64.b64encode(cwd.encode()).decode())
+" 2>/dev/null) || HOOK_CWD_B64=""
+
 [ -z "$COMMAND" ] && exit 0
 
 # ---------------------------------------------------------------------------
@@ -97,13 +108,42 @@ print(json.dumps({
 }
 
 deny_with_reason() {
-  REASON="$1" python3 -c "
-import json, os
+  REASON="$1" HOOK_CWD_B64="$HOOK_CWD_B64" MATCHED_COMMAND_B64="$MATCHED_COMMAND_B64" python3 -c "
+import base64, json, os, re
+
+def decode(name):
+    try:
+        return base64.b64decode(os.environ.get(name, ''), validate=True).decode(
+            'utf-8', errors='replace'
+        )
+    except Exception:
+        return ''
+
+def sanitize(value, limit=512):
+    # Denial context is diagnostic, not a second command channel. Keep normal
+    # printable text exact, flatten line-oriented control characters, replace
+    # the rest, and bound the payload so an adversarial hook input cannot turn
+    # one refusal into an unbounded or terminal-active log record.
+    cleaned = ''.join(
+        ' ' if ch in '\r\n\t' else ch if ch.isprintable() else '?'
+        for ch in value
+    )
+    cleaned = re.sub(r' +', ' ', cleaned).strip()
+    if len(cleaned) > limit:
+        cleaned = cleaned[:limit - 3] + '...'
+    return cleaned
+
+cwd = sanitize(decode('HOOK_CWD_B64')) or '<unknown>'
+matched = sanitize(decode('MATCHED_COMMAND_B64')) or '<unavailable>'
+reason = (
+    os.environ.get('REASON', '')
+    + f' Denial context -- hook-input cwd: {cwd}; matched command: {matched}.'
+)
 print(json.dumps({
     'hookSpecificOutput': {
         'hookEventName': 'PreToolUse',
         'permissionDecision': 'deny',
-        'permissionDecisionReason': os.environ.get('REASON', '')
+        'permissionDecisionReason': reason
     }
 }))
 "
@@ -118,7 +158,7 @@ ALTERNATIVES="Alternatives instead of stash: (1) diff-to-file (SABLE.md 6.4a) --
 #   DENY <kind>              deny; <kind> in CLEAR|PUSH|POP:<subcmd>
 #   WARN <kind>              allow-with-warning; <kind> in PUSH|POP:<subcmd>
 # ---------------------------------------------------------------------------
-CLASSIFY=$(CMD_STR="$COMMAND" python3 -c "
+CLASSIFY_OUTPUT=$(CMD_STR="$COMMAND" python3 -c "
 import os, re, shlex, sys
 
 cmd = os.environ.get('CMD_STR', '')
@@ -192,6 +232,7 @@ def find_explicit_index(args):
     return None
 
 verdict = 'NONE'
+matched_command = ''
 
 for raw_seg in segments(tokens):
     seg = strip_env_prefix(raw_seg)
@@ -220,6 +261,11 @@ for raw_seg in segments(tokens):
         continue
     if seg[i] != 'stash':
         continue
+    # Retain only the classified git invocation, not unrelated commands
+    # before/after it or environment assignments stripped above. Besides being
+    # irrelevant to the verdict, those assignments may contain credentials.
+    # shlex.join gives a shell-quoted canonical rendering of the argv examined.
+    matched_command = shlex.join(seg)
     rest = seg[i + 1:]
 
     if rest and rest[0] in KNOWN_SUBCMDS:
@@ -252,9 +298,15 @@ for raw_seg in segments(tokens):
         verdict = 'NONE'
         break
 
-print(verdict)
-" 2>/dev/null) || CLASSIFY="NONE"
+import base64
+matched_b64 = base64.b64encode(matched_command.encode()).decode()
+print(verdict + '\t' + matched_b64)
+" 2>/dev/null) || CLASSIFY_OUTPUT=$'NONE\t'
 
+[ -z "$CLASSIFY_OUTPUT" ] && CLASSIFY_OUTPUT=$'NONE\t'
+CLASSIFY="NONE"
+MATCHED_COMMAND_B64=""
+IFS=$'\t' read -r CLASSIFY MATCHED_COMMAND_B64 <<< "$CLASSIFY_OUTPUT"
 [ -z "$CLASSIFY" ] && CLASSIFY="NONE"
 
 DECISION="${CLASSIFY%% *}"

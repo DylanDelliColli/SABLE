@@ -198,20 +198,28 @@ In SABLE, you don't write a separate implementation plan and then create beads. 
 
 If a session ends mid-work, the next agent runs `bd ready` and continues. No re-reading plans. No lost context. The beads are the single source of truth.
 
-### 3.6 Issue Discovery Is Mandatory
+### 3.6 Issue Discovery: Capture Is Mandatory, Filing Is Deliberate
 
-Any bug, bad practice, incorrect behavior, pre-existing error, or code smell noticed at any time — by any agent, during any task — must be immediately logged as a bead. This is non-negotiable.
+Any bug, bad practice, incorrect behavior, pre-existing error, or code smell noticed at any time — by any agent, during any task — must be **captured** before you move on. This is non-negotiable. What is *not* automatic is turning that capture into a bead.
 
-Do not ask "should I log this?" Just log it:
+Do not ask "should I log this?" Just capture it:
+
+```bash
+sable-note "<what's wrong, which file, one repro breadcrumb>"
+```
+
+It enters the bead pool only through a curation pass — `/sable-review` — and **curation is operator-manual: it runs when the operator invokes it, never automatically.**
+
+**The carve-out: a defect that blocks or endangers in-flight work gets a bead immediately**, with full forensic detail while it is fresh.
 
 ```bash
 bd create --title="<what's wrong>" --type=bug --priority=2 \
   --description="<file, function, what's wrong, how to reproduce, acceptance criteria>"
 ```
 
-The reasoning: agents are amnesiac. If it's not in a bead, it doesn't exist in the next session. The cost of a false-positive bead (turns out it wasn't a real issue) is trivial. The cost of a missed bug (nobody remembers it existed) compounds over time.
-
 **Important**: Before creating a bead, verify the referenced file or function actually exists (grep or glob). Hallucinated beads waste full agent cycles when the next agent tries to act on them.
+
+The reasoning: agents are amnesiac, so an uncaptured observation does not exist next session. But a false-positive *bead* is not free — it enters a pool that people plan against, and at reflex speed the pool grows faster than it drains until it stops being a plan. Capture is three seconds; filing is a commitment, so it gets a decision.
 
 ---
 
@@ -965,7 +973,7 @@ All projects use **bd (beads)** for issue tracking.
 
 ### Rules
 - Use `bd` for ALL task tracking
-- Issue discovery is mandatory — see a bug, log a bead
+- Capture discovery with `sable-note`; it becomes a bead only via operator-invoked `/sable-review`. Blocking defects are the carve-out — bead them immediately (§3.6)
 - One `bd` command per Bash call (no chaining with && or ;)
 - Never use `bd edit` — it opens $EDITOR and hangs agents
 

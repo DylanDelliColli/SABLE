@@ -122,6 +122,38 @@ assert_allow "default: complete description allowed" "" "bd create --title=foo -
 
 MANAGER_ENV="CLAUDE_AGENT_NAME=optimus CLAUDE_AGENT_ROLE=manager"
 
+# ---------- Simple create inspection commands (SABLE-gjorq) ----------
+
+assert_allow "inspection: bare bd create allowed" "$MANAGER_ENV" \
+  "bd create"
+assert_allow "inspection: bd create -h allowed" "$MANAGER_ENV" \
+  "bd create -h"
+assert_allow "inspection: bd create --help allowed" "$MANAGER_ENV" \
+  "bd create --help"
+assert_allow "inspection: whitespace-equivalent bd create --help allowed" "$MANAGER_ENV" \
+  "bd create    --help"
+assert_allow "inspection: whitespace between bd/create remains argv-equivalent" "$MANAGER_ENV" \
+  "bd    create --help"
+assert_allow "inspection: quoted --help argv allowed" "$MANAGER_ENV" \
+  "bd create '--help'"
+assert_deny "inspection: compound help plus real create remains denied" "$MANAGER_ENV" \
+  "bd create --help && bd create --title=real" \
+  "no --description"
+assert_deny "inspection: whitespace-equivalent help plus real create remains denied" "$MANAGER_ENV" \
+  "bd create    --help;bd create --title=real" \
+  "no --description"
+assert_deny "inspection: quoted help plus real create remains denied" "$MANAGER_ENV" \
+  "bd create '--help' || bd create --title=real" \
+  "no --description"
+assert_deny "inspection: actual create without description remains denied" "$MANAGER_ENV" \
+  "bd create --title=real" \
+  "no --description"
+assert_deny "inspection: spaced real create without description remains denied" "$MANAGER_ENV" \
+  "bd    create --title=real" \
+  "no --description"
+assert_allow "inspection: actual create with adequate description remains allowed" "$MANAGER_ENV" \
+  "bd create --title=real --labels=origin:planned --description=\"Update hooks/bead-description-gate.sh. Test in hooks/test/test-bead-description-gate.sh.\""
+
 # Test 6: missing description in manager mode → DENY
 assert_deny "manager: missing description denied" "$MANAGER_ENV" "bd create --title=foo" "no --description"
 
@@ -533,7 +565,9 @@ else
   ORIGIN_BD_INIT_OK=0
   for _ in 1 2 3 4; do
     rm -rf "$ORIGIN_REPO_DIR/.beads"
-    ( cd "$ORIGIN_REPO_DIR" && env HOME="$ORIGIN_BD_HOME" BD_NON_INTERACTIVE=1 CI=true bd init --non-interactive >/dev/null 2>&1 )
+    # -u BEADS_DB (SABLE-sx1rb): never inherit an ambient BEADS_DB (e.g. the
+    # impact tier's own) — this suite builds and must use its OWN sandbox DB.
+    ( cd "$ORIGIN_REPO_DIR" && env -u BEADS_DB HOME="$ORIGIN_BD_HOME" BD_NON_INTERACTIVE=1 CI=true bd init --non-interactive >/dev/null 2>&1 )
     if [ -f "$ORIGIN_REPO_DIR/.beads/config.yaml" ]; then ORIGIN_BD_INIT_OK=1; break; fi
   done
 

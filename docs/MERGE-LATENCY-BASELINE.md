@@ -15,8 +15,11 @@ All data comes from three sources on this repo, no synthetic data:
    original tip commit (with its real author/committer date) survives forever
    as the merge commit's second parent, even after the worker branch itself is
    deleted on green (`cleanup_after_merge`, SABLE-dn7r). This gives an exact
-   count and timestamp for every promotion, and a coarse latency proxy
-   (merge-commit date − branch-tip date) for all of them.
+   count and timestamp for every promotion, and a coarse push→preview-build
+   proxy (merge-commit date − branch-tip date) for all of them. It is a
+   **LOWER BOUND with respect to the CI phase, not push→landed latency**:
+   `promote()` timestamps the preview merge object before CI and fast-forwards
+   it only after green, so the proxy excludes the preview run by construction.
 2. **`~/.claude/sable/logs/post-push-merge-notify.log`** — the pre-push hook's
    `CONFIRMED local=<sha> remote=<sha>` lines give real push timestamps. Joined
    against the matching `ci-verify/<bead>-<sha7>` GitHub Actions run's
@@ -47,19 +50,38 @@ Two important scope notes, both discovered while measuring (see beads below):
 
 ### Measurement window
 
-126 promoted merges landed on `tmux-only` between 2026-07-14T13:22:04 and
-2026-07-17T12:29:48 (-0400), ~71 hours of gate activity, then a gap to today
-(2026-07-21) with no further gate activity — i.e. all data below is from one
-contiguous multi-day drain, not cherry-picked.
+The baseline sample contains 126 promoted merges landed on `tmux-only` between
+2026-07-14T13:22:04 and 2026-07-17T12:29:48 (-0400), ~71 hours of one
+contiguous multi-day drain rather than a cherry-picked interval. Gate activity
+did resume afterward: `c9dc26d` landed on 2026-07-21. That 127th observation is
+kept out of the already-computed percentiles below and used as an independent
+worked example instead.
 
 ### (1) Push-to-integrated latency, current serial path
 
-| Measure | Coarse proxy (n=126, commit-date only) | Precise push→CI-done (n=47, real push log × gh run join) | Precise, same-session only (n=41, excludes a 15h overnight gap) |
+| Measure | Coarse push→preview-build LOWER BOUND (n=126, commit-date only; excludes CI) | Precise push→CI-done (n=47, real push log × gh run join) | Precise, same-session only (n=41, excludes a 15h overnight gap) |
 |---|---|---|---|
 | median | 647s | 1621s | 1513s |
 | p90 | 3571s | 54846s | 3841s |
 | p95 | 54275s | 55147s | 4944s |
 | mean | 4025s | 8721s | 1950s |
+
+The coarse column must not be used as integrated-latency telemetry. A
+post-window promotion demonstrates the missing interval:
+
+- push confirmed: 2026-07-21T15:20:18Z
+- preview merge `c9dc26d` timestamp: 2026-07-21T15:21:51Z
+- `ci-verify` run 29843619012 created: 2026-07-21T15:21:55Z
+- run green: 2026-07-21T15:27:16Z
+
+The preview object was therefore timestamped four seconds before its own CI run
+was created and 325 seconds before green; it could not have landed before that
+green instant. The coarse proxy omits approximately one full CI run here.
+That bias does not cancel in an S2 pre/post comparison: S2 is intended to
+remove this very preview→land verification interval, making the omitted term
+large before S2 and near zero afterward. **S6 must use the precise
+push→CI-done method, or preferably a new push→landed timestamp captured at the
+actual fast-forward; it must not compare against the coarse column.**
 
 The same-session column (n=41) is the honest floor for the gate's own
 contribution — the wide p90/p95 in the other columns is a shift-boundary

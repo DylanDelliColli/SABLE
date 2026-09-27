@@ -67,7 +67,7 @@ else
   # bypasses the SABLE-s6qk linked-worktree guard (this suite runs from a fleet
   # worktree); it is a harness concern, not part of the documented command form.
   env -u SABLE_AGENTS_YAML -u SABLE_DISPATCH_DIR -u CLAUDE_USER_DIR -u CLAUDE_PROJECT_DIR \
-    HOME="$ISOHOME" bash "$INSTALL" --project="$PROJ" --from-here >"$ISOHOME/install.log" 2>&1
+    HOME="$ISOHOME" bash "$INSTALL" --project="$PROJ" --from-here --merge-settings >"$ISOHOME/install.log" 2>&1
   rc=$?
   [ "$rc" = "0" ] && pass "E2E: install.sh --project into fresh repo (rc=0)" \
     || fail "E2E: install.sh --project into fresh repo" "rc=$rc (see $ISOHOME/install.log)"

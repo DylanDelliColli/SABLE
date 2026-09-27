@@ -41,6 +41,17 @@ assert_field() {
 assert_field "lincoln type is cockpit (the seat)" '.lincoln.type'             "cockpit"
 assert_field "lincoln cross_inbox_read true"      '.lincoln.cross_inbox_read' "true"
 assert_field "lincoln role_prompt path"           '.lincoln.role_prompt'      "roles/lincoln.md"
+assert_field "lincoln never dispatches workers"   '.lincoln.dispatches_workers' "false"
+assert_field "lincoln launches the execution fleet" '.lincoln.launches_fleets' "true"
+if printf '%s' "$OUT" | jq -e '
+  .lincoln.scope
+  | (contains("producer subagents") and contains("warm-pane session"))
+' >/dev/null 2>&1; then
+  pass "lincoln scope separates planning producers from execution panes"
+else
+  fail "lincoln scope separates planning producers from execution panes" \
+    "scope must name producer subagents and the warm-pane session"
+fi
 
 # The standalone cockpit agent entry must be GONE (merged into lincoln).
 if printf '%s' "$OUT" | jq -e '.cockpit' >/dev/null 2>&1; then

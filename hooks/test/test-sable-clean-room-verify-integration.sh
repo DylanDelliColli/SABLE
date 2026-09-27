@@ -19,6 +19,8 @@
 #
 # Run with:
 #   bash hooks/test/test-sable-clean-room-verify-integration.sh
+#
+# sable-test-load: nested-runner -- defining E2E proves the real installer suite under scrubbed PATH
 
 set -uo pipefail
 

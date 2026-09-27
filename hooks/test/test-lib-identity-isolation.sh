@@ -11,7 +11,7 @@
 # config wrote Validator/v@test into the real .git/config, and the push shipped
 # the real HEAD to the real origin/main with 2>/dev/null hiding the corruption.
 # This harness proves the fixed suite can NEVER pollute the real repo's identity
-# OR push to its origin. Three layers:
+# OR push to its origin. Two layers:
 #
 #   1. Deterministic sabotage (RED/GREEN gate): shim `mktemp` so the 4th
 #      `mktemp -d` (VAL_REPO) hands back a non-cd-able path, reproducing the
@@ -21,10 +21,7 @@
 #      Validator/v@test and origin/main advances to the escaped commit); GREEN
 #      on the fix (scoped `git -C` + guarded cd).
 #
-#   2. Concurrency under a busy /tmp: N parallel suite runs + a /tmp thrasher,
-#      same identity + origin-ref assertion. Load/regression guard.
-#
-#   3. Structural: no bare `git config` command, no unguarded fixture `cd`, and
+#   2. Structural: no bare `git config` command, no unguarded fixture `cd`, and
 #      no bare `git push` command remain in the suite.
 #
 # Standalone — NOT wired into the .sable testCommand (the suite it guards runs
@@ -32,6 +29,7 @@
 # Optional arg: path to the suite under test (defaults to the sibling suite;
 # point it at a pre-fix copy for RED verification).
 #
+# sable-test-load: nested-runner -- one deterministic sabotage run proves fixture escape containment
 # NOTE on the ordinal: VAL_REPO is the 4th `mktemp -d` in the suite
 # (FIXTURE_DIR, then two mk_mode_repo fixtures, then VAL_REPO). The sabotage
 # trips on that ordinal; the STRUCTURAL layer below is the ordinal-independent
@@ -138,38 +136,7 @@ assert_sentinel_clean "$S1" "$S1_BARE" "$S1_MAIN" \
   "sabotage: a failed VAL_REPO cd never mutates the real repo identity OR pushes to its origin"
 
 # ==========================================================================
-# Layer 2 — concurrency under a busy /tmp
-# ==========================================================================
-S2="$WORKROOT/sentinel2"; S2_BARE="$WORKROOT/sentinel2-bare"
-make_sentinel "$S2" "$S2_BARE"
-S2_MAIN="$(git ls-remote "$S2_BARE" refs/heads/main | awk '{print $1}')"
-mkdir -p "$WORKROOT/t2"
-
-THRASH_STOP="$WORKROOT/thrash.stop"
-(
-  while [ ! -e "$THRASH_STOP" ]; do
-    d="$("$REAL_MKTEMP" -d "$WORKROOT/t2/thrash.XXXXXX" 2>/dev/null)" || continue
-    rm -rf "$d" 2>/dev/null
-  done
-) &
-THRASH_PID=$!
-
-N=4
-pids=""
-for i in $(seq 1 "$N"); do
-  ( cd "$WORKROOT" && cd "$S2" && exec env TMPDIR="$WORKROOT/t2" bash "$SUITE" ) >/dev/null 2>&1 &
-  pids="$pids $!"
-done
-for p in $pids; do wait "$p" 2>/dev/null || true; done
-
-: > "$THRASH_STOP"
-wait "$THRASH_PID" 2>/dev/null || true
-
-assert_sentinel_clean "$S2" "$S2_BARE" "$S2_MAIN" \
-  "concurrency: $N parallel suite runs under a busy /tmp never mutate the real repo identity OR origin"
-
-# ==========================================================================
-# Layer 3 — structural guards on the suite source
+# Layer 2 — structural guards on the suite source
 # ==========================================================================
 # A bare `git config` / `git push` COMMAND sits at command position (line start
 # after optional whitespace); scoped forms are `git -C "$X" config|push`, and

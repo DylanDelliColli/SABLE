@@ -56,20 +56,48 @@ Each merge request — message OR bead:
    You are reading a PRECOMPUTED result, not starting one. Do not `gh pr view` /
    `gh pr checks` for the merge decision — the ci-verify gate, not the PR page,
    is the authority on whether a branch may land.
-3. **Sequencing decision** — verdicts are parallel, promotions are SERIAL. You
-   are the single writer to the integration branch, so order the `green` ones
-   and promote them one at a time:
-   - No overlap with in-flight PRs → queue it for promotion
-   - Overlap with a PR that hasn't merged → **hold this one**, file a follow-up
-     note in the bead, set bead status accordingly
-   - Anything not `green` → it is not in this queue at all
+3. **Drain bounded micro-batches** — verdicts are parallel and landing is one
+   atomic integration-ref write. Let the queue adapter join unlanded
+   `origin/wk-*` refs to their exact Beads branch metadata and run up to four
+   sealed cycles of eight:
+
+   ```bash
+   sable-merge-gate batch-drain --max-members 8 --max-cycles 4
+   ```
+
+   `batch-drain` chooses oldest-closed work deterministically, reports every
+   unreadable/held/ambiguous exclusion, and feeds the existing `batch-cycle`
+   authority. That authority still owns overlap/read-write admission,
+   canonical fold, exact combined CI verdict, atomic landing, and red-batch
+   diagnosis; discovery is not another writer. Use `batch-drain --dry-run`
+   to inspect the queue without CI or a landing.
+
+   Each cycle is sealed before its CI run. Messages that arrive while CI runs
+   are discovered only after that cycle finishes and therefore enter the next
+   cycle—there is no swarm-wide boundary and no reason to wait for quiet. The
+   drain stops on red/retry, a queue smaller than two, or its cycle bound. For
+   a forensic/manual retry, `batch-cycle --member BRANCH:BEAD ...` remains the
+   explicit single-cycle interface. If fewer than two candidates survive,
+   use the serial fallback in step 5.
+
+   Throughput observations are durable:
+
+   ```bash
+   sable-merge-gate batch-metrics
+   sable-merge-report --since <shift-start-ISO8601>
+   ```
+
+   The first reports arrival/drain rates, fill, outcomes, and actual CI rounds.
+   The second compares push-to-landed latency for serial versus batched member
+   promotions and excludes same-batch siblings from queue-depth inflation.
 4. **Conflict classification** (use the registry's `fix_directly` and `delegate_to_author` lists):
    - Mechanical conflicts (imports, lockfiles, whitespace, non-overlapping diffs, docs) → fix in place: rebase, resolve, push
    - Semantic conflicts (overlapping logic, competing implementations, test divergence, config changes) → file `for-<author>` bead with conflict context and suggested resolution; close the for-chuck bead with reason "delegated to author"
-5. **PROMOTE** — `sable-merge-gate promote --bead <id> --branch <branch>`, one
-   branch at a time, in the order you sequenced. On a green verdict this
-   consumes the stored result and fast-forwards in seconds; it never re-merges,
-   so what lands is byte-identical to what CI verified. Read its exit code:
+5. **SERIAL FALLBACK** — use `sable-merge-gate promote --bead <id> --branch
+   <branch>` only for a lone survivor or a member that `batch-drain` explicitly
+   excluded. On a green verdict this consumes the stored result and
+   fast-forwards in seconds; it never re-merges, so what lands is
+   byte-identical to what CI verified. Read its exit code:
 
    | code | meaning | what you do |
    |---|---|---|
@@ -89,19 +117,39 @@ Each merge request — message OR bead:
    Before this bead that ruling lived only in a bead note or a manager's
    working memory, which you as the seat never read — you could be holding
    one half of a deliberately-paired change with no way to know it. The
-   ruling is now `metadata.landing_pair` on the bead itself (`bd update <id>
-   --set-metadata landing_pair=<counterpart-id>`, set on BOTH sides of the
-   pair), and `sable-merge-gate promote` reads it MECHANICALLY: a solo
-   promote of either half exits 28, naming the counterpart, unless the
-   counterpart has already landed or you pass `--with-pair <counterpart-id>`
-   to promote both in the same sitting:
+   ruling is now a mechanically reciprocal Beads declaration. Create and
+   remove it only through the one authority that writes both metadata records
+   and their durable reverse index:
    ```bash
-   sable-merge-gate promote --bead <id>  --branch <branch>  --with-pair <counterpart-id>
-   sable-merge-gate promote --bead <counterpart-id> --branch <counterpart-branch>
+   sable-merge-gate landing-pair declare <id> <counterpart-id>
+   sable-merge-gate landing-pair remove <id> <counterpart-id>
    ```
-   Check `bd show <id> --json` for a `landing_pair` metadata field before you
-   sequence a queue — it changes the ORDER question above from "any two
-   independent greens" to "these two travel together."
+   Never write `metadata.landing_pair` directly. A partial/manual one-sided
+   edit is treated as corrupt from EITHER bead and every landing writer exits
+   28 until the command above repairs or removes it. `sable-merge-gate
+   promote` reads this state MECHANICALLY: a solo promote of either half exits
+   28, naming the counterpart, unless the counterpart has already landed. An
+   unlanded pair must enter the SAME atomic batch; an ID acknowledgement is
+   not landing evidence:
+   ```bash
+   sable-merge-gate batch-cycle \
+     --member <branch>:<id> \
+     --member <counterpart-branch>:<counterpart-id>
+   ```
+   `batch-cycle` binds both exact branch tips to one combined CI verdict and
+   advances the integration ref once or not at all. `land-batch` is the manual
+   recovery path only when that exact combined ref has already been formed and
+   verified; every `--member` must include its bead ID. Solo promotion after a
+   counterpart has genuinely landed remains available only to repair a legacy
+   half-landed pair.
+
+   Check `bd show <id> --json` for the reciprocal `landing_pair` metadata and
+   its `relates-to` reverse index before you sequence a queue — it changes the
+   ORDER question above from "any two independent greens" to "these two travel
+   together."
+
+   `batch-cycle` enforces the same metadata at its final writer: every declared
+   counterpart must be a member of the same atomic batch (or already landed).
 
    Codes 23 and 24 mean **retry**, not failure — never tell an author to "fix"
    either one.

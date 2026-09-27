@@ -541,7 +541,7 @@ def test_gh_source_batch_ref_end_to_end_produces_batch_run_event_with_resolved_m
     # Real durable manifest, isolated from the real state dir via
     # SABLE_MG_BATCH_RECORD_LOG -- mirrors
     # test_stamp_and_read_batch_record_round_trip's own isolation pattern in
-    # test_sable_gate_promote_lib.py.
+    # test_sable_gate_promote_lib_integration.py.
     monkeypatch.setenv("SABLE_MG_BATCH_RECORD_LOG", str(tmp_path / "batch-records.jsonl"))
     combined_ref = "ci-verify/batch-1234abc"
     members = [

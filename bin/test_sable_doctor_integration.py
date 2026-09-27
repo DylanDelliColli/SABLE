@@ -37,7 +37,7 @@ def run_install(home_dir: Path):
     assert result.returncode == 0, f"install.sh failed:\n{result.stdout}\n{result.stderr}"
 
 
-def run_doctor(claude_dir: Path, *extra_args, env=None, bin_dir=None):
+def run_doctor(claude_dir: Path, *extra_args, env=None, bin_dir=None, cwd=None):
     # bin_dir defaults to the fixture's OWN ~/.local/bin (claude_dir's sibling
     # under the same redirected HOME run_install used) — never the real
     # machine's ~/.local/bin. Without this, sable-doctor's --bin-dir default
@@ -45,11 +45,14 @@ def run_doctor(claude_dir: Path, *extra_args, env=None, bin_dir=None):
     # the actual dev machine's pinned bins into every assertion here.
     if bin_dir is None:
         bin_dir = claude_dir.parent / ".local" / "bin"
+    doctor_env = dict(os.environ if env is None else env)
+    doctor_env["HOME"] = str(claude_dir.parent)
     return subprocess.run(
         [sys.executable, str(DOCTOR), "--repo", str(REPO), "--claude-dir", str(claude_dir),
          "--bin-dir", str(bin_dir), *extra_args],
         capture_output=True, text=True, timeout=30,
-        env=env if env is not None else os.environ,
+        env=doctor_env,
+        cwd=cwd,
     )
 
 
@@ -78,15 +81,16 @@ def run_doctor_project(cwd: Path, *extra_args, bin_dir=None):
          "--bin-dir", str(bin_dir), *extra_args],
         cwd=str(cwd),
         capture_output=True, text=True, timeout=30,
+        env={**os.environ, "HOME": str(cwd)},
     )
 
 
-@pytest.fixture()
-def project_install(tmp_path):
+@pytest.fixture(scope="module")
+def project_install_template(tmp_path_factory):
     # the project IS its own git root, and HOME=project makes install.sh's
     # ${HOME}/.claude land exactly at <project-root>/.claude — the same path
     # --project resolves via git-common-dir.
-    project = tmp_path / "project"
+    project = tmp_path_factory.mktemp("doctor-project-template") / "project"
     project.mkdir()
     subprocess.run(["git", "init", "-q"], cwd=project, check=True)
     run_project_install(project)
@@ -94,10 +98,24 @@ def project_install(tmp_path):
 
 
 @pytest.fixture()
-def installed_claude_dir(tmp_path):
-    home = tmp_path / "home"
+def project_install(tmp_path, project_install_template):
+    project = tmp_path / "project"
+    shutil.copytree(project_install_template, project, symlinks=True)
+    return project
+
+
+@pytest.fixture(scope="module")
+def installed_home_template(tmp_path_factory):
+    home = tmp_path_factory.mktemp("doctor-home-template") / "home"
     home.mkdir()
     run_install(home)
+    return home
+
+
+@pytest.fixture()
+def installed_claude_dir(tmp_path, installed_home_template):
+    home = tmp_path / "home"
+    shutil.copytree(installed_home_template, home, symlinks=True)
     return home / ".claude"
 
 
@@ -108,6 +126,34 @@ def test_fresh_install_is_clean(installed_claude_dir):
     assert result.returncode == 0, result.stdout + result.stderr
     assert "clean" in result.stdout
     assert "DRIFT" not in result.stdout
+
+
+def test_project_local_install_present_is_explicitly_outside_user_scope(
+        installed_claude_dir, tmp_path):
+    project = tmp_path / "consumer-project"
+    project.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+    project_skill = project / ".claude" / "skills" / "columbo" / "SKILL.md"
+    project_skill.parent.mkdir(parents=True)
+    project_skill.write_text("stale project-local skill\n")
+    assert project_skill.read_bytes() != (
+        REPO / "skills" / "columbo" / "SKILL.md"
+    ).read_bytes()
+
+    result = run_doctor(installed_claude_dir, cwd=project)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (
+        f"manifest install root: {installed_claude_dir.resolve()}"
+        in result.stdout
+    )
+    assert "no other .claude install roots are in the manifest." in result.stdout
+    assert (
+        f"Shadow-role roots: "
+        f"{(project / '.claude' / 'sable' / 'roles').resolve()}"
+        in result.stdout
+    )
+    assert f"manifest install root: {(project / '.claude').resolve()}" not in result.stdout
 
 
 def test_fresh_install_json_reports_clean_true(installed_claude_dir):
@@ -203,7 +249,8 @@ def test_quiet_mode_one_line_on_drift(installed_claude_dir):
     assert result.returncode == 1
     assert result.stdout == ""
     assert "drifted" in result.stderr
-    assert "bash install.sh" in result.stderr
+    assert "ordinary files: 1" in result.stderr
+    assert "bash install.sh" not in result.stderr
 
 
 # --- --project flag: targets the current git project's own install ----------
@@ -354,10 +401,10 @@ def test_guarded_pinned_bin_full_report_names_the_safe_cp_path_not_install_sh(in
     assert f"cp {REPO / 'bin' / target_name}" in result.stdout
 
 
-def test_unguarded_drift_sessionstart_hook_still_names_install_sh(installed_claude_dir):
-    # Over-suppression check: a drifted UNGUARDED file (no pinning involved
-    # at all) must still get the ordinary remedy — silencing it globally
-    # would hide real drift, which is its own regression.
+def test_unguarded_drift_sessionstart_reports_without_prescribing_an_action(
+        installed_claude_dir):
+    # The boot path reports the observation, while the full doctor owns the
+    # diagnosis and per-file remedy.
     (installed_claude_dir / "hooks" / "tdd-gate.sh").write_text("tampered\n")
     bin_dir = installed_claude_dir.parent / ".local" / "bin"
 
@@ -368,7 +415,31 @@ def test_unguarded_drift_sessionstart_hook_still_names_install_sh(installed_clau
     )
     combined = result.stdout + result.stderr
     assert result.returncode == 1
-    assert "bash install.sh" in combined
+    assert "ordinary files: 1" in combined
+    assert "run `sable-doctor` for detail" in combined
+    assert "bash install.sh" not in combined
+
+
+def test_sessionstart_summary_separates_ordinary_and_pinned_drift(
+        installed_claude_dir):
+    bin_dir = installed_claude_dir.parent / ".local" / "bin"
+    target_name = "sable-dolt-push"
+    _establish_real_pin(bin_dir, target_name)
+    _revert_pin_to_symlink(bin_dir, target_name)
+    (installed_claude_dir / "hooks" / "tdd-gate.sh").write_text("tampered\n")
+
+    result = subprocess.run(
+        [sys.executable, str(DOCTOR), "--repo", str(REPO),
+         "--claude-dir", str(installed_claude_dir),
+         "--bin-dir", str(bin_dir), "--quiet"],
+        capture_output=True, text=True, timeout=30,
+    )
+    combined = result.stdout + result.stderr
+
+    assert result.returncode == 1
+    assert "ordinary files: 1" in combined
+    assert "pinned bins: 1" in combined
+    assert "bash install.sh" not in combined
 
 
 def test_pinned_bin_survives_real_reinstall_after_the_fix(installed_claude_dir):
@@ -443,13 +514,37 @@ def git_head(repo_dir: Path) -> str:
     ).stdout.strip()
 
 
-@pytest.fixture()
-def provenance_fixture(tmp_path):
-    fixture_repo = make_fixture_repo(tmp_path / "fixture-repo")
-    home = tmp_path / "home"
+@pytest.fixture(scope="module")
+def provenance_template(tmp_path_factory):
+    """Pay the real repo snapshot + install once for read/modify audit cases.
+
+    Tests that specifically assert install-time dirty/untracked classification
+    still run the real installer from their own state below. These audit-path
+    tests need independent mutable copies, not repeated installation.
+    """
+    root = tmp_path_factory.mktemp("doctor-provenance-template")
+    fixture_repo = make_fixture_repo(root / "fixture-repo")
+    home = root / "home"
     home.mkdir()
     run_install_from(fixture_repo, home)
+    return root
+
+
+@pytest.fixture()
+def provenance_fixture(tmp_path, provenance_template):
+    root = tmp_path / "provenance"
+    shutil.copytree(provenance_template, root, symlinks=True)
+    fixture_repo = root / "fixture-repo"
+    home = root / "home"
     return fixture_repo, home / ".claude"
+
+
+@pytest.fixture()
+def provenance_repo(tmp_path, provenance_template):
+    """Independent committed repo copied from the immutable real template."""
+    fixture_repo = tmp_path / "fixture-repo"
+    shutil.copytree(provenance_template / "fixture-repo", fixture_repo, symlinks=True)
+    return fixture_repo
 
 
 def test_install_writes_provenance_stamp_with_the_actual_head_sha(provenance_fixture):
@@ -515,13 +610,13 @@ def test_installed_from_flag_fails_clearly_without_a_stamp(installed_claude_dir)
     assert "no provenance stamp" in result.stderr
 
 
-def test_install_from_a_dirty_tree_stamps_dirty_true(tmp_path):
+def test_install_from_a_dirty_tree_stamps_dirty_true(tmp_path, provenance_repo):
     # a genuinely TRACKED modification breaks reproducibility from the
     # recorded SHA -- install.sh installs tracked content, so this MUST
     # stamp dirty=true. (Modifying a tracked file, not adding a new
     # untracked one -- see the untracked-only test below for the contrast
     # this bead, SABLE-dt92b, is actually about.)
-    fixture_repo = make_fixture_repo(tmp_path / "fixture-repo")
+    fixture_repo = provenance_repo
     readme = fixture_repo / "README.md"
     readme.write_text(readme.read_text() + "\ndirties a tracked file post-commit\n")
     home = tmp_path / "home"
@@ -531,14 +626,14 @@ def test_install_from_a_dirty_tree_stamps_dirty_true(tmp_path):
     assert "dirty=true" in stamp
 
 
-def test_install_from_an_untracked_only_tree_stamps_dirty_false(tmp_path):
+def test_install_from_an_untracked_only_tree_stamps_dirty_false(tmp_path, provenance_repo):
     # SABLE-dt92b: this is the defect, reproduced end-to-end. An untracked
     # file (never `git add`ed) does not touch any tracked content, so the
     # recorded SHA still reconstructs the installed set exactly -- dirty
     # must read false, and doctor's rendered line must not claim "not
     # reproducible". Untracked presence may still be surfaced, but as its
     # own, separately-worded fact.
-    fixture_repo = make_fixture_repo(tmp_path / "fixture-repo")
+    fixture_repo = provenance_repo
     (fixture_repo / "UNCOMMITTED_CHANGE.md").write_text("an untracked scratch file\n")
     home = tmp_path / "home"
     home.mkdir()
@@ -557,8 +652,9 @@ def test_install_from_an_untracked_only_tree_stamps_dirty_false(tmp_path):
     assert "not reproducible" not in result.stdout
 
 
-def test_install_from_a_fully_clean_tree_stamps_dirty_false_and_untracked_false(tmp_path):
-    fixture_repo = make_fixture_repo(tmp_path / "fixture-repo")
+def test_install_from_a_fully_clean_tree_stamps_dirty_false_and_untracked_false(
+        tmp_path, provenance_repo):
+    fixture_repo = provenance_repo
     home = tmp_path / "home"
     home.mkdir()
     run_install_from(fixture_repo, home)

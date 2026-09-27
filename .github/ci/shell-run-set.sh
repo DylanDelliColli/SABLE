@@ -2,9 +2,14 @@
 # shell-run-set.sh — single source of truth for which hooks/test/test-*.sh
 # suites the ci-verify workflow runs, and which it deliberately excludes.
 #
-# Three modes:
+# Primary modes:
 #   --run       execute the allowlist; exit non-zero if ANY suite reds (this is
 #               the gating step the merge-preview ci-verify gate reads).
+#   --profile FILE
+#               execute that same allowlist once and write
+#               suite<TAB>status<TAB>seconds to FILE. Timing is taken around
+#               each existing suite invocation with a monotonic clock; this
+#               is a report adapter, not a second test pass.
 #   --manifest  print every hooks/test/test-*.sh as RUN / EXCLUDED(reason) /
 #               UNCLASSIFIED, then a totals line. Informational (exit 0) — kept
 #               for human-readable output — but it emits ::warning:: for any
@@ -115,6 +120,7 @@ ALLOW=(
   test-sable-test.sh
   test-sable-worker-status.sh
   test-script-dir-symlink.sh
+  test-sealed-verification.sh
   test-session-role-anchor.sh
   test-shell-run-set-strict.sh
   test-sherlock-research.sh
@@ -204,6 +210,8 @@ declare -A EXCLUDE=(
 declare -A COVERS=(
   [test-active-contracts-integration.sh]="hooks/multi-manager/session-role-anchor.sh"
   [test-ci-bd-coverage-gap.sh]=".github/ci/shell-run-set.sh hooks/test/test-dep-merge-state.sh hooks/test/test-overlap-dispatch-e2e.sh hooks/test/lib-require-all.sh"
+  [test-impact-manifest.sh]=".github/ci/impact-manifest.sh"
+  [test-impact-selection.sh]=".github/ci/impact-manifest.sh .github/ci/shell-run-set.sh"
   [test-control-trace.sh]="hooks/multi-manager/control-trace.sh"
   [test-dep-merge-state.sh]="bin/sable-dep-check bin/sable-spawn-worker"
   [test-doctor-snapshot-staleness.sh]="bin/sable-doctor bin/sable-bin-install install.sh"
@@ -229,19 +237,22 @@ declare -A COVERS=(
   [test-pre-dispatch-model-check.sh]="hooks/multi-manager/pre-dispatch-model-check.sh"
   [test-pre-dispatch-preempt.sh]="hooks/multi-manager/pre-dispatch-preempt.sh"
   [test-pre-dispatch-refresh.sh]="hooks/multi-manager/pre-dispatch-refresh.sh"
-  [test-pre-push-rebase-test.sh]="hooks/multi-manager/pre-push-rebase-test.sh"
+  [test-pre-push-rebase-concurrency.sh]="hooks/test/lib-pre-push-fixture-root.sh hooks/test/test-pre-push-rebase-test.sh"
+  [test-pre-push-rebase-test.sh]="hooks/multi-manager/pre-push-rebase-test.sh hooks/test/lib-pre-push-fixture-root.sh"
   [test-preview-kick.sh]="hooks/multi-manager/post-push-merge-notify.sh"
   [test-provenance-guard.sh]="hooks/multi-manager/pre-push-rebase-test.sh"
   [test-read-guard.sh]="hooks/multi-manager/read-guard.sh"
   [test-registry.sh]="hooks/multi-manager/lib-registry-path.sh"
   [test-require-all.sh]="hooks/test/lib-require-all.sh"
-  [test-role-card-install.sh]="bin/sable-orchestration-install templates/multi-manager/roles/lincoln.md templates/multi-manager/roles/optimus.md templates/multi-manager/roles/tarzan.md templates/multi-manager/roles/chuck.md"
+  [test-role-card-install.sh]="bin/sable-orchestration-install templates/multi-manager/agents.yaml templates/multi-manager/roles/lincoln.md templates/multi-manager/roles/optimus.md templates/multi-manager/roles/tarzan.md templates/multi-manager/roles/chuck.md"
   [test-sable-contained.sh]="bin/sable-contained"
   [test-sable-mode.sh]="hooks/multi-manager/lib-mode-path.sh"
   [test-sable-msg.sh]="bin/sable-msg bin/sable_pane_lib.py"
   [test-sable-test.sh]="bin/sable-test"
   [test-sable-worker-status.sh]="bin/sable-worker-status bin/sable_pane_lib.py"
   [test-seat-sighting.sh]="bin/sable-msg hooks/multi-manager/seat-sighting-gate.sh"
+  [test-sealed-verification.sh]=".github/ci/run-sealed-verification.sh .github/ci/shell-run-set.sh"
+  [test-shell-run-set-strict.sh]=".github/ci/shell-run-set.sh"
   [test-session-role-anchor.sh]="hooks/multi-manager/session-role-anchor.sh"
   [test-snapshot-freeze.sh]="bin/sable-snapshot bin/sable_snapshot_lib.py bin/sable_gate_promote_lib.py bin/sable_gate_classify_lib.py"
   [test-tarzan-optimus-accept-contract.sh]="templates/multi-manager/roles/tarzan.md templates/multi-manager/roles/optimus.md"
@@ -533,7 +544,9 @@ check_loud_skip_cli() {
 }
 
 run_set() {
+  local profile_path="${1:-}"
   local failed=() skipped_realbd=() name rc out_file n_skip
+  local started_ns="" ended_ns="" elapsed="" status=""
   # SABLE-jd5fj.16: the top-level rollup below used to report only pass/fail
   # — "ci-verify shell run-set: all N suites GREEN" says nothing about a
   # suite that passed BY SKIPPING its real-bd leg. That is exactly how the
@@ -542,15 +555,35 @@ run_set() {
   # actually looks at. Tee each iron-rule suite's output to a scratch file so
   # it can be grepped for that marker AFTER streaming (unchanged) to the log.
   out_file="$(mktemp)"
+  if [ -n "$profile_path" ]; then
+    if ! printf 'suite\tstatus\tseconds\n' > "$profile_path"; then
+      echo "::error::could not create shell-suite profile: $profile_path" >&2
+      rm -f "$out_file"
+      return 2
+    fi
+  fi
   for name in "${ALLOW[@]}"; do
     if [ ! -f "$TESTDIR/$name" ]; then
-      echo "::error::run-set names $name but it is missing from hooks/test/"; failed+=("$name (missing)"); continue
+      echo "::error::run-set names $name but it is missing from hooks/test/"
+      failed+=("$name (missing)")
+      [ -n "$profile_path" ] && printf '%s\tmissing\t0.000000\n' "$name" >> "$profile_path"
+      continue
+    fi
+    if [ -n "$profile_path" ]; then
+      started_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
     fi
     echo "::group::$name"
     bash "$TESTDIR/$name" 2>&1 | tee "$out_file"
     rc=${PIPESTATUS[0]}
     echo "::endgroup::"
     [ $rc -eq 0 ] || failed+=("$name (rc=$rc)")
+    if [ -n "$profile_path" ]; then
+      ended_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
+      elapsed="$(awk -v start="$started_ns" -v end="$ended_ns" \
+        'BEGIN { printf "%.6f", (end - start) / 1000000000 }')"
+      if [ "$rc" -eq 0 ]; then status="pass"; else status="fail:$rc"; fi
+      printf '%s\t%s\t%s\n' "$name" "$status" "$elapsed" >> "$profile_path"
+    fi
     if in_array "$name" "${IRON_RULE_REALBD_SUITES[@]}"; then
       n_skip=$(grep -oE 'Skipped: [0-9]+' "$out_file" | tail -1 | grep -oE '[0-9]+' || true)
       if [ -n "${n_skip:-}" ] && [ "$n_skip" -gt 0 ]; then
@@ -570,6 +603,7 @@ run_set() {
     echo "::warning::ci-verify shell run-set: ${#skipped_realbd[@]} iron-rule suite(s) skipped their real-bd leg here — NOT counted as coverage, only as a non-failing exit (SABLE-jd5fj.16):"
     printf '  - %s\n' "${skipped_realbd[@]}"
   fi
+  [ -n "$profile_path" ] && echo "shell-run-set profile: $profile_path"
   [ ${#failed[@]} -eq 0 ]
 }
 
@@ -587,6 +621,13 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
     --check-beads)     check_beads ;;
     --check-loud-skip) check_loud_skip_cli ;;
     --run)             run_set ;;
-    *) echo "usage: $0 --run | --manifest | --check | --check-beads | --check-loud-skip" >&2; exit 2 ;;
+    --profile)
+      if [ "$#" -ne 2 ] || [ -z "${2:-}" ]; then
+        echo "usage: $0 --profile FILE" >&2
+        exit 2
+      fi
+      run_set "$2"
+      ;;
+    *) echo "usage: $0 --run | --profile FILE | --manifest | --check | --check-beads | --check-loud-skip" >&2; exit 2 ;;
   esac
 fi

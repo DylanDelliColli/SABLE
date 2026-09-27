@@ -35,7 +35,7 @@ REPO_A="$TMP_A/nested/repoA"
 REPO_B="$TMP_B/deeper/nested/path/repoB"
 mkdir -p "$REPO_A" "$REPO_B"
 
-SABLE_PROJECT_DIR="$REPO_A" bash "$INSTALLER" --project >/dev/null 2>&1
+SABLE_PROJECT_DIR="$REPO_A" bash "$INSTALLER" --project --merge-settings >/dev/null 2>&1
 
 SET_A="$REPO_A/.claude/settings.json"
 if [ -e "$SET_A" ]; then pass "repoA: project install wrote committed settings.json"; else fail "repoA: project install wrote committed settings.json"; fi

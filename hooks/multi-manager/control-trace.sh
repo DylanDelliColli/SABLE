@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # control-trace.sh — neutral-observer control hook (SABLE-jfg6.2 / contract D2)
+# Manual hook-delivery diagnostic since SABLE-z3j28.3; not registered by the
+# default lifecycle settings because it writes on every Bash call and carries
+# no execution authority.
 #
 # DELIBERATELY SELF-CONTAINED: does NOT source lib-hook-trace.sh (SABLE-jfg6.1
 # / D1). If the shared trace lib ever has a bug that silently swallows its own

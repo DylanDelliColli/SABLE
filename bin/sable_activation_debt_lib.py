@@ -179,11 +179,14 @@ BASE_INSTALL = "install.sh"
 # authorize a much larger operation than they meant to.
 AUTH_BIN = ("user scope ~/.local/bin; symlinks into the checkout by default, "
             "but a pinned snapshot resolves outside it and needs a re-pin")
-AUTH_ORCHESTRATION = ("orchestration scope (--user writes the LIVE ~/.claude, "
-                      "SABLE-2avau); merges multi-manager rows into settings.json")
-AUTH_BASE = ("OPERATOR DECISION — install.sh also writes base-tier hook "
-             "REGISTRATIONS into settings.json (install.sh:414), a materially "
-             "larger blast radius than the orchestration installer")
+AUTH_ORCHESTRATION = (
+    "orchestration artifact scope (--user writes files into the LIVE ~/.claude, "
+    "SABLE-2avau); settings activation requires explicit --merge-settings consent"
+)
+AUTH_BASE = (
+    "base install scope — copies base hooks/agents and prepends CLAUDE.md; "
+    "base-tier settings registrations remain a manual paste"
+)
 
 
 @dataclass(frozen=True)
@@ -230,8 +233,8 @@ class Roots:
     the installers derive it, so pointing HOME at a scratch dir relocates the
     table and the tools together — the only way to exercise this against a real
     installed layout without writing to the developer's live ~/.claude
-    (SABLE-2avau: `sable-orchestration-install --user` silently targets the
-    LIVE ~/.claude with no escape; SABLE-k0nvp: a pinning suite polluted the
+    (SABLE-2avau: `sable-orchestration-install --user` targets the LIVE
+    ~/.claude for artifact writes; SABLE-k0nvp: a pinning suite polluted the
     real ~/.local twice)."""
     claude: str
     local_bin: str

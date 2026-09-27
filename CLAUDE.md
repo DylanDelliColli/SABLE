@@ -54,6 +54,36 @@ bd close <id>         # Complete work
 - If push fails, resolve and retry until it succeeds
 <!-- END BEADS INTEGRATION -->
 
+## Issue Discovery: Capture Is Mandatory, Filing Is Deliberate
+
+**This section is deliberately duplicated from the global `~/.claude/CLAUDE.md` because
+that file is Claude-only.** Codex reads `AGENTS.md` (a symlink to this file); nothing on
+this host loads `~/.claude/CLAUDE.md` into a Codex session — there is no
+`~/.codex/AGENTS.md`, no `instructions` key in `~/.codex/config.toml`, and
+`~/.codex/hooks.json` injects only `bd prime`. Since three of the four execution roles
+(optimus, tarzan, chuck) are Codex panes, doctrine that lives only in the global file
+reaches none of them. Keep this section in sync by hand (SABLE-jgax3).
+
+**Work** flows through beads. **Discovery** flows through capture-then-curate:
+
+```bash
+sable-note "<what's wrong, which file, one repro breadcrumb>"
+```
+
+Anything you merely *noticed* — a smell, a rough edge, a pre-existing bug tangential to
+your task — is captured, not filed. It enters the bead pool only through `/sable-review`,
+and **curation is operator-manual: it runs when the operator invokes it, never
+automatically.**
+
+**Carve-out: a defect that blocks or endangers in-flight work gets a bead immediately**,
+with full forensic detail while fresh. `bd ready` must remain the place where blocking
+defects surface at once.
+
+Not covered by this rule: auto-filed tooling exhaust (message-delivery fallback beads,
+`[reconcile]` records). That class is fixed at the send channel, not by a capture policy.
+
+See SABLE.md §3.7 for the full rationale.
+
 ## Non-Interactive Shell Commands
 
 **ALWAYS use non-interactive flags** with file operations to avoid hanging on confirmation prompts.
@@ -88,15 +118,33 @@ false-fails ("golangci-lint not found in PATH") or silently no-ops. Do not
 treat a red `bd preflight` run as signal here; use the commands below instead.
 
 ```bash
+# Install the exact Python environment shared by both authoritative workflows:
+python -m pip install -r .github/ci/test-requirements.txt
+
+# Fast deterministic feedback for staged/unstaged/untracked changes:
+bin/sable-dev-check
+
+# Include every commit on a worker branch, or inspect without executing:
+bin/sable-dev-check --base origin/tmux-only
+bin/sable-dev-check --base origin/tmux-only --dry-run
+
 # Full Python suite (unit + integration; bd/dolt-dependent tests self-skip
-# when those tools are absent — see ci-verify.yml):
-python -m pytest bin/ -q -p no:cacheprovider
+# when those tools are absent — see ci-verify.yml). -rs reports reasons;
+# the SABLE reporter names every skipped node and the ADDED/REMOVED set since
+# the previous successful full run:
+python -m pytest bin/ -q -rs -p no:cacheprovider --sable-report-skip-set
 
 # Shell test suites (classification is fail-closed; --run executes the
 # allowlisted suites; see .github/ci/shell-run-set.sh header for the
 # excluded-suite policy):
 bash .github/ci/shell-run-set.sh --check
+python bin/columbo-cost-prefilter.py --check-load-declarations
 bash .github/ci/shell-run-set.sh --run
+
+# Reproducible cost reports from the same authoritative executions:
+python -m pytest bin/ -q -rs -p no:cacheprovider --sable-report-skip-set \
+  --sable-test-cost-report=/tmp/sable-python-cost.json
+bash .github/ci/shell-run-set.sh --profile /tmp/sable-shell-cost.tsv
 
 # Exclusion-freshness gate (LOCAL ONLY — resolves each EXCLUDE entry's
 # tracking beads against the real bd store and fails when a [blocked-by: ...]
@@ -106,8 +154,8 @@ bash .github/ci/shell-run-set.sh --run
 # automatically pre-push via test-shell-run-set-strict.sh's case (f):
 bash .github/ci/shell-run-set.sh --check-beads
 
-# Fast local pre-push subset (also runs automatically via the pre-push git
-# hook through this repo's .sable testCommand=):
+# Curated fixed shell subset (useful when checking pre-push machinery itself;
+# this repo's .sable hook uses sable-dev-check for proportional feedback):
 bash .github/ci/test-tiers.sh --run pre_push
 ```
 

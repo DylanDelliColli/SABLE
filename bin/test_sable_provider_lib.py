@@ -4,6 +4,7 @@ from sable_provider_lib import (
     ProviderMapError,
     agent_name,
     agent_role,
+    codex_hook_graph_path,
     default_provider_map,
     format_provider_map,
     normalize_provider,
@@ -16,6 +17,7 @@ from sable_provider_lib import (
     execution_provider,
     execution_provider_map,
     provider_boot_message,
+    validate_codex_hook_graph,
     validate_provider_capabilities,
 )
 
@@ -126,6 +128,37 @@ def test_interactive_codex_command_supports_the_worker_lifecycle():
     assert " exec " not in command
 
 
+def test_codex_command_grants_writable_roots_for_git(tmp_path):
+    """SABLE-82k8m: Codex's workspace-write sandbox makes .git READ-ONLY even
+    though it sits INSIDE the workspace — a deliberate, separate exclusion,
+    proven by probe: granting an unrelated root leaves .git blocked while
+    naming it explicitly unblocks it. Without this grant `git fetch` dies on
+    FETCH_HEAD and no worker can self-push."""
+    command = interactive_command(
+        "codex", "sonnet", cwd=str(tmp_path),
+        writable_roots=["/repo/.git"],
+    )
+    assert "sandbox_workspace_write.writable_roots=" in command
+    assert "/repo/.git" in command
+
+
+def test_codex_command_omits_writable_roots_when_none_requested():
+    """No grant unless asked — the sandbox stays as tight as it started."""
+    command = interactive_command("codex", "sonnet")
+    assert "writable_roots" not in command
+
+
+def test_claude_command_ignores_writable_roots(tmp_path):
+    """REGRESSION: writable_roots is a Codex sandbox concept. It must never
+    leak into the Claude command, which has no such flag."""
+    command = interactive_command(
+        "claude", "sonnet", cwd=str(tmp_path),
+        writable_roots=["/repo/.git"],
+    )
+    assert "writable_roots" not in command
+    assert "/repo/.git" not in command
+
+
 def test_execution_provider_reads_frozen_state(tmp_path, monkeypatch):
     state = tmp_path / "mode.json"
     state.write_text(
@@ -166,3 +199,36 @@ def test_codex_boot_message_anchors_the_installed_role_card(tmp_path):
     assert str(role) in message
     assert message.endswith("begin")
     assert provider_boot_message("claude", "optimus", "begin", base=str(tmp_path)) == "begin"
+
+
+def test_codex_hook_graph_path_honors_codex_home_and_claude_user_dir(tmp_path):
+    assert codex_hook_graph_path({"CODEX_HOME": str(tmp_path / "custom")}) == (
+        tmp_path / "custom" / "hooks.json"
+    )
+    assert codex_hook_graph_path(
+        {"CLAUDE_USER_DIR": str(tmp_path / "scope" / ".claude")}
+    ) == tmp_path / "scope" / ".codex" / "hooks.json"
+
+
+@pytest.mark.parametrize("content", [None, "", "  \n", "{broken", "{}"])
+def test_codex_hook_graph_validator_fails_closed(tmp_path, content):
+    codex_home = tmp_path / ".codex"
+    codex_home.mkdir()
+    path = codex_home / "hooks.json"
+    if content is not None:
+        path.write_text(content)
+
+    with pytest.raises(
+        ProviderMapError,
+        match="sable-orchestration-install --user --merge-settings",
+    ):
+        validate_codex_hook_graph({"CODEX_HOME": str(codex_home)})
+
+
+def test_codex_hook_graph_validator_accepts_nonempty_json_object(tmp_path):
+    codex_home = tmp_path / ".codex"
+    codex_home.mkdir()
+    path = codex_home / "hooks.json"
+    path.write_text('{"SessionStart": [{"hooks": []}]}')
+
+    assert validate_codex_hook_graph({"CODEX_HOME": str(codex_home)}) == path

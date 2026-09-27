@@ -268,6 +268,8 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+from contextvars import ContextVar
 import importlib.util
 import json
 import os
@@ -996,6 +998,27 @@ def preview_ref_age_seconds(repo: str, sha: str, now: float) -> float | None:
         return None
 
 
+_WORK_BEAD_RESOLUTION_CACHE: ContextVar[
+    dict[tuple[str, str], tuple[list[dict], bool]] | None
+] = ContextVar("_WORK_BEAD_RESOLUTION_CACHE", default=None)
+
+
+@contextmanager
+def one_branch_work_bead_resolution():
+    """Share one real bd resolution across hold/pair/status reads.
+
+    The three views deliberately remain separate public Interfaces, but during
+    one branch classification they consume the same immutable record set. This
+    removes three identical `bd list`/fallback chains without carrying state
+    across branches or cadences.
+    """
+    token = _WORK_BEAD_RESOLUTION_CACHE.set({})
+    try:
+        yield
+    finally:
+        _WORK_BEAD_RESOLUTION_CACHE.reset(token)
+
+
 def find_work_bead_records(repo: str, branch: str) -> tuple[list[dict], bool]:
     """ALL work-bead records joined to the branch, plus whether resolution was
     READABLE.
@@ -1015,6 +1038,17 @@ def find_work_bead_records(repo: str, branch: str) -> tuple[list[dict], bool]:
     change (SABLE-jejx3) is arity: the metadata leg returns EVERY joined bead
     rather than only the first, because a hold on any of them holds the branch
     (see all_records_from_search_json)."""
+    cache = _WORK_BEAD_RESOLUTION_CACHE.get()
+    key = (repo, branch)
+    if cache is not None and key in cache:
+        return cache[key]
+
+    def resolved(records: list[dict], readable: bool) -> tuple[list[dict], bool]:
+        answer = (records, readable)
+        if cache is not None:
+            cache[key] = answer
+        return answer
+
     resolvable_failure = False
     cp = _bd(repo, "list", "--status", "all",
              "--metadata-field", f"branch={branch}", "--json", check=False)
@@ -1028,7 +1062,7 @@ def find_work_bead_records(repo: str, branch: str) -> tuple[list[dict], bool]:
         recs = [r for r in all_records_from_search_json(cp.stdout)
                 if r.get("status") is not None]
         if recs:
-            return (recs, True)
+            return resolved(recs, True)
 
     bead_id = parse_bead_id(branch)
     if bead_id:
@@ -1036,15 +1070,15 @@ def find_work_bead_records(repo: str, branch: str) -> tuple[list[dict], bool]:
         if cp.returncode == 0:
             rec = record_from_show_json(cp.stdout)
             if rec is not None and rec.get("status") is not None:
-                return ([rec], True)
+                return resolved([rec], True)
 
     cp = _bd(repo, "search", branch, "--status", "all", "--json", check=False)
     if cp.returncode == 0:
         rec = first_record_from_search_json(cp.stdout)
         if rec is not None:
-            return ([rec], True)
-        return ([], not resolvable_failure)
-    return ([], not resolvable_failure)
+            return resolved([rec], True)
+        return resolved([], not resolvable_failure)
+    return resolved([], not resolvable_failure)
 
 
 def find_work_bead(repo: str, branch: str) -> tuple[dict | None, bool]:
@@ -1785,17 +1819,22 @@ def reconcile(repo: str, remote: str, threshold_minutes: float, dry_run: bool,
         # the sweep needs the record itself. Resolved only for branches that
         # cleared P1 AND are not already contained: a landed branch is nobody's
         # concern, held or not.
-        hold = find_work_bead_hold(repo, br) if live_candidate else None
-        # HELD-ON-MATCHED-PAIR (SABLE-tseoz) — only when the hold read CLEAN, so
-        # a None from here can never be an unreadable bead masquerading as
-        # 'no ruling' (HOLD_UNKNOWN already short-circuits classification).
-        matched_pair = (find_work_bead_matched_pair(repo, br)
-                        if live_candidate and hold is None else None)
+        # One immutable bd record set feeds the hold, matched-pair, and status
+        # views. Before SABLE-ssu6v each accessor repeated the same real
+        # `bd list`/fallback chain, tripling the dominant host boundary for
+        # every live candidate.
+        with one_branch_work_bead_resolution():
+            hold = find_work_bead_hold(repo, br) if live_candidate else None
+            # HELD-ON-MATCHED-PAIR (SABLE-tseoz) — only when the hold read CLEAN,
+            # so a None from here can never be an unreadable bead masquerading
+            # as 'no ruling' (HOLD_UNKNOWN already short-circuits classification).
+            matched_pair = (find_work_bead_matched_pair(repo, br)
+                            if live_candidate and hold is None else None)
 
-        is_stranded, reason, status = classify_branch(
-            repo, remote, br, integration_branch, open_beads, threshold_minutes,
-            now, hold, stale_days, live_bead_ids, queued_stale_min,
-            base_sha=base_sha, contained=contained, matched_pair=matched_pair)
+            is_stranded, reason, status = classify_branch(
+                repo, remote, br, integration_branch, open_beads, threshold_minutes,
+                now, hold, stale_days, live_bead_ids, queued_stale_min,
+                base_sha=base_sha, contained=contained, matched_pair=matched_pair)
         print(f"  {br}: {reason}")
         if isinstance(hold, dict):
             held.append((br, hold))

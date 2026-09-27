@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+"""sable-dev-check — proportional local feedback before sealed-candidate CI."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import sable_dev_check_lib as devcheck  # noqa: E402
+
+
+def _repo_root() -> Path:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        raise devcheck.DeveloperCheckError(f"git is unavailable: {exc}") from exc
+    if result.returncode != 0:
+        raise devcheck.DeveloperCheckError(
+            result.stderr.strip() or "not inside a git repository"
+        )
+    return Path(result.stdout.strip())
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="sable-dev-check",
+        description=(
+            "Run deterministic changed-module feedback locally. This does not "
+            "replace the complete sealed-candidate ci-verify suite."
+        ),
+    )
+    parser.add_argument(
+        "--base",
+        help="include commits in BASE...HEAD, plus staged/unstaged/untracked files",
+    )
+    parser.add_argument(
+        "--path",
+        action="append",
+        default=[],
+        help="plan for this changed path instead of reading git (repeatable)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the deterministic plan without executing tests",
+    )
+    parser.add_argument(
+        "--budget",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "explicit total execution budget override (implicit: 90s for "
+            "scoped plans; full_snapshot tier budget for a FULL fallback)"
+        ),
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.budget is not None and args.budget <= 0:
+        parser.error("--budget must be positive")
+    try:
+        repo = _repo_root()
+        changed = (
+            tuple(args.path)
+            if args.path
+            else devcheck.collect_changed_paths(repo, args.base)
+        )
+        plan = devcheck.build_plan(repo, changed)
+        budget = devcheck.effective_budget(
+            repo, plan, explicit_seconds=args.budget,
+        )
+        print(
+            devcheck.render_plan(
+                plan,
+                max_entries=None if args.dry_run else 20,
+                budget=budget,
+            ),
+            flush=True,
+        )
+        if args.dry_run:
+            return 0
+        return devcheck.run_plan(
+            repo, plan, budget_seconds=budget.seconds,
+        )
+    except devcheck.DeveloperCheckError as exc:
+        print(f"sable-dev-check: precondition failed: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -45,6 +45,11 @@ dependency order (a DAG — nothing imports "upward"):
                                verdicts, sweeps orphans. Never promotes.
   sable_gate_promote_lib.py    Consumes a verdict and promotes (or refuses).
                                The only writer to the integration branch.
+  sable_batch_coordinator_lib.py
+                               Composes admission, fold, exact combined
+                               verdict, atomic landing, and red diagnosis for
+                               one bounded rolling-queue cycle. Owns no second
+                               writer or verifier.
   sable_gate_budget_lib.py     Per-tier duration budget breach detection +
                                idempotent bead filing (SABLE-cmar4.4). Called
                                by promote, wrapped around the acquire_verdict
@@ -274,7 +279,7 @@ import sable_footprint_lib as footprint_lib          # noqa: E402
 import sable_gate_classify_lib as classify           # noqa: E402
 import sable_gate_git_lib as git_lib                 # noqa: E402
 import sable_gate_preview_lib as preview_lib         # noqa: E402
-import sable_gate_promote_lib as promote_lib         # noqa: E402
+import sable_batch_coordinator_lib as batch_coordinator, sable_gate_promote_lib as promote_lib  # noqa: E402,E501
 import sable_snapshot_lib as snapshot_lib            # noqa: E402
 
 # Public API re-exports. These are the names OTHER tools import from this file
@@ -341,11 +346,6 @@ def main(argv: list[str] | None = None) -> int:
                          "test / deleted test file never needs this. Recorded on the bead. "
                          "Mirrors the 'Model override: <reason>' pattern; also accepted as a "
                          "'Coverage override: <reason>' line in this flag's own value.")
-    pp.add_argument("--with-pair", action="append", default=[], dest="with_pair",
-                    metavar="BEAD_ID",
-                    help="BEAD_ID is promoted together with --bead in THIS call (repeatable "
-                         "or comma-separated) — satisfies a landing_pair constraint (SABLE-rzkw7)")
-
     # SABLE-jd5fj.1 kick entrypoint. No --bead: the post-push hook that fires
     # this knows the branch it just confirmed, not the bead behind it, and a kick
     # writes no bead evidence anyway.
@@ -375,6 +375,8 @@ def main(argv: list[str] | None = None) -> int:
     ps.add_argument("--dry-run", action="store_true", dest="dry_run",
                     help="report the refs that would be deleted, deleting nothing (SABLE-o9b8u)")
 
+    promote_lib.register_landing_pair_subcommand(sub)
+
     # SABLE-w0zjm. The gate's own worst-case promote wall-clock, so an operator
     # wrapper DERIVES its timeout instead of keeping a second copy of the number.
     # Named promote-budget, not budget, because sable_gate_budget_lib already owns
@@ -399,18 +401,15 @@ def main(argv: list[str] | None = None) -> int:
                     dest="member_footprints", metavar="PATH[,...]",
                     help="repeatable; one per batch member (SABLE-be4lo.6)")
 
-    # SABLE-be4lo.7 (land-batch, the GATE-CLASS landing path) and SABLE-be4lo.8
-    # (bisect-batch, the red-batch bisection state machine). Both subparsers and
-    # all of their logic live in promote_lib so this CLI stays argparse-dispatch-
-    # thin; they register and dispatch through ONE pair of calls because this
-    # file sits against test_cli_is_thin's 150-line budget (SABLE-ehx8u).
-    promote_lib.register_batch_subcommands(sub)
+    # Batch primitives plus SABLE-z3j28.1's composed rolling cycle register
+    # through one coordinator seam so this CLI stays argparse-dispatch-thin.
+    batch_coordinator.register_batch_subcommands(sub)
 
     # SABLE-jd5fj.8. Refreshes the gate-owned persisted warm .testmondata
     # (see sable_gate_promote_lib's module comment on _warm_testmondata_path)
-    # by running the full bin/ suite with --testmon-noselect, same as CI's
-    # .github/ci/testmon-cache-warm.sh — meant to be run periodically or by
-    # an operator, NOT by the gate itself on every promote.
+    # by running the full bin/ suite with --testmon-noselect. CI no longer pays
+    # this duplicate run (SABLE-z3j28.2); this is an explicit local operator
+    # action for the local impact tier.
     pw = sub.add_parser("warm-testmon-cache",
                         help="refresh the gate-owned warm .testmondata used by the "
                              "combined-tree impact tier's pytest half")
@@ -431,10 +430,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "promote":
             base = git_lib.resolve_base(args.base, args.repo)
-            with_pair = promote_lib.parse_with_pair(args.with_pair)
             return promote_lib.promote(args.bead, args.branch, base, args.repo,
                                        args.remote, args.manager, args.override,
-                                       args.coverage_override, with_pair)
+                                       args.coverage_override)
         if args.command == "preview":
             base = git_lib.resolve_base(args.base, args.repo)
             return preview_lib.kick_preview(args.branch, base, args.repo, args.remote)
@@ -444,11 +442,13 @@ def main(argv: list[str] | None = None) -> int:
                                               args.remote, args.json)
         if args.command == "sweep":
             return preview_lib.sweep(args.repo, args.remote, args.max_age_hours, args.dry_run)
+        if args.command == "landing-pair":
+            return promote_lib.dispatch_landing_pair_command(args)
         if args.command == "promote-budget":
             print(promote_lib.render_promote_budget_report(
                 args.member_footprints, args.seconds, args.json))
             return 0
-        if args.command in ("land-batch", "bisect-batch"): return promote_lib.dispatch_batch_command(args)  # noqa: E501,E701 SABLE-be4lo.7/.8 (one-line dispatch keeps the CLI under test_cli_is_thin's 150-line guard; all logic is in the lib)
+        if args.command in ("land-batch", "bisect-batch", "batch-cycle", "batch-drain", "batch-metrics"): return batch_coordinator.dispatch_batch_command(args)  # noqa: E501,E701 SABLE-be4lo.7/.8, SABLE-z3j28.1/.4
         if args.command == "warm-testmon-cache":
             return promote_lib.warm_gate_testmon_cache(args.repo)
         if args.command == "impact-tier-phases":

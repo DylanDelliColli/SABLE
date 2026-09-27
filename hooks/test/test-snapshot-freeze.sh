@@ -442,8 +442,10 @@ else
   # never see or write the real bead pool. The cd is guarded (SABLE-0ssz.2: an
   # unguarded cd that fails leaves the command running in the real worktree).
   bd_in_sandbox() {
+    # -u BEADS_DB (SABLE-sx1rb): every call through here must resolve
+    # against $W5's own sandbox DB by CWD/HOME, never an ambient BEADS_DB.
     ( cd "$W5" || exit 97
-      env HOME="$BD_HOME" BD_NON_INTERACTIVE=1 CI=true bd "$@" )
+      env -u BEADS_DB HOME="$BD_HOME" BD_NON_INTERACTIVE=1 CI=true bd "$@" )
   }
   # `bd init` on the embedded-Dolt backend can leave a PARTIAL database on a
   # first-run race (rc 0, no config.yaml) — gate on the artifact, retry the

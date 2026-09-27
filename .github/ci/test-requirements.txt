@@ -1,0 +1,16 @@
+# Reproducible Python environment shared by ci-verify and green-snapshot.
+# Regenerate deliberately from a green Python 3.13 clean room; do not add a
+# second inline package list to either workflow.
+Jinja2==3.1.6
+MarkupSafe==3.0.3
+Pygments==2.20.0
+chardet==7.4.3
+coverage==7.15.2
+diff_cover==10.4.1
+iniconfig==2.3.0
+packaging==26.2
+pluggy==1.6.0
+pytest==9.1.1
+pytest-cov==7.1.0
+pytest-impact==0.1.0
+pytest-testmon==2.2.0

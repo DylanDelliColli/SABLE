@@ -17,7 +17,7 @@ Columbo's interview workflow (taxonomy, decision rubric, 5-phase flow, skeleton-
 - **Skill (`skills/columbo/`)** — portable, single-file, no dependencies beyond `bd`. Right for work computers, repos where you don't run a manager swarm, or any setup where you want the workflow without the agent-coordination plumbing. Invokable as `/columbo` from any cwd.
 - **Multi-manager agent (`templates/multi-manager/roles/columbo.md`)** — full implementation with identity injection, `for-columbo` inbox, bead-template gate enforcement, runs as a peer to Sherlock / Victor / Rudy. Right for personal projects with the full SABLE stack installed.
 
-Both produce the same outputs: `columbo-test-spec` / `columbo-test-gap` beads + `*.skel.test.<ext>` skeleton files. Pick the one that matches your setup; the workflow content is the same.
+Both produce the same outputs: `columbo-test-spec` / `columbo-test-gap` beads plus skeleton files — `skel_<feature-name>.py` for pytest, validated with `pytest --collect-only`, and `*.skel.test.<ext>` for other frameworks. Pick the one that matches your setup; the workflow content is the same.
 
 ## Install on a new machine
 

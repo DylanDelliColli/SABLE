@@ -51,7 +51,9 @@ trap 'rm -rf "$TMPROOT"' EXIT
 
 BEADS_ROOT="$TMPROOT/beads"
 mkdir -p "$BEADS_ROOT"
-INIT_OUT="$(cd "$BEADS_ROOT" && env BD_NON_INTERACTIVE=1 bd init --prefix=seat 2>&1)"
+# -u BEADS_DB (SABLE-sx1rb): never inherit an ambient BEADS_DB (e.g. the
+# impact tier's own) — this suite builds and must use its OWN isolated DB.
+INIT_OUT="$(cd "$BEADS_ROOT" && env -u BEADS_DB BD_NON_INTERACTIVE=1 bd init --prefix=seat 2>&1)"
 if [ ! -d "$BEADS_ROOT/.beads" ]; then
   echo "FATAL: could not initialize an isolated bd DB: $INIT_OUT"
   exit 2

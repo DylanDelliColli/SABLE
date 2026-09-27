@@ -71,6 +71,13 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from sable_registry_lib import _main_worktree_root as main_worktree_root  # noqa: E402
 from sable_pane_lib import WORKER_CAP_DEFAULT, worker_cap  # noqa: E402
+from sable_provider_lib import (  # noqa: E402
+    CODEX_HOOK_GRAPH_REMEDY,
+    ProviderMapError,
+    codex_hook_graph_path,
+    execution_provider_map,
+    validate_codex_hook_graph,
+)
 
 REPO = Path(__file__).resolve().parent.parent
 REFRESH_CMD = "bash install.sh"
@@ -120,7 +127,57 @@ def classify_bin_shape(repo: Path, name: str):
     return shape if shape in ("snapshot", "plain") else None
 
 
-def python_sibling_importing_bins(repo: Path):
+def _classifiable_bin_names(repo: Path):
+    """Names covered by sable-bin-install's tool classifier."""
+    bin_dir = repo / "bin"
+    if not bin_dir.is_dir():
+        return []
+    return [
+        f.name
+        for f in sorted(bin_dir.glob("sable-*"))
+        if f.is_file() and f.suffix not in (".py", ".bak") and not f.name.endswith("~")
+    ]
+
+
+def classify_bin_shapes(repo: Path):
+    """Return every installable bin's authoritative shape in one subprocess.
+
+    Doctor needs the complete classification while building its manifest.
+    Crossing into sable-bin-install once preserves that Module as the sole
+    classification authority without paying one shell startup per artifact.
+    A malformed or incomplete response is undetermined (None), never a
+    partially trusted map.
+    """
+    script = _bin_install_script(repo)
+    if not script.is_file():
+        return None
+    try:
+        proc = subprocess.run(
+            ["bash", str(script), "--classify-all"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+
+    shapes = {}
+    for line in proc.stdout.splitlines():
+        fields = line.split("\t")
+        if len(fields) != 2:
+            return None
+        name, shape = fields
+        if not name or name in shapes or shape not in ("snapshot", "plain"):
+            return None
+        shapes[name] = shape
+
+    expected = set(_classifiable_bin_names(repo))
+    if not expected.issubset(shapes):
+        return None
+    return shapes
+
+
+def python_sibling_importing_bins(repo: Path, shapes=None):
     """Every bin/sable-* entrypoint that sable-bin-install's own classifier
     calls "snapshot" (has repo-local python imports, SABLE-9boz4) — i.e.
     needs --pin-snapshot rather than a plain regular-file copy.
@@ -131,15 +188,11 @@ def python_sibling_importing_bins(repo: Path):
     hardcoding: a bin gaining, losing, or being renamed with a sibling import
     must not silently drop out of doctor's coverage the way an enumerated
     list would."""
-    bin_dir = repo / "bin"
     names = []
-    if not bin_dir.is_dir():
-        return names
-    for f in sorted(bin_dir.glob("sable-*")):
-        if not f.is_file() or f.suffix in (".py", ".bak") or f.name.endswith("~"):
-            continue
-        if classify_bin_shape(repo, f.name) == "snapshot":
-            names.append(f.name)
+    for name in _classifiable_bin_names(repo):
+        shape = shapes.get(name) if shapes is not None else classify_bin_shape(repo, name)
+        if shape == "snapshot":
+            names.append(name)
     return names
 
 
@@ -350,8 +403,8 @@ def _check_snapshot_pin(src: Path, dst: Path, cache: dict = None):
     return "clean", None
 
 # SABLE-mkj6k INTERIM GUARD — remove this set (and every branch that reads it
-# below, in check_manifest/render_text_report/main's --quiet path) once the
-# install.sh pin-preservation fix has been verified live everywhere on the
+# below, in check_manifest/render_text_report) once the install.sh
+# pin-preservation fix has been verified live everywhere on the
 # fleet: with sable-bin-install honoring pins, `bash install.sh` can no longer
 # silently un-pin these bins, so the ordinary remedy is safe again for them.
 # Until that verification lands, an agent running a STALE (pre-fix) installed
@@ -496,6 +549,12 @@ def skill_install_name(skill_dir: Path) -> str:
     return skill_dir.name
 
 
+REPO_RUNNABLE_ONLY_HOOKS = frozenset({
+    "control-trace.sh",
+    "close-decay-sweep.sh",
+})
+
+
 def build_manifest(repo: Path, claude_dir: Path, bin_dir: Path = None):
     """Return [(category, repo_path, installed_path), ...] mirroring exactly
     what install.sh + sable-orchestration-install copy.
@@ -518,6 +577,8 @@ def build_manifest(repo: Path, claude_dir: Path, bin_dir: Path = None):
 
     # Step 6 (delegated to sable-orchestration-install): multi-manager hooks
     for f in sorted((repo / "hooks" / "multi-manager").glob("*.sh")):
+        if f.name in REPO_RUNNABLE_ONLY_HOOKS:
+            continue
         entries.append(("multi-manager hooks", f, claude_dir / "hooks" / "multi-manager" / f.name))
 
     # registry
@@ -548,6 +609,7 @@ def build_manifest(repo: Path, claude_dir: Path, bin_dir: Path = None):
     # always supplies one for real runs; unit fixtures opt in explicitly).
     if bin_dir is not None:
         bin_dir = Path(bin_dir)
+        bin_shapes = classify_bin_shapes(repo)
         for name in PINNED_BIN_NAMES:
             src = repo / "bin" / name
             if not src.is_file():
@@ -561,11 +623,16 @@ def build_manifest(repo: Path, claude_dir: Path, bin_dir: Path = None):
             # snapshot dir is still a pin," so it called a correctly
             # snapshot-pinned bin "unpinned" and recommended a destructive
             # plain cp. One name, one classification, one category.
-            if classify_bin_shape(repo, name) == "snapshot":
+            shape = (
+                bin_shapes.get(name)
+                if bin_shapes is not None
+                else classify_bin_shape(repo, name)
+            )
+            if shape == "snapshot":
                 continue
             entries.append(("pinned bins", src, bin_dir / name))
 
-        for name in python_sibling_importing_bins(repo):
+        for name in python_sibling_importing_bins(repo, shapes=bin_shapes):
             src = repo / "bin" / name
             entries.append(("pinned snapshot bins", src, bin_dir / name))
 
@@ -642,6 +709,42 @@ def _shadowed_role_card_report_lines(shadowed):
     )
     lines.append("  the project-local copy.")
     return lines
+
+
+def check_codex_hook_graph(base=None, environment=None):
+    """Return a doctor row only when execution mode assigns a Codex role."""
+
+    providers = execution_provider_map(base=base)
+    if providers is None or "codex" not in providers.values():
+        return None
+    path = codex_hook_graph_path(environment)
+    try:
+        validate_codex_hook_graph(environment)
+    except ProviderMapError as exc:
+        return {
+            "installed_path": str(path),
+            "status": "invalid",
+            "detail": str(exc),
+            "remedy": CODEX_HOOK_GRAPH_REMEDY,
+        }
+    return {
+        "installed_path": str(path),
+        "status": "clean",
+        "detail": None,
+        "remedy": CODEX_HOOK_GRAPH_REMEDY,
+    }
+
+
+def _codex_hook_graph_report_lines(result):
+    if result is None:
+        return []
+    if result["status"] == "clean":
+        return [f"[Codex hook graph] CLEAN {result['installed_path']}"]
+    return [
+        f"[Codex hook graph] INVALID {result['installed_path']}",
+        f"  {result['detail']}",
+        f"  Repair with: {result['remedy']}",
+    ]
 
 
 def _read_pin_marker(bin_dir: Path) -> set:
@@ -820,6 +923,63 @@ _STATUS_LABELS = {
 _SNAPSHOT_REMEDY_STATUSES = ("broken-copy-pin", "snapshot-drift", "snapshot-stale", "could-not-assess")
 
 
+def install_comparison_scope(
+        claude_dir: Path, bin_dir: Path, shadow_cwd: Path, shadow_home: Path):
+    """Machine-readable bounds for this invocation's install comparison.
+
+    The manifest is deliberately rooted at exactly one .claude tree and one
+    global pinned-bin directory. The independent shadow-role check does visit
+    one project-local and one user-level roles directory, so those bounds are
+    named separately rather than hidden behind an over-broad "nothing else
+    was compared" claim.
+    """
+    return {
+        "manifest": {
+            "install_root": str(Path(claude_dir).expanduser().resolve()),
+            "pinned_bin_root": str(Path(bin_dir).expanduser().resolve()),
+            "other_claude_install_roots_included": False,
+        },
+        "shadowed_role_cards": {
+            "project_roles_root": str(
+                (Path(shadow_cwd) / ".claude" / "sable" / "roles").resolve()
+            ),
+            "user_roles_root": str(
+                (Path(shadow_home) / ".claude" / "sable" / "roles").resolve()
+            ),
+        },
+    }
+
+
+def install_comparison_scope_line(scope):
+    """Human-readable form of install_comparison_scope(), kept to one line
+    so the SessionStart-facing --quiet path can retain its compact contract."""
+    manifest = scope["manifest"]
+    shadow = scope["shadowed_role_cards"]
+    return (
+        "comparison scope — "
+        f"manifest install root: {manifest['install_root']}; "
+        f"pinned-bin root: {manifest['pinned_bin_root']}; "
+        "no other .claude install roots are in the manifest. "
+        f"Shadow-role roots: {shadow['project_roles_root']} and "
+        f"{shadow['user_roles_root']}."
+    )
+
+
+def quiet_drift_summary(bad, scope=None):
+    """Summarize boot-time drift without prescribing an unreviewed action."""
+    pinned = sum(r["category"] in GUARDED_CATEGORIES for r in bad)
+    snapshot = sum(r["category"] == "pinned snapshot bins" for r in bad)
+    ordinary = len(bad) - pinned - snapshot
+    summary = (
+        "sable-doctor: drifted from repo HEAD — "
+        f"ordinary files: {ordinary}; pinned bins: {pinned}; "
+        f"snapshot-pinned bins: {snapshot} — run `sable-doctor` for detail"
+    )
+    if scope is not None:
+        summary += f" — {install_comparison_scope_line(scope)}"
+    return summary
+
+
 def _guarded_remedy_lines(guarded_bad):
     """SABLE-mkj6k interim guard: the safe per-file remedy for a drifted
     GUARDED_CATEGORIES entry. Deliberately never spells out REFRESH_CMD (see
@@ -893,7 +1053,7 @@ def _snapshot_remedy_lines(snapshot_bad):
             )
             lines.append("  runtime. Advance the pin (or drop it to track the repo):")
             lines.append(f"    sable-bin-install --pin-snapshot {name}      # re-pin at HEAD")
-            lines.append(f"    sable-bin-install --repin                    # un-pin, follow the repo")
+            lines.append("    sable-bin-install --repin                    # un-pin, follow the repo")
         elif r["status"] == "could-not-assess":
             lines.append(
                 f"  {r['installed_path']}'s pinned file could not be read (permission denied,"
@@ -912,21 +1072,37 @@ def _snapshot_remedy_lines(snapshot_bad):
     return lines
 
 
-def render_text_report(results, provenance=None, current_head=None, ancestor_ok=None, shadowed_roles=None):
+def render_text_report(
+        results, provenance=None, current_head=None, ancestor_ok=None,
+        shadowed_roles=None, scope=None, codex_hook_graph=None):
     shadowed_roles = shadowed_roles or []
     bad = [r for r in results if r["status"] != "clean"]
-    if not bad and not shadowed_roles:
+    hook_graph_bad = (
+        codex_hook_graph is not None
+        and codex_hook_graph["status"] != "clean"
+    )
+    if not bad and not shadowed_roles and not hook_graph_bad:
         print(f"sable-doctor: clean — {len(results)} installed files match repo HEAD.")
+        if scope is not None:
+            print(install_comparison_scope_line(scope))
         for line in _provenance_report_lines(provenance, ancestor_ok=ancestor_ok):
+            print(line)
+        for line in _codex_hook_graph_report_lines(codex_hook_graph):
             print(line)
         print(worker_cap_line())
         return
     if bad:
         print(f"sable-doctor: DRIFT DETECTED — {len(bad)}/{len(results)} installed files "
               "do not match repo HEAD.\n")
-    else:
+    elif shadowed_roles and not hook_graph_bad:
         print(f"sable-doctor: clean — {len(results)} installed files match repo HEAD, "
               f"but {len(shadowed_roles)} role card(s) are shadowed (see below).\n")
+    else:
+        print(f"sable-doctor: clean — {len(results)} installed files match repo HEAD, "
+              "but an independent runtime check failed (see below).\n")
+    if scope is not None:
+        print(install_comparison_scope_line(scope))
+        print()
     for line in _provenance_report_lines(provenance, current_head=current_head, ancestor_ok=ancestor_ok):
         print(line)
     print()
@@ -964,6 +1140,10 @@ def render_text_report(results, provenance=None, current_head=None, ancestor_ok=
     if shadowed_roles:
         print()
         for line in _shadowed_role_card_report_lines(shadowed_roles):
+            print(line)
+    if codex_hook_graph is not None:
+        print()
+        for line in _codex_hook_graph_report_lines(codex_hook_graph):
             print(line)
     print(worker_cap_line())
 
@@ -1010,6 +1190,11 @@ def main(argv=None):
         return 0
 
     bin_dir = resolve_bin_dir(args.bin_dir)
+    shadow_cwd = Path(os.getcwd())
+    shadow_home = Path(os.environ.get("HOME") or Path.home())
+    scope = install_comparison_scope(
+        claude_dir, bin_dir, shadow_cwd, shadow_home
+    )
     entries = build_manifest(repo, claude_dir, bin_dir)
     results = check_manifest(entries)
     bad = [r for r in results if r["status"] != "clean"]
@@ -1020,8 +1205,11 @@ def main(argv=None):
     # --claude-dir/--project — the shadow question is about the CURRENT
     # process's cwd and home, not whichever install the operator asked to
     # inspect.
-    shadowed_roles = check_shadowed_role_cards(
-        Path(os.getcwd()), Path(os.environ.get("HOME") or Path.home())
+    shadowed_roles = check_shadowed_role_cards(shadow_cwd, shadow_home)
+    codex_hook_graph = check_codex_hook_graph(base=repo, environment=os.environ)
+    hook_graph_bad = (
+        codex_hook_graph is not None
+        and codex_hook_graph["status"] != "clean"
     )
 
     provenance = read_provenance(claude_dir)
@@ -1032,61 +1220,42 @@ def main(argv=None):
 
     if args.json:
         print(json.dumps({
-            "clean": not bad and not shadowed_roles,
+            "clean": not bad and not shadowed_roles and not hook_graph_bad,
             "results": results,
             "shadowed_role_cards": shadowed_roles,
+            "codex_hook_graph": codex_hook_graph,
             "provenance": provenance,
             "current_head": current_head,
             "provenance_ancestor_of_head": ancestor_ok,
+            "scope": scope,
         }, indent=2))
     elif args.quiet:
-        if shadowed_roles:
+        if hook_graph_bad:
             print(
-                f"sable-doctor: {len(shadowed_roles)} manager role card(s) shadowed by "
-                "project-local precedence (SABLE-thx70) — run `sable-doctor` for detail",
+                "sable-doctor: Codex hook graph preflight failed — "
+                f"{codex_hook_graph['detail']}",
                 file=sys.stderr,
             )
+        if shadowed_roles:
+            shadow_summary = (
+                f"sable-doctor: {len(shadowed_roles)} manager role card(s) shadowed by "
+                "project-local precedence (SABLE-thx70) — run `sable-doctor` for detail"
+            )
+            if not bad:
+                shadow_summary += f" — {install_comparison_scope_line(scope)}"
+            print(shadow_summary, file=sys.stderr)
         if bad:
-            guarded_bad = [r for r in bad if r["category"] in GUARDED_CATEGORIES]
-            snapshot_bad = [
-                r for r in bad
-                if r["category"] == "pinned snapshot bins" and r["status"] in _SNAPSHOT_REMEDY_STATUSES
-            ]
-            if guarded_bad:
-                # SABLE-mkj6k interim guard — see GUARDED_CATEGORIES comment.
-                # This is the SessionStart-hook path (`sable-doctor --quiet`),
-                # the highest-traffic message in the system; it must not tell
-                # a fresh pane with zero context to run the one command that
-                # could silently un-pin a deliberately pinned bin.
-                print(
-                    f"sable-doctor: {len(bad)} installed file(s) drifted from repo HEAD, "
-                    f"including {len(guarded_bad)} pinned bin(s) — do not use the ordinary "
-                    "installer refresh for those (SABLE-mkj6k interim guard); run "
-                    "`sable-doctor` for the safe per-file refresh commands",
-                    file=sys.stderr,
-                )
-            elif snapshot_bad:
-                # SABLE-9boz4 — same principle as the mkj6k guard above: a
-                # broken/drifted snapshot pin needs `--pin-snapshot` repair,
-                # not the ordinary installer refresh (which skips it anyway).
-                print(
-                    f"sable-doctor: {len(bad)} installed file(s) drifted from repo HEAD, "
-                    f"including {len(snapshot_bad)} snapshot-pinned bin(s) — do not use the "
-                    "ordinary installer refresh for those; run `sable-doctor` for the safe "
-                    "re-pin commands",
-                    file=sys.stderr,
-                )
-            else:
-                print(
-                    f"sable-doctor: {len(bad)} installed file(s) drifted from repo HEAD "
-                    f"— run `{REFRESH_CMD}` to refresh (run `sable-doctor` for detail)",
-                    file=sys.stderr,
-                )
+            # SessionStart is an observation surface, not an authorization
+            # surface. A fresh pane has no context for choosing among ordinary,
+            # pinned, and snapshot-pinned remedies, so name the bounds and
+            # defer diagnosis to the detailed report.
+            print(quiet_drift_summary(bad, scope=scope), file=sys.stderr)
     else:
         render_text_report(results, provenance=provenance, current_head=current_head,
-                            ancestor_ok=ancestor_ok, shadowed_roles=shadowed_roles)
+                            ancestor_ok=ancestor_ok, shadowed_roles=shadowed_roles,
+                            scope=scope, codex_hook_graph=codex_hook_graph)
 
-    return 1 if (bad or shadowed_roles) else 0
+    return 1 if (bad or shadowed_roles or hook_graph_bad) else 0
 
 
 if __name__ == "__main__":

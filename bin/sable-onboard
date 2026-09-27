@@ -228,23 +228,33 @@ def _probe_beads_workspace(repo: str, env: Env) -> Tuple[str, str]:
     return STATUS_OK, ".beads/ workspace present (config.yaml)."
 
 
+_SABLE_KEY_SHAPES = (
+    "testCommand=<cmd>, integrationBranch=<branch>, or testTimeout=<seconds>"
+)
+
+
 def _probe_sable_contract(repo: str, env: Env) -> Tuple[str, str]:
     """The .sable contract is checked for SHAPE, not mere presence: every line
-    must be a valid testCommand= / integrationBranch= line under the one-parser
-    grammar (sable_stack_detect.validate). A malformed line is a GAP even though
-    the file exists; an absent or empty file is a GAP (no contract established)."""
+    must be a valid testCommand=, integrationBranch=, or testTimeout= line under
+    the one-parser grammar (sable_stack_detect.validate). A malformed line is a
+    GAP even though the file exists; an absent or empty file is a GAP (no
+    contract established)."""
     path = os.path.join(repo, ".sable")
     if not os.path.isfile(path):
-        return STATUS_GAP, "no .sable contract (onboarding proposes testCommand=/integrationBranch=)."
+        return STATUS_GAP, (
+            "no .sable contract (valid line shapes: %s)." % _SABLE_KEY_SHAPES
+        )
     verdicts = ssd.validate(_read(path))
     if not verdicts:
-        return STATUS_GAP, ".sable is empty — no testCommand=/integrationBranch= line."
+        return STATUS_GAP, (
+            ".sable is empty — expected at least one of: %s." % _SABLE_KEY_SHAPES
+        )
     rejects = [lc for lc in verdicts if lc.verdict == "reject"]
     if rejects:
         where = ", ".join(str(lc.lineno) for lc in rejects)
         return STATUS_GAP, (
-            ".sable has malformed line(s) at %s — each must be exactly "
-            "testCommand=<cmd> or integrationBranch=<branch>." % where
+            ".sable has malformed line(s) at %s — each must be exactly one of: %s."
+            % (where, _SABLE_KEY_SHAPES)
         )
     return STATUS_OK, ".sable line-shape valid (%d line(s))." % len(verdicts)
 
@@ -344,7 +354,8 @@ CHECKS = (
           "Run `bd init` in the repo to create the beads workspace.",
           "bd init", _probe_beads_workspace),
     Check("sable-contract", REQUIRED_HARD,
-          "Establish a valid .sable (testCommand=/integrationBranch=) — onboarding proposes one after an execute-once check.",
+          "Establish a valid .sable using %s; onboarding proposes one after an execute-once check."
+          % _SABLE_KEY_SHAPES,
           "sable_stack_detect.write", _probe_sable_contract),
     Check("claude-md-prime-block", REQUIRED_HARD,
           "Prepend the Prime Directive block to CLAUDE.md (install.sh Step 7 does this).",

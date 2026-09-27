@@ -4,7 +4,7 @@
 The dolt push-lock wrapper: the single blessed path for `bd dolt push` both
 fleets adopt. Defense-in-depth serialization of cross-fleet pushes:
 
-  1. a filesystem lock at ~/.claude/sable/dolt-push.lock carrying fleet-id +
+  1. a filesystem lock at /tmp/sable-<uid>/dolt-push.lock carrying fleet-id +
      pid + timestamp, acquire-before / delete-after, stale-breakable at a TTL;
   2. pull-before-push folded in;
   3. the bounce-on-dangling stopgap folded in (on a dangling-chunk error: bounce
@@ -58,9 +58,47 @@ class FakeClock:
 
 # --- lock path / fleet-id resolution ----------------------------------------
 
-def test_default_lock_path_under_home():
+def test_default_lock_path_is_sandbox_writable_and_uid_scoped():
+    """SABLE-82k8m: the lock lived under ~/.claude, which Codex's
+    workspace-write sandbox makes READ-ONLY, so chuck could not push at all
+    (OSError 30 creating the lock tmpfile). /tmp is the only host-global
+    location writable under that sandbox with no extra grant — verified by
+    probe against the real sandbox; ~/.claude/sable, /var/tmp and
+    XDG_RUNTIME_DIR are all blocked.
+
+    UID-SCOPED because /tmp is world-writable with a sticky bit: a fixed
+    well-known name is squattable by any other user on the host, which would
+    either hijack or deny the fleet's push lock."""
     env = {"HOME": "/home/someone"}
-    assert sdp.default_lock_path(env) == "/home/someone/.claude/sable/dolt-push.lock"
+    path = sdp.default_lock_path(env, uid=1000)
+
+    assert path == "/tmp/sable-1000/dolt-push.lock"
+    assert "/.claude/" not in path, "must not return to the sandbox-blocked home"
+
+
+def test_default_lock_path_is_host_global_not_repo_local():
+    """LOAD-BEARING (SABLE-ipcf, the 2026-07-09 cross-fleet corruption): this
+    lock serializes dolt pushes across SEPARATE fleets sharing ONE beads
+    remote. A repo-local or cwd-derived path would give each fleet its own
+    mutex and reintroduce exactly the concurrent-push corruption the wrapper
+    exists to prevent. The path must therefore be identical regardless of
+    where it is resolved from."""
+    env = {"HOME": "/home/someone"}
+
+    from_repo_a = sdp.default_lock_path(dict(env, PWD="/repo/a"), uid=1000)
+    from_repo_b = sdp.default_lock_path(dict(env, PWD="/repo/b"), uid=1000)
+
+    assert from_repo_a == from_repo_b
+    # and it is anchored outside any repo
+    assert from_repo_a.startswith("/tmp/")
+
+
+def test_default_lock_path_separates_users():
+    """Two users on one host get distinct locks — neither can squat or break
+    the other's, and each owns its own 0700 parent."""
+    env = {"HOME": "/home/someone"}
+
+    assert sdp.default_lock_path(env, uid=1000) != sdp.default_lock_path(env, uid=1001)
 
 
 def test_lock_path_env_override_wins():

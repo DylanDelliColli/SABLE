@@ -1480,5 +1480,51 @@ def test_scope_summary_lane_with_nothing_hidden_omits_hidden_note():
     assert "hidden" not in line
 
 
+def test_main_reap_refreshes_the_listed_snapshot_after_mutation(monkeypatch, capsys):
+    # SABLE-xyb92 plant: the first snapshot drives the reap decision; the
+    # second is deliberately different so filtering the old list cannot make
+    # this test pass. The survivor's refreshed bead tag must be what main()
+    # prints, while the pane reaped from the first snapshot must disappear.
+    snapshots = [
+        [
+            {"pane": "%1", "bead": "bead-reaped", "status": "done"},
+            {"pane": "%2", "bead": "survivor-before", "status": "running"},
+        ],
+        [
+            {"pane": "%2", "bead": "survivor-refreshed", "status": "running"},
+        ],
+    ]
+    reaped = []
+
+    def fake_list_workers_confirmed(socket, session=None, interval=None):
+        return snapshots.pop(0)
+
+    def fake_reap(panes, socket):
+        reaped.extend(panes)
+        return []
+
+    monkeypatch.setattr(sws, "resolve_session", lambda socket=None: "w")
+    monkeypatch.setattr(sws, "list_workers_confirmed", fake_list_workers_confirmed)
+    monkeypatch.setattr(sws, "flag_rate_limit_stalls", lambda workers, socket: workers)
+    monkeypatch.setattr(sws, "filter_protected", lambda panes, socket: panes)
+    monkeypatch.setattr(sws, "filter_live_agents", lambda panes, socket: panes)
+    monkeypatch.setattr(sws, "reap", fake_reap)
+    monkeypatch.setattr(sws, "list_fleet_panes", lambda socket, session=None: [])
+    monkeypatch.setattr(sws, "flag_dialog_stalls", lambda panes, socket: [])
+    monkeypatch.setenv("SABLE_AGENT_NAME", "")
+    monkeypatch.setenv("CLAUDE_AGENT_NAME", "")
+    monkeypatch.setenv("SABLE_STATUS_SAMPLE_INTERVAL", "0")
+
+    assert sws.main(["--reap"]) == 0
+    captured = capsys.readouterr()
+
+    assert snapshots == []  # both pre-reap and post-reap reads were consumed
+    assert reaped == ["%1"]
+    assert "bead-reaped" not in captured.out
+    assert "survivor-before" not in captured.out
+    assert "survivor-refreshed" in captured.out
+    assert "reaped 1 done pane(s)" in captured.err
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

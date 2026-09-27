@@ -36,12 +36,16 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from sable_pane_lib import (  # noqa: E402
-    AUTONOMOUS_ROLES, KICK_TAG, SessionCollision, deliver_text, kick_message,
-    repo_root, resolve_session, wait_for_ready,
+    AUTONOMOUS_ROLES, KICK_TAG, SessionCollision, capture_pane, deliver_text,
+    dialog_posture, git_common_dir, kick_message, repo_root, resolve_session,
+    wait_for_ready,
+)
+from sable_handoff_lib import (  # noqa: E402
+    HandoffRefused, read_execution_authority,
 )
 from sable_provider_lib import (  # noqa: E402
-    ProviderMapError, execution_provider, interactive_command, pane_environment,
-    provider_boot_message,
+    DEFAULT_PROVIDER, ProviderMapError, execution_provider, interactive_command,
+    pane_environment, provider_boot_message, validate_codex_hook_graph,
 )
 from sable_registry_lib import (  # noqa: E402
     FLEET_PROJECT_ONLY_REMEDY, fleet_project_only, sable_registry_path,
@@ -103,6 +107,24 @@ def fleet_boundary_refusal(base: str | None = None) -> str | None:
     resolver's fleet-preflight CLI. The escape hatch (export SABLE_AGENTS_YAML)
     flips the scope to 'override' and lifts this."""
     return FLEET_PROJECT_ONLY_REMEDY if fleet_project_only(base) else None
+
+
+def rollback_failed_pane(base: list[str], pane: str) -> str:
+    """Remove an invocation-owned pane and report whether retry is unblocked."""
+    subprocess.run(
+        base + ["kill-pane", "-t", pane],
+        capture_output=True, text=True,
+    )
+    listing = subprocess.run(
+        base + ["list-panes", "-a", "-F", "#{pane_id}"],
+        capture_output=True, text=True,
+    )
+    still_present = (
+        listing.returncode == 0 and pane in listing.stdout.splitlines()
+    )
+    if still_present:
+        return "WARNING: failed pane cleanup did not succeed"
+    return "failed pane removed; retry can recreate the role"
 
 
 def strip_instance_suffix(name: str) -> str:
@@ -311,8 +333,17 @@ def manager_command(provider: str = "claude", cwd: str | None = None) -> str:
         return override
     perm = os.environ.get("SABLE_WORKER_PERMISSION", "--permission-mode bypassPermissions")
     add_dirs = [str(Path(cwd).parent)] if provider == "codex" and cwd else []
+    # Codex's workspace-write sandbox blocks .git even inside the workspace, so
+    # a seat cannot fetch and a worker cannot push without naming it. The grant
+    # is the SHARED git dir, never <cwd>/.git — see git_common_dir (SABLE-82k8m).
+    roots = []
+    if provider == "codex" and cwd:
+        common = git_common_dir(cwd)
+        if common:
+            roots = [common]
     return interactive_command(
         provider, "opus", claude_permission=perm, cwd=cwd, add_dirs=add_dirs,
+        writable_roots=roots,
     )
 
 
@@ -426,21 +457,35 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write(f"sable-spawn-manager: {deliverable_err}\n")
         return 2
 
+    root = repo_root()
+    if any(role not in PRODUCER_ROLES for role in requested):
+        try:
+            read_execution_authority(base=root)
+        except HandoffRefused as e:
+            sys.stderr.write(
+                "sable-spawn-manager: execution handoff refused before fleet "
+                f"start: {e}\n"
+            )
+            return 5
+
     if subprocess.run(base + ["has-session", "-t", session],
                       capture_output=True).returncode != 0:
         sys.stderr.write(f"sable-spawn-manager: no '{session}' session — "
                          f"start one with: sable-launch\n")
         return 1
 
-    root = repo_root()
     provider_by_role: dict[str, str] = {}
     for role in requested:
-        provider_role = "worker" if role in PRODUCER_ROLES else strip_instance_suffix(role)
-        try:
-            provider_by_role[role] = execution_provider(provider_role, base=root)
-        except ProviderMapError as e:
-            sys.stderr.write(f"sable-spawn-manager: {e}\n")
-            return 5
+        if role in PRODUCER_ROLES:
+            provider_by_role[role] = DEFAULT_PROVIDER
+        else:
+            try:
+                provider_by_role[role] = execution_provider(
+                    strip_instance_suffix(role), base=root
+                )
+            except ProviderMapError as e:
+                sys.stderr.write(f"sable-spawn-manager: {e}\n")
+                return 5
 
     listing = subprocess.run(base + ["list-panes", "-s", "-t", session,
                                      "-F", "#{pane_id}\t#{@sable_role}\t#{@sable_provider}"],
@@ -459,6 +504,14 @@ def main(argv: list[str] | None = None) -> int:
             f"{detail}. Stand down/reap those panes before relaunch.\n"
         )
         return 5
+    if any(provider_by_role[role] == "codex" for role in to_spawn):
+        try:
+            validate_codex_hook_graph()
+        except ProviderMapError as e:
+            sys.stderr.write(
+                f"sable-spawn-manager: refusing Codex pane spawn: {e}\n"
+            )
+            return 5
     for role in skipped:
         sys.stderr.write(f"sable-spawn-manager: {role} already running — skipping\n")
 
@@ -501,16 +554,35 @@ def main(argv: list[str] | None = None) -> int:
             ),
         )
         if ready_timeout > 0:
-            wait_for_ready(
+            ready = wait_for_ready(
                 base, pane, ready_timeout, interval=poll_interval,
                 provider=provider,
             )
+            if not ready:
+                cap = capture_pane(base, pane)
+                state = (
+                    "interactive dialog/selector"
+                    if dialog_posture(cap)
+                    else "not in composer posture (still booting, exited, or stuck)"
+                )
+                cleanup = rollback_failed_pane(base, pane)
+                sys.stderr.write(
+                    "sable-spawn-manager: REFUSING bootstrap "
+                    f"role={role} pane={pane} provider={provider} state={state}; "
+                    f"operating-loop kick was NOT typed; {cleanup}.\n"
+                )
+                return 10
         kick = kick_message(role, deliverable=ns.deliverable if is_producer else None)
         if not is_producer:
             try:
                 kick = provider_boot_message(provider, role, kick, base=root)
             except ProviderMapError as e:
-                sys.stderr.write(f"sable-spawn-manager: {e}\n")
+                cleanup = rollback_failed_pane(base, pane)
+                sys.stderr.write(
+                    "sable-spawn-manager: REFUSING bootstrap "
+                    f"role={role} pane={pane} provider={provider}: {e}; "
+                    f"{cleanup}.\n"
+                )
                 return 5
         if deliver_text(base, pane, kick, KICK_TAG,
                         tries=submit_tries, interval=poll_interval,
@@ -518,8 +590,13 @@ def main(argv: list[str] | None = None) -> int:
             sys.stderr.write(f"sable-spawn-manager: {role} up in its own window, "
                              f"kicked into its operating loop\n")
         else:
-            sys.stderr.write(f"sable-spawn-manager: WARNING kick to {role} ({pane}) "
-                             f"may be unsubmitted\n")
+            cleanup = rollback_failed_pane(base, pane)
+            sys.stderr.write(
+                "sable-spawn-manager: REFUSING bootstrap "
+                f"role={role} pane={pane} provider={provider}: delivery could "
+                f"not be verified; {cleanup}.\n"
+            )
+            return 11
     return 0
 
 

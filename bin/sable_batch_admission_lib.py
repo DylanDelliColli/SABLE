@@ -5,9 +5,11 @@ Member selection for a batch. A candidate is admissible iff ALL of:
 
   (a) NON-GATE-CLASS       no merge-tooling / gate-lib / dispatch file in its
                             declared-or-mechanical footprint.
-  (b) INDIVIDUALLY GREEN    a kicked preview exists for the CURRENT
-                            (base, branch) pair and its stored verdict is
-                            GREEN — never a stale or recomputed one.
+  (b) BRANCH-TIP QUALIFIED  a kicked preview for this exact branch tip has a
+                            stored GREEN verdict. The preview may be on the
+                            current base or an older ancestor base: it is
+                            qualification evidence, while the batch's exact
+                            combined-tree verdict is landing authority.
   (c) PAIRWISE RW-DISJOINT  its declared write/read footprint does not
                             couple with any OTHER member already admitted
                             into this batch (sable_footprint_lib.is_rw_disjoint,
@@ -172,6 +174,33 @@ class MechanicalVerdict:
         raise KeyError(name)
 
 
+@dataclass(frozen=True)
+class BatchabilityVerdict:
+    """Per-candidate verdict for a combined batch.
+
+    This is deliberately separate from :class:`MechanicalVerdict`.  A serial
+    fast-forward needs an exact current-base preview; a rolling batch does not,
+    because the previous batch necessarily moves the base while the next
+    workers retain the same tips.  The exact combined batch run supplies the
+    current-base landing authority later.
+    """
+    branch: str
+    bead: str
+    batchable: bool
+    clauses: tuple[ClauseResult, ...]
+
+    @property
+    def reason(self) -> str:
+        failing = [f"{c.name}: {c.reason}" for c in self.clauses if not c.passed]
+        return "; ".join(failing) if failing else "all clauses passed"
+
+    def clause(self, name: str) -> ClauseResult:
+        for clause in self.clauses:
+            if clause.name == name:
+                return clause
+        raise KeyError(name)
+
+
 def _non_gate_class(repo: str, base_sha: str, branch_sha: str, bead: str) -> ClauseResult:
     try:
         declared = fp.declared_footprint(repo, bead)
@@ -211,6 +240,45 @@ def _individually_green_and_ff(repo: str, remote: str, branch: str,
         green = ClauseResult("individually_green", False,
                              f"verdict for {preview_sha[:7]} is {state}, not green")
     return ff, green
+
+
+def _branch_tip_qualified(repo: str, remote: str, branch: str,
+                          base_sha: str, branch_sha: str) -> ClauseResult:
+    """GREEN qualification for this exact branch tip, independent of base age.
+
+    Prefer a current-base preview when one exists.  Its RED or pending result
+    is authoritative qualification failure and must not be hidden behind an
+    older green.  Only when no current preview exists do we accept the newest
+    completed green preview built on an ancestor base.  The later combined
+    run still tests the exact object that can land on ``base_sha``.
+    """
+    current = preview_lib.adopt_kicked_preview(
+        repo, remote, branch, base_sha, branch_sha)
+    if current is not None:
+        preview_sha, ref = current
+        verdict = preview_lib.read_verdict(repo, ref, preview_sha)
+        if verdict.complete and verdict.outcome == classify.GREEN:
+            return ClauseResult(
+                "branch_tip_qualified", True,
+                f"current-base preview {preview_sha[:7]} is GREEN "
+                f"(source={verdict.source})")
+        state = verdict.outcome if verdict.complete else "pending/unanswered"
+        return ClauseResult(
+            "branch_tip_qualified", False,
+            f"current-base preview {preview_sha[:7]} is {state}, not green")
+
+    stale = preview_lib.find_stale_green_preview(
+        repo, remote, branch, base_sha, branch_sha)
+    if stale is not None:
+        return ClauseResult(
+            "branch_tip_qualified", True,
+            f"exact branch tip qualified GREEN on ancestor base "
+            f"{stale.base_sha[:7]} via {stale.ref}; the combined batch run "
+            "will authorize the current-base object")
+    return ClauseResult(
+        "branch_tip_qualified", False,
+        f"no completed GREEN preview found for exact branch tip {branch_sha[:7]} "
+        "on the current base or an ancestor base")
 
 
 def _zero_holds(repo: str, bead: str) -> ClauseResult:
@@ -253,6 +321,28 @@ def is_this_branch_mechanical(repo: str, remote: str, bead: str, branch: str,
                              mechanical=all(c.passed for c in clauses), clauses=clauses)
 
 
+def is_this_branch_batchable(repo: str, remote: str, bead: str, branch: str,
+                             base_sha: str, branch_sha: str) -> BatchabilityVerdict:
+    """The rolling-batch admission predicate.
+
+    It shares the safety clauses that are properties of the member itself,
+    but intentionally omits ``clean_ff_adoption``.  Requiring an exact
+    current-base individual preview here makes every earlier landing
+    invalidate the whole open queue, recreating the serial bottleneck the
+    combined run exists to remove.
+    """
+    clauses = (
+        _non_gate_class(repo, base_sha, branch_sha, bead),
+        _branch_tip_qualified(repo, remote, branch, base_sha, branch_sha),
+        _zero_holds(repo, bead),
+        _zero_conflicts(repo, base_sha, branch, branch_sha, bead),
+    )
+    return BatchabilityVerdict(
+        branch=branch, bead=bead,
+        batchable=all(clause.passed for clause in clauses),
+        clauses=clauses)
+
+
 # --------------------------------------------------------------------------
 # Batch admission
 # --------------------------------------------------------------------------
@@ -286,8 +376,8 @@ def admit_batch(repo: str, remote: str, base_sha: str,
     """Select the admissible subset of `candidates` for one batch onto
     `base_sha`, in the order given.
 
-    Greedy, not exhaustive: a candidate is admitted iff it is mechanical
-    (is_this_branch_mechanical), its declared write/read footprint is
+    Greedy, not exhaustive: a candidate is admitted iff it is batchable
+    (is_this_branch_batchable), its declared write/read footprint is
     rw-disjoint from EVERY already-admitted member's, AND folding it onto the
     base alongside every already-admitted member is clean (fold_check on the
     accumulated set). A candidate that fails any check is EXCLUDED with a
@@ -319,14 +409,23 @@ def admit_batch(repo: str, remote: str, base_sha: str,
     excluded: list[Exclusion] = []
 
     for cand in candidates:
-        verdict = is_this_branch_mechanical(repo, remote, cand.bead, cand.branch,
-                                            base_sha, cand.sha)
-        if not verdict.mechanical:
+        verdict = is_this_branch_batchable(
+            repo, remote, cand.bead, cand.branch, base_sha, cand.sha)
+        if not verdict.batchable:
             excluded.append(Exclusion(cand, verdict.reason))
             continue
 
         try:
-            writes_c = fp.declared_footprint(repo, cand.bead)
+            # Writes are never declaration-only.  A missing or incomplete
+            # declaration must not hide paths the branch actually changes:
+            # mechanical writes are the floor and the declaration can only
+            # widen them.  Besides preserving the footprint module's core
+            # contract, this rejects a real write/write overlap before
+            # spending a combined fold check.
+            declared_writes = fp.declared_footprint(repo, cand.bead)
+            mechanical_writes = fp.mechanical_footprint(
+                repo, base_sha, cand.sha)
+            writes_c = fp.widen(mechanical_writes, declared_writes)
             reads_c = fp.declared_reads(repo, cand.bead)
         except fp.FootprintUndetermined as exc:
             excluded.append(Exclusion(cand, f"declared footprint undetermined: {exc}"))
@@ -348,7 +447,7 @@ def admit_batch(repo: str, remote: str, base_sha: str,
         member = FoldMember(label=cand.branch, sha=cand.sha, bead=cand.bead)
         trial_members = admitted_members + [member]
         if not admitted_members:
-            # is_this_branch_mechanical's zero_conflicts clause already ran
+            # is_this_branch_batchable's zero_conflicts clause already ran
             # exactly this single-member fold — do not spend it twice. Only
             # once a SECOND member joins does the fold become a genuinely
             # NEW (combined) run this candidate has not already paid for.

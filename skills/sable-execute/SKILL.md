@@ -26,22 +26,21 @@ You are **Lincoln**, the orchestrator main session (see `roles/lincoln.md`). Thi
 flips you into **execution mode**, whose single job is to **drain the bead
 pool**.
 
-## 0. Verify handoff readiness (soft gate)
+## 0. Require the approved handoff (hard gate)
 
-Before flipping to execution, confirm the backlog is actually drainable —
-otherwise you send managers into under-scoped work. Two checks:
+Planning's final human gate records a tier-appropriate receipt in the atomic mode
+state:
 
-- **Planning reached the end.** `sable-mode substage get` returns
-  `decomposition` (or a prior planning session already handed off). If it returns
-  an earlier substage, the staged flow isn't finished.
-- **No open questions remain.** `bd ready -l open-question` is empty — every
-  ambiguity the human needed to resolve has been resolved.
+- **Quick** binds the one consolidated approval to its explicit 1–3 beads.
+- **Full** binds final decomposition approval to all five dossier artifacts, the
+  epic's live children, fresh `bd swarm validate --json`, and a ready front.
+- **Both** prove zero unresolved `open-question` beads across open, in-progress,
+  blocked, and deferred states, and bind the current integration-base SHA.
 
-If either fails, the pool is half-formed: return to `/sable-plan`, or drain the
-`open-question` beads, before proceeding. This is a **discipline gate, not a hard
-lock** — nothing stops you, but skipping it means execution surfaces questions
-the human should have answered during planning, which is exactly what staged
-planning exists to prevent.
+Do not reproduce these checks manually. The mode transition below revalidates
+the receipt and carries it into execution under the same state lock. If evidence
+changed after approval, it refuses without altering planning state; return to
+`/sable-plan`, resolve the drift, and ask for the single final approval again.
 
 ## 0.5 Docker Supabase preflight (hard gate, SABLE-n5rb)
 
@@ -74,7 +73,8 @@ the db.
 ## 1. Flip the mode-state
 
 Choose the provider map once for this execution session, then run exactly one
-mode transition. A Claude-only install uses the backwards-compatible default:
+mode transition. It succeeds only from a fresh approved planning receipt. A
+Claude-only install uses the backwards-compatible default:
 
 ```bash
 sable-mode set execution --fleet optimus,tarzan,chuck
@@ -94,6 +94,24 @@ entries default to Claude. The map is immutable while execution mode is active:
 do not switch providers per bead or per dispatch. To change it, stand down the
 fleet and return to planning/clear the ended session before starting a new
 execution session.
+
+There is one explicit emergency bypass, owned by the human operator:
+
+```bash
+sable-mode set execution --break-glass \
+  --reason "operator-provided reason" --fleet optimus,tarzan,chuck
+```
+
+Never choose this on the operator's behalf. It records the operator identity,
+time, reason, base SHA, and failed readiness checks as `kind=break-glass`.
+Generic hook force flags do not create execution authority.
+
+For an approved receipt, its `scope` array is also the exact execution work
+set. Quick scope is the explicit 1–3 approved beads; Full scope is the exact
+child-ID snapshot approved at decomposition. New descendants and unrelated
+ready work are not added implicitly: return to planning and record a new final
+approval. Only a carried `kind=break-glass` receipt is unbounded, and
+`sable-spawn-worker` announces that bypass on every dispatch.
 
 This writes the **per-repo** mode-state file — `<repo>/.claude/sable/state/mode-state.json`
 when inside a git repo (resolved from the git common-dir, so all of the repo's
@@ -117,18 +135,32 @@ merged with bare `git merge --no-ff` because his static identity still described
 the old manual flow. Persist the live contracts to disk so `session-role-anchor.sh`
 surfaces them into every fresh boot's identity:
 
+**Use `add` for every line — never `set`.** The surface ACCUMULATES across shifts:
+most of what a booting pane needs was written by earlier shifts, not by this flip.
+`set` REPLACES the whole surface, and this choreography used to lead with it —
+on 2026-07-30 one flip destroyed 25 of 29 committed lines of operator doctrine,
+including an entry marked BINDING ON EVERY INCOMING LINCOLN and the ruling naming
+the run's integration branch. They survived only because this one file is
+git-tracked (SABLE-ztks1), which is luck the mechanism must not depend on.
+`sable-contract set` now REFUSES (exit 3) against a non-empty surface for exactly
+this reason (SABLE-wx048); `set --force` is the deliberate reset.
+
 ```bash
-sable-contract set  "Merges go ONLY through sable-merge-gate. NO bare git merge/push on any integration branch."
-sable-contract add  "Workers self-push their worktree branch; the post-push hook files for-chuck; Chuck merges via the gate."
+sable-contract add  "Merges go ONLY through sable-merge-gate. NO bare git merge/push on any integration branch."
+sable-contract add  "Workers self-push their worktree branch; Chuck's PRIMARY handoff is a direct tmux message; a durable for-chuck bead is created only if delivery fails, so its absence is healthy; Chuck merges via the gate."
 # add any interim fleet rule live this shift, e.g.:
 # sable-contract add "Interim worker cap: 2 per manager until SABLE-p8rf lands."
 ```
 
+Adding a line that already says the same thing is cheap and safe; erasing one that
+a previous shift is relying on is not — so when in doubt, `add`.
+
 `sable-contract` writes `<repo>/.claude/sable/state/active-contracts.md`, colocated
 with the mode-state (same per-repo resolution). Update it the moment a protocol
 flips — a contract change that lives only in this conversation dies with the next
-restart. Clear a rule with `sable-contract clear` / re-`set` when it no longer
-applies.
+restart. Retire a single rule with `sable-contract clear` (removes the surface) or
+`sable-contract set --force` (deliberate full reset) — both destroy accumulated
+history, so read the surface first and re-add what still applies.
 
 ## 2. Bring up the warm-pane session
 
@@ -152,7 +184,9 @@ Determine which of two states you are in:
   (your window is not disturbed), launched with a bypass permission posture
   and kicked into its operating loop. Idempotent: already-running managers are
   skipped. The interlock allows this only in execution mode — which you just
-  set in step 1.
+  set in step 1. The spawn tool independently checks the carried handoff before
+  any manager pane is created; a legacy or statusless execution file cannot
+  start the fleet.
 - **No sable session exists yet** (`tmux has-session -t sable` fails). Tell the
   operator to run `sable-launch` from a plain terminal (it wraps `sable-tmux`,
   creates the Lincoln-only session, and attaches — `tmux attach -t sable`),
@@ -161,12 +195,17 @@ Determine which of two states you are in:
 
 How the drain works (all of it happens in the panes, not in your context):
 
-- **Managers (optimus, tarzan)** drain their lanes from `bd ready`: verify each
-  ready bead, claim it, and **dispatch their own workers** — one ephemeral
-  worker pane per bead via the worker-spawn helper (worktree = pane CWD, model
-  pinned from the bead's `model:` label, pre-dispatch governance runs inside
-  the helper). Managers review results through the bead pool; they do **not**
-  push worker code.
+- **Managers (optimus, tarzan)** read `sable-mode handoff show` and drain only
+  ready IDs from that receipt's exact scope, partitioned by their normal
+  parented/orphan lanes. They verify each bead and **dispatch their own workers**
+  — one ephemeral worker pane per bead via the worker-spawn helper,
+  which checks receipt scope and then owns the claim (worktree = pane CWD,
+  model pinned from the bead's `model:` label, pre-dispatch governance runs
+  inside the helper). Managers do not pre-claim normal dispatches. The helper
+  mechanically rejects a lead or bundle member outside the receipt before any
+  claim.
+  Managers review results through the bead pool; they do **not** push worker
+  code.
 - **Workers** do TDD in their own worktree, pass the gates, **self-push** their
   own worktree branch from their pane CWD, close their bead with gate evidence,
   and flag `@sable_status=done`.

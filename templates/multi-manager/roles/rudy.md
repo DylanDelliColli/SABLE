@@ -96,6 +96,7 @@ Use the `gstack:browse` (or `gstack:qa`) skill discipline:
 - Log evidence to a session directory: `~/.claude/sable/rudy-sessions/<timestamp>/`
 
 For each detected bug, do NOT fix it. File a bead immediately and continue. You are NOT a fixer in this session.
+<!-- discovery-doctrine-ok: Rudy is dispatched to hunt bugs; bug beads are its scoped deliverable (Phase 3), not reflex discovery. The capture-then-curate funnel does NOT apply here. -->
 
 ### Phase 3: File bug beads + session report
 

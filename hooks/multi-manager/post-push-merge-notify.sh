@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# post-push-merge-notify.sh — File for-chuck bead with overlap analysis after push
+# post-push-merge-notify.sh — Direct Chuck handoff with durable failure fallback
 # Trigger: PostToolUse:Bash matching `git push` | Timeout: 10000ms
 #
-# After a successful git push, file a coord bead addressed to chuck (the merge
-# integrator) with: PR URL (if detectable), files modified, overlap context with
-# any in-progress beads' WIP-CLAIMS.
+# After a successful git push, message Chuck (the merge integrator) directly
+# with: PR URL (if detectable), files modified, and overlap context with any
+# in-progress beads' WIP-CLAIMS. File a durable for-chuck coord bead only when
+# direct delivery cannot be confirmed.
 #
 # Chuck uses this to sequence merges intelligently — hold a PR if it overlaps
 # an in-flight PR, merge if independent.
@@ -53,8 +54,9 @@ print('---STDERR---')
 print(stderr)
 " 2>/dev/null) || exit 0
 
-CWD=$(echo "$PARSED" | sed -n '1p')
-COMMAND=$(echo "$PARSED" | sed -n '2p')
+CWD="${PARSED%%$'\n'*}"
+PARSED_REST="${PARSED#*$'\n'}"
+COMMAND="${PARSED_REST%%$'\n---STDOUT---'*}"
 
 # Only act on successful git push (SABLE-jpr: use shared matcher so
 # 'git -C <path> push' and other flag-interleaved forms are matched correctly)
@@ -98,8 +100,8 @@ sable_pp_trace "INVOKED cwd=${CWD} cmd=[${COMMAND}]"
 # can't catch this case on its own — remote tip == local HEAD looks identical
 # whether this push is the one that landed it or a resend of already-landed
 # content — so this text check stays as the no-op-specific leg.
-STDOUT_STDERR=$(echo "$PARSED" | sed -n '/---STDOUT---/,$p')
-if echo "$STDOUT_STDERR" | grep -qiE 'everything[[:space:]]+up-to-date'; then
+STDOUT_STDERR="${PARSED#*$'\n---STDOUT---'$'\n'}"
+if printf '%s' "$STDOUT_STDERR" | grep -qiE 'everything[[:space:]]+up-to-date'; then
   sable_pp_trace "EXIT no-op-push (everything up-to-date)"
   exit 0
 fi
@@ -285,8 +287,6 @@ fi
 # Try to detect PR URL via gh (best-effort, optional)
 PR_URL=$(gh pr view --json url -q .url 2>/dev/null || echo "")
 
-FILES_CSV=$(echo "$FILES" | tr '\n' ',' | sed 's/,$//')
-
 # --- Overlap scan against UNCONTAINED BRANCH REFS (SABLE-pfbjw) ------------
 # GROUND TRUTH, not declarations. The prior implementation intersected this
 # push's files against `bd list --status=in_progress`'s wip_claims metadata,
@@ -329,6 +329,10 @@ OVERLAPS=""
 if [ -z "$INTEGRATION_TIP" ]; then
   sable_pp_trace "OVERLAP-SCAN skipped unresolved-integration-ref ${INTEGRATION_REF}"
 else
+  declare -A PUSHED_FILE_SET=()
+  while IFS= read -r PUSHED_FILE; do
+    [ -n "$PUSHED_FILE" ] && PUSHED_FILE_SET["$PUSHED_FILE"]=1
+  done <<< "$FILES"
   CANDIDATE_REFS=$(git -C "$CWD" for-each-ref --format='%(refname:short)' 'refs/remotes/origin/wk-*' 2>/dev/null || echo "")
   OVERLAP_LINES=""
   while IFS= read -r CAND_REF; do
@@ -346,14 +350,13 @@ else
     CAND_FILES=$(git -C "$CWD" diff "${INTEGRATION_REF}...${CAND_REF}" --name-only 2>/dev/null)
     [ -z "$CAND_FILES" ] && continue
 
-    SHARED=$(FILES_CSV="$FILES_CSV" CAND_FILES="$CAND_FILES" python3 -c "
-import os
-pushed = set(f for f in os.environ.get('FILES_CSV', '').split(',') if f)
-cand = set(f for f in os.environ.get('CAND_FILES', '').split(chr(10)) if f)
-shared = sorted(pushed & cand)
-if shared:
-    print(','.join(shared))
-" 2>/dev/null)
+    SHARED=""
+    while IFS= read -r CAND_FILE; do
+      [ -n "$CAND_FILE" ] || continue
+      if [ "${PUSHED_FILE_SET[$CAND_FILE]:-0}" = "1" ]; then
+        SHARED="${SHARED}${SHARED:+,}${CAND_FILE}"
+      fi
+    done <<< "$CAND_FILES"
     [ -z "$SHARED" ] && continue
 
     # Label with any bead(s) declaring this branch — ANY status (the entire
@@ -387,11 +390,19 @@ fi
 # shared and WITH WHAT, instead of the previous bare, unactionable
 # "shares files with in-flight work" that cost a manual derivation to dismiss
 # on every false positive.
-OVERLAPS_BRIEF=$(printf '%s' "$OVERLAPS" | sed 's/^  - //' | tr '\n' ';' | sed 's/;$//' | sed 's/;/; /g')
+OVERLAPS_BRIEF="${OVERLAPS#  - }"
+OVERLAPS_BRIEF="${OVERLAPS_BRIEF//$'\n'/; }"
 
 # Brief basename list, shared by the message-based notifications below (the
 # worker-landing wake and the Chuck handoff).
-FILES_BRIEF=$(echo "$FILES" | sed 's#.*/##' | head -8 | tr '\n' ' ')
+FILES_BRIEF=""
+FILES_BRIEF_COUNT=0
+while IFS= read -r FILE_PATH; do
+  [ -n "$FILE_PATH" ] || continue
+  FILES_BRIEF="${FILES_BRIEF}${FILE_PATH##*/} "
+  FILES_BRIEF_COUNT=$((FILES_BRIEF_COUNT + 1))
+  [ "$FILES_BRIEF_COUNT" -ge 8 ] && break
+done <<< "$FILES"
 
 # SABLE-f916: both landing artifacts below (the live chuck message AND the
 # durable for-chuck bead fallback) were byte-identical in framing to what a
@@ -483,9 +494,9 @@ if isinstance(data, list):
     fi
     if [ "$BEAD_TOTAL" -gt 0 ] && [ "$BEAD_CLOSED_COUNT" -eq "$BEAD_TOTAL" ]; then
       if [ "$BEAD_TOTAL" -eq 1 ]; then
-        LAND_MSG="${AUTO_NOTIFY_TAG} Worker landed: branch ${BRANCH} (${FILES_BRIEF}) pushed; bead ${BEAD_ID:-?} is CLOSED. Review the outcome — closed bead + for-chuck PR — and REVISE by re-spawning into the same worktree if wrong."
+        LAND_MSG="${AUTO_NOTIFY_TAG} Worker landed: branch ${BRANCH} (${FILES_BRIEF}) pushed; bead ${BEAD_ID:-?} is CLOSED. Review the outcome via the closed bead. Chuck's primary merge handoff is direct; the durable for-chuck bead is created only if delivery fails, so its absence is healthy. REVISE by re-spawning into the same worktree if wrong."
       else
-        LAND_MSG="${AUTO_NOTIFY_TAG} Worker landed: branch ${BRANCH} (${FILES_BRIEF}) pushed; ALL ${BEAD_TOTAL} beads on this branch are CLOSED (${BEAD_ALL_IDS}). Review the outcome — closed beads + for-chuck PR — and REVISE by re-spawning into the same worktree if wrong."
+        LAND_MSG="${AUTO_NOTIFY_TAG} Worker landed: branch ${BRANCH} (${FILES_BRIEF}) pushed; ALL ${BEAD_TOTAL} beads on this branch are CLOSED (${BEAD_ALL_IDS}). Review the outcome via the closed beads. Chuck's primary merge handoff is direct; the durable for-chuck bead is created only if delivery fails, so its absence is healthy. REVISE by re-spawning into the same worktree if wrong."
       fi
     elif [ "$BEAD_TOTAL" -gt 0 ]; then
       LAND_MSG="${AUTO_NOTIFY_TAG} Worker pushed: branch ${BRANCH} (${FILES_BRIEF}). ${BEAD_CLOSED_COUNT}/${BEAD_TOTAL} bead(s) on this branch are closed — NOT all done (open: ${BEAD_OPEN_LIST}). This is NOT a completion signal; check \`bd show <id>\` for each and \`sable-worker-status\` before reviewing."

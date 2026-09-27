@@ -24,13 +24,11 @@
 #
 # ── Silent-green guard (SABLE-7v3z / SABLE-lcevs) ────────────────────────────
 # pytest runs the WHOLE bin/ directory (auto-discovery, no testpaths/--ignore),
-# so no bin/ test can exist-but-not-run. The shell run-set's --manifest step
-# prints every hooks/test/test-*.sh as RUN / EXCLUDED(reason) / UNCLASSIFIED —
-# readable, but a ::warning:: annotation alone never fails a job (SABLE-lcevs:
-# this was the fail-OPEN gap that let a branch land fully green with new
-# suites UNCLASSIFIED and never executed). The --check step right after it is
-# the enforcement: same detection, but exits non-zero on any UNCLASSIFIED
-# suite or stale run-set entry, so this step is what actually blocks the gate.
+# so no bin/ test can exist-but-not-run. The sealed verifier's static lane runs
+# shell-run-set --check, which prints every hooks/test/test-*.sh as RUN /
+# EXCLUDED(reason) / UNCLASSIFIED AND exits non-zero on any UNCLASSIFIED suite
+# or stale run-set entry. One enforced pass supplies both readable evidence and
+# the fail-closed verdict; a separate --manifest pass would duplicate it.
 #
 # ── Cost (SABLE-oeci gotcha 5) ───────────────────────────────────────────────
 # Single job, no matrix. (Repo is public, so Actions minutes are free; kept lean
@@ -49,31 +47,13 @@
 # it can never mask a real regression. Do NOT remove either branch trigger
 # above (SABLE-ad21 / gah9-bypass safety net still requires both).
 #
-# ── pytest-testmon cache wiring (SABLE-cmar4.3) ───────────────────────────────
-# .testmondata (pytest-testmon's line-coverage map) persists ACROSS runs as a
-# GitHub Actions cache artifact, keyed on ref+SHA with branch-prefix
-# restore-keys below, so an exact-SHA lookup always "misses" (every push is a
-# new SHA) but falls through to the most recent cache saved for this ref, then
-# to any ref, via prefix matching — actions/cache then saves the post-run
-# .testmondata under the new exact-SHA key. testmon's own file-hash diffing
-# tolerates a "stale" cache restored from a different branch/commit; it just
-# means more files read as dirty (conservative), never fewer.
-#
-# This job's own correctness-verifying pytest step below (the one gating the
-# merge) stays UNCONDITIONALLY full-suite (SABLE-7v3z) and plain — it does NOT
-# pass any testmon flag. Cache-warming (recording/updating .testmondata for
-# the impact-tier SELECTOR — bin/tier_selection.py, .github/ci/pytest-impact-
-# tier.sh, still not wired into this gate; see below) is a SEPARATE, later
-# step that re-runs the same full suite with --testmon-noselect. The two are
-# split deliberately (SABLE-cmar4.3 second revise) — see that step's own
-# comment for why: pytest-testmon 2.2.0 has a real, reproduced defect that
-# crashes on this repo's bin/ layout, and that crash must never take the gate
-# down when every actual test passed.
-#
-# An impact-scoped run here is only safe once the full-snapshot backstop
-# (SABLE-jd5fj.5) exists to catch what it under-selects. On a cache miss (no
-# .testmondata restored at all) --testmon-noselect is a no-op beyond writing a
-# fresh map from that run — still the same conservative full run either way.
+# ── One Python run per verdict (SABLE-z3j28.2) ────────────────────────────────
+# The correctness-verifying pytest step below is unconditionally full-suite.
+# ci-verify does not also warm .testmondata: that cache is not used to select
+# this workflow's tests, and warming it re-ran the exact same suite solely for a
+# different, local impact-tier consumer. Local operators can still run
+# `sable-merge-gate warm-testmon-cache`; a combined batch verdict pays for the
+# authoritative Python suite exactly once.
 
 name: ci-verify
 
@@ -170,17 +150,7 @@ jobs:
           # verbatim CI usage error that diagnosed it) -- the two needs
           # converged on the same package, so cmar4.5's superset line already
           # satisfies both.
-          pip install pytest pytest-testmon pytest-impact pytest-cov diff_cover
-
-      - name: Restore pytest-testmon coverage cache (SABLE-cmar4.3)
-        if: steps.dedup.outputs.already_verified != 'true'
-        uses: actions/cache@v4
-        with:
-          path: .testmondata
-          key: testmon-v1-${{ github.ref }}-${{ github.sha }}
-          restore-keys: |
-            testmon-v1-${{ github.ref }}-
-            testmon-v1-
+          pip install -r .github/ci/test-requirements.txt
 
       - name: Configure git identity (SABLE-59zu — clean-room needs one)
         if: steps.dedup.outputs.already_verified != 'true'
@@ -220,69 +190,13 @@ jobs:
           command -v bd   >/dev/null 2>&1 && echo "::warning::bd unexpectedly present in clean-room (SABLE-59zu)"   || true
           command -v dolt >/dev/null 2>&1 && echo "::warning::dolt unexpectedly present in clean-room (SABLE-59zu)" || true
 
-      - name: pytest — full bin/ suite (unit + integration; bd/dolt suites self-skip)
+      - name: Sealed verification — full Python + serial shell + static authority
         if: steps.dedup.outputs.already_verified != 'true'
         run: |
-          # The full bin/ suite runs with NOTHING deselected — auto-discovery,
-          # no testpaths/--ignore, so no bin/ test can exist-but-not-run
-          # (silent-green guard, SABLE-7v3z). The two tests once deselected here
-          # for shared-runner flakiness are both fixed and re-enabled:
-          #   - test_two_concurrent_wrappers_serialize (SABLE-l7gd): lock TOCTOU
-          #     race (create-then-write + unconditional stale-lock unlink) fixed.
-          #   - test_reap_protects_done_pane_in_attached_clients_current_window
-          #     (SABLE-7dva): the pty-attached tmux client now registers
-          #     headlessly (TERM set, own session, drained master fd) instead of
-          #     never attaching on the CI clean-room.
-          python -m pytest bin/ -q -p no:cacheprovider
-
-      - name: Warm pytest-testmon coverage cache (SABLE-cmar4.3 second revise)
-        if: steps.dedup.outputs.already_verified != 'true'
-        run: |
-          # Re-runs the SAME full bin/ suite with --testmon-noselect
-          # (record/update .testmondata, deselect nothing) purely to keep the
-          # impact-tier's coverage map warm — see the cache-wiring comment
-          # above for why selection itself isn't enabled on this gate. Kept
-          # OUT of the correctness-verifying step above because pytest-testmon
-          # 2.2.0 has a real, reproduced defect: it crashes with INTERNALERROR
-          # (IndexError in its own SourceTree.get_file(), testmon_core.py:93
-          # `filename.rsplit(".", 1)[1]`) whenever it measures coverage on a
-          # file with no extension at all — true of ~23 of this repo's bin/
-          # python executables (shebang, no .py suffix) that several
-          # bin/test_*.py suites load in-process via
-          # importlib.machinery.SourceFileLoader. Confirmed by direct repro:
-          # testmon's own Coverage() instance hardcodes
-          # include=[repo_root + "/*"] with no ini/.coveragerc/pytest-cov
-          # config surface to narrow it, and 2.2.0 (latest) has no upstream
-          # fix. bin/tier_selection.py's classify_cache_warm_outcome()
-          # narrowly tolerates ONLY this exact signature with zero reported
-          # test failures — any other non-zero exit (a real failure, a
-          # different crash) still fails this step for real. A tolerated
-          # crash just leaves .testmondata stale for this run, same as any
-          # other cache miss.
-          bash .github/ci/testmon-cache-warm.sh
-
-      - name: Fixture isolation tripwire (SABLE-0ssz.2 — ban unsandboxed real-repo git ops)
-        if: steps.dedup.outputs.already_verified != 'true'
-        run: |
-          # Static ban on the escape class behind the 2026-07-14 P0s (SABLE-xydb
-          # push-to-real-main, SABLE-a5a5 config-to-shared-.git/config): any
-          # test fixture that runs an unguarded-cd or an explicit git -C
-          # <real-repo> mutation reds the gate here, at CI time, not by the next
-          # P0. Known/tracked violations are excused via KNOWN_VIOLATIONS.
-          python bin/sable-fixture-tripwire
-
-      - name: Shell run-set coverage manifest (SABLE-7v3z — exclusions are visible)
-        if: steps.dedup.outputs.already_verified != 'true'
-        run: bash .github/ci/shell-run-set.sh --manifest
-
-      - name: Shell run-set fail-closed check (SABLE-lcevs — UNCLASSIFIED/stale blocks the gate)
-        if: steps.dedup.outputs.already_verified != 'true'
-        run: bash .github/ci/shell-run-set.sh --check
-
-      - name: Shell impact manifest — lib fan-out completeness (SABLE-cmar4.2)
-        if: steps.dedup.outputs.already_verified != 'true'
-        run: bash .github/ci/impact-manifest.sh --check
-
-      - name: hooks/test shell suites (known-green allowlist)
-        if: steps.dedup.outputs.already_verified != 'true'
-        run: bash .github/ci/shell-run-set.sh --run
+          # One Actions job remains one preview slot. Inside that dedicated
+          # runner, three independently fail-closed lanes overlap:
+          #   - the complete bin/ pytest discovery (nothing deselected),
+          #   - every shell ALLOW suite through its existing serial runner,
+          #   - fixture/classification/load/fan-out static authority.
+          # Each lane must leave a parseable result; missing evidence is RED.
+          bash .github/ci/run-sealed-verification.sh

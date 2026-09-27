@@ -73,6 +73,42 @@ else
   fail "idempotent on re-run"
 fi
 
+# ---- SABLE-5hwa: prune retired repo-owned dangling symlinks ----
+# A retired tool disappears from TOOLS, so the ordinary install loop never
+# visits its old destination. Scope cleanup to links that point into THIS
+# checkout's bin/: a broken user-managed sable-* link elsewhere is not ours.
+D_RETIRED=$(mktemp -d)
+RETIRED_LINK="$D_RETIRED/sable-retired-fixture"
+UNRELATED_LINK="$D_RETIRED/sable-private-fixture"
+REGULAR_FILE="$D_RETIRED/sable-retired-regular"
+ln -s "$REPO_BIN/sable-retired-fixture" "$RETIRED_LINK"
+ln -s "/opt/user-tools/sable-private-fixture" "$UNRELATED_LINK"
+printf 'user-owned\n' > "$REGULAR_FILE"
+
+DRY_RETIRED=$(bash "$INSTALL" --dir "$D_RETIRED" --dry-run 2>&1 1>/dev/null) || true
+if [ -L "$RETIRED_LINK" ] \
+  && printf '%s' "$DRY_RETIRED" | grep -q "would remove retired repo-owned symlink: $RETIRED_LINK"; then
+  pass "retired-link cleanup dry-run reports without writing"
+else
+  fail "retired-link cleanup dry-run reports without writing" \
+    "link=$(ls -ld "$RETIRED_LINK" 2>/dev/null) stderr=[$DRY_RETIRED]"
+fi
+
+RETIRED_ERR=$(bash "$INSTALL" --dir "$D_RETIRED" 2>&1 1>/dev/null) || true
+if [ ! -L "$RETIRED_LINK" ] && [ ! -e "$RETIRED_LINK" ] \
+  && printf '%s' "$RETIRED_ERR" | grep -q "removed retired repo-owned symlink: $RETIRED_LINK"; then
+  pass "plain install removes a retired repo-owned dangling symlink"
+else
+  fail "plain install removes a retired repo-owned dangling symlink" \
+    "link=$(ls -ld "$RETIRED_LINK" 2>/dev/null) stderr=[$RETIRED_ERR]"
+fi
+
+if [ -L "$UNRELATED_LINK" ] && [ -f "$REGULAR_FILE" ]; then
+  pass "retired-link cleanup preserves unrelated dangling links and regular files"
+else
+  fail "retired-link cleanup preserves unrelated dangling links and regular files"
+fi
+
 # ---- UNIT: target dir already on PATH -> no PATH warning ----
 D_ONPATH=$(mktemp -d)
 ERR_ON=$(PATH="$D_ONPATH:$PATH" bash "$INSTALL" --dir "$D_ONPATH" 2>&1 1>/dev/null) || true
@@ -90,6 +126,19 @@ if [ -f "$D_COPY/sable-note" ] && [ ! -L "$D_COPY/sable-note" ] && [ -x "$D_COPY
 else
   fail "--copy mode" "$(ls -l "$D_COPY/sable-note" 2>/dev/null)"
 fi
+if SABLE_MODE_STATE="$D_COPY/mode-state.json" "$D_COPY/sable-mode" path >/dev/null 2>&1; then
+  pass "--copy carries sable-mode's Python support-module closure"
+else
+  fail "--copy carries sable-mode's Python support-module closure" \
+    "copied sable-mode could not import its sibling modules"
+fi
+if [ -f "$D_COPY/sable_mode_store_lib.py" ] \
+  && [ -f "$D_COPY/sable_provider_lib.py" ] \
+  && [ -f "$D_COPY/sable_handoff_lib.py" ]; then
+  pass "--copy installs mode/provider/handoff support modules beside entrypoints"
+else
+  fail "--copy installs mode/provider/handoff support modules beside entrypoints"
+fi
 
 # ---- UNIT: --uninstall removes the installed tools ----
 bash "$INSTALL" --dir "$D1" --uninstall >/dev/null 2>&1 || true
@@ -97,6 +146,15 @@ if [ ! -e "$D1/sable-launch" ] && [ ! -e "$D1/sable-note" ]; then
   pass "--uninstall removes the installed tools"
 else
   fail "--uninstall" "still present: $(ls "$D1" 2>/dev/null)"
+fi
+
+bash "$INSTALL" --dir "$D_COPY" --uninstall >/dev/null 2>&1 || true
+if [ ! -e "$D_COPY/sable-mode" ] \
+  && [ ! -e "$D_COPY/sable_mode_store_lib.py" ] \
+  && [ ! -e "$D_COPY/sable_handoff_lib.py" ]; then
+  pass "--uninstall removes copied Python support modules"
+else
+  fail "--uninstall removes copied Python support modules"
 fi
 
 # ---- UNIT: --dry-run writes nothing ----

@@ -13,7 +13,6 @@ landed in the repo).
 import importlib.util
 import json
 import subprocess
-import sys
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -101,6 +100,21 @@ def test_build_manifest_installed_paths_match_install_layout(tmp_path):
     assert by_category["registry"] == claude_dir / "sable" / "agents.yaml"
     assert by_category["manager roles"] == claude_dir / "sable" / "roles" / "tarzan.md"
     assert by_category["skill:columbo"] == claude_dir / "skills" / "columbo" / "SKILL.md"
+
+
+def test_build_manifest_omits_repo_runnable_only_observer_hooks(tmp_path):
+    repo, claude_dir = make_repo(tmp_path)
+    for name in doctor.REPO_RUNNABLE_ONLY_HOOKS:
+        (repo / "hooks" / "multi-manager" / name).write_text(
+            "#!/bin/sh\nexit 0\n")
+
+    entries = doctor.build_manifest(repo, claude_dir)
+    multi_manager_sources = {
+        src.name for category, src, _dst in entries
+        if category == "multi-manager hooks"
+    }
+
+    assert multi_manager_sources == {"post-push-merge-notify.sh"}
 
 
 def test_build_manifest_only_installs_the_four_manager_roles(tmp_path):
@@ -423,7 +437,8 @@ def test_quiet_mode_guarded_pinned_bin_does_not_recommend_install_sh(tmp_path, c
     assert captured.out == ""
 
 
-def test_quiet_mode_unguarded_drift_still_recommends_install_sh(tmp_path, capsys):
+def test_quiet_mode_unguarded_drift_reports_without_prescribing_install_sh(
+        tmp_path, capsys):
     def mutate(repo, claude_dir):
         (claude_dir / "hooks" / "tdd-gate.sh").write_text("tampered\n")
 
@@ -435,7 +450,22 @@ def test_quiet_mode_unguarded_drift_still_recommends_install_sh(tmp_path, capsys
     captured = capsys.readouterr()
     assert rc == 1
     assert captured.out == ""
-    assert "bash install.sh" in captured.err
+    assert "ordinary files: 1" in captured.err
+    assert "run `sable-doctor` for detail" in captured.err
+    assert "bash install.sh" not in captured.err
+
+
+def test_quiet_drift_summary_separates_all_category_counts():
+    summary = doctor.quiet_drift_summary([
+        {"category": "hooks"},
+        {"category": "pinned bins"},
+        {"category": "pinned snapshot bins"},
+    ])
+
+    assert "ordinary files: 1" in summary
+    assert "pinned bins: 1" in summary
+    assert "snapshot-pinned bins: 1" in summary
+    assert "bash install.sh" not in summary
 
 
 # --- resolve_claude_dir ---------------------------------------------------------
@@ -513,6 +543,23 @@ def test_main_returns_zero_and_prints_clean_when_matching(tmp_path, capsys):
     assert "clean" in out
 
 
+def test_clean_verdict_names_the_roots_compared(tmp_path, capsys):
+    repo, claude_dir = make_repo(tmp_path)
+    bin_dir = tmp_path / "installed-bin"
+
+    rc = doctor.main([
+        "--repo", str(repo),
+        "--claude-dir", str(claude_dir),
+        "--bin-dir", str(bin_dir),
+    ])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert f"manifest install root: {claude_dir.resolve()}" in out
+    assert f"pinned-bin root: {bin_dir.resolve()}" in out
+    assert "no other .claude install roots are in the manifest." in out
+
+
 def test_main_returns_one_and_reports_drift(tmp_path, capsys):
     def mutate(repo, claude_dir):
         (claude_dir / "hooks" / "tdd-gate.sh").write_text("tampered\n")
@@ -524,6 +571,27 @@ def test_main_returns_one_and_reports_drift(tmp_path, capsys):
     assert "DRIFT DETECTED" in out
     assert "tdd-gate.sh" in out
     assert "bash install.sh" in out
+
+
+def test_drift_verdict_also_names_the_roots(tmp_path, capsys):
+    def mutate(repo, claude_dir):
+        (claude_dir / "hooks" / "tdd-gate.sh").write_text("tampered\n")
+
+    repo, claude_dir = make_repo(tmp_path, mutate=mutate)
+    bin_dir = tmp_path / "installed-bin"
+
+    rc = doctor.main([
+        "--repo", str(repo),
+        "--claude-dir", str(claude_dir),
+        "--bin-dir", str(bin_dir),
+    ])
+    out = capsys.readouterr().out
+
+    assert rc == 1
+    assert "DRIFT DETECTED" in out
+    assert f"manifest install root: {claude_dir.resolve()}" in out
+    assert f"pinned-bin root: {bin_dir.resolve()}" in out
+    assert "no other .claude install roots are in the manifest." in out
 
 
 def test_main_json_output_is_valid_and_matches_status(tmp_path, capsys):
@@ -539,6 +607,42 @@ def test_main_json_output_is_valid_and_matches_status(tmp_path, capsys):
     missing = [r for r in payload["results"] if r["status"] == "missing"]
     assert len(missing) == 1
     assert missing[0]["category"] == "agent definitions"
+
+
+def test_main_json_names_the_roots_compared(tmp_path, monkeypatch, capsys):
+    repo, claude_dir = make_repo(tmp_path)
+    bin_dir = tmp_path / "installed-bin"
+    cwd = tmp_path / "consumer"
+    home = tmp_path / "home"
+    cwd.mkdir()
+    home.mkdir()
+    monkeypatch.chdir(cwd)
+    monkeypatch.setenv("HOME", str(home))
+
+    rc = doctor.main([
+        "--repo", str(repo),
+        "--claude-dir", str(claude_dir),
+        "--bin-dir", str(bin_dir),
+        "--json",
+    ])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    assert payload["scope"] == {
+        "manifest": {
+            "install_root": str(claude_dir.resolve()),
+            "pinned_bin_root": str(bin_dir.resolve()),
+            "other_claude_install_roots_included": False,
+        },
+        "shadowed_role_cards": {
+            "project_roles_root": str(
+                (cwd / ".claude" / "sable" / "roles").resolve()
+            ),
+            "user_roles_root": str(
+                (home / ".claude" / "sable" / "roles").resolve()
+            ),
+        },
+    }
 
 
 def test_main_quiet_suppresses_output_when_clean(tmp_path, capsys):
@@ -560,7 +664,31 @@ def test_main_quiet_prints_one_line_to_stderr_when_drifted(tmp_path, capsys):
     assert rc == 1
     assert captured.out == ""
     assert "drifted" in captured.err
-    assert "bash install.sh" in captured.err
+    assert "ordinary files: 1" in captured.err
+    assert "bash install.sh" not in captured.err
+
+
+def test_scope_line_survives_the_sessionstart_summary_path(tmp_path, capsys):
+    def mutate(repo, claude_dir):
+        (claude_dir / "hooks" / "tdd-gate.sh").write_text("tampered\n")
+
+    repo, claude_dir = make_repo(tmp_path, mutate=mutate)
+    bin_dir = tmp_path / "installed-bin"
+
+    rc = doctor.main([
+        "--repo", str(repo),
+        "--claude-dir", str(claude_dir),
+        "--bin-dir", str(bin_dir),
+        "--quiet",
+    ])
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    assert captured.out == ""
+    assert f"manifest install root: {claude_dir.resolve()}" in captured.err
+    assert f"pinned-bin root: {bin_dir.resolve()}" in captured.err
+    assert "no other .claude install roots are in the manifest." in captured.err
+    assert len(captured.err.splitlines()) == 1
 
 
 # --- worker cap line (SABLE-61dy) ----------------------------------------------
@@ -661,6 +789,24 @@ def pin_snapshot(tmp_path, repo, bin_dir, sha, bin_dir_dest, *, tamper=False):
 def test_python_sibling_importing_bins_detects_only_the_importer(tmp_path):
     repo, bin_dir, _sha = make_snapshot_repo(tmp_path)
     assert doctor.python_sibling_importing_bins(repo) == ["sable-importer"]
+
+
+def test_build_manifest_classifies_all_bins_through_one_process_boundary(tmp_path, monkeypatch):
+    repo, _bin_dir, _sha = make_snapshot_repo(tmp_path)
+    real_run = doctor.subprocess.run
+    classifier_commands = []
+
+    def recording_run(command, *args, **kwargs):
+        if command[:2] == ["bash", str(repo / "bin" / "sable-bin-install")]:
+            classifier_commands.append(command)
+        return real_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(doctor.subprocess, "run", recording_run)
+    doctor.build_manifest(repo, tmp_path / "claude", tmp_path / "local-bin")
+
+    assert classifier_commands == [
+        ["bash", str(repo / "bin" / "sable-bin-install"), "--classify-all"],
+    ]
 
 
 def test_build_manifest_includes_pinned_snapshot_bins_category(tmp_path):
@@ -1650,6 +1796,14 @@ def test_main_json_includes_shadowed_role_cards_and_flips_clean_false(tmp_path, 
     assert rc == 1
     assert payload["clean"] is False
     assert payload["shadowed_role_cards"][0]["role"] == "chuck"
+    assert payload["scope"]["shadowed_role_cards"] == {
+        "project_roles_root": str(
+            (cwd / ".claude" / "sable" / "roles").resolve()
+        ),
+        "user_roles_root": str(
+            (home / ".claude" / "sable" / "roles").resolve()
+        ),
+    }
 
 
 def test_main_quiet_mode_reports_shadowed_role_card(tmp_path, monkeypatch, capsys):
@@ -1667,6 +1821,9 @@ def test_main_quiet_mode_reports_shadowed_role_card(tmp_path, monkeypatch, capsy
     assert rc == 1
     assert "shadowed" in captured.err.lower()
     assert "SABLE-thx70" in captured.err
+    assert f"Shadow-role roots: {(cwd / '.claude' / 'sable' / 'roles').resolve()}" in captured.err
+    assert str((home / ".claude" / "sable" / "roles").resolve()) in captured.err
+    assert len(captured.err.splitlines()) == 1
 
 
 def test_main_quiet_mode_clean_when_no_shadow_present(tmp_path, monkeypatch, capsys):
@@ -1687,3 +1844,71 @@ def test_main_quiet_mode_clean_when_no_shadow_present(tmp_path, monkeypatch, cap
     assert rc == 0
     assert captured.out == ""
     assert captured.err == ""
+
+
+# --- Codex hook-graph execution preflight (SABLE-q9r1o) ---------------------
+
+def _write_provider_state(path: Path, provider: str):
+    path.write_text(json.dumps({
+        "mode": "execution",
+        "providers": {
+            "optimus": provider,
+            "tarzan": provider,
+            "chuck": provider,
+            "worker": provider,
+        },
+    }))
+
+
+def test_doctor_reports_missing_codex_hook_graph_in_execution_mode(
+    tmp_path, monkeypatch, capsys
+):
+    repo, claude_dir = make_repo(tmp_path)
+    state = tmp_path / "mode.json"
+    _write_provider_state(state, "codex")
+    monkeypatch.setenv("SABLE_MODE_STATE", str(state))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / ".codex"))
+
+    rc = doctor.main(["--repo", str(repo), "--claude-dir", str(claude_dir)])
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    assert "[Codex hook graph] INVALID" in captured.out
+    assert "sable-orchestration-install --user --merge-settings" in captured.out
+
+
+def test_doctor_reports_clean_codex_hook_graph_row_in_execution_mode(
+    tmp_path, monkeypatch, capsys
+):
+    repo, claude_dir = make_repo(tmp_path)
+    state = tmp_path / "mode.json"
+    _write_provider_state(state, "codex")
+    codex_home = tmp_path / ".codex"
+    codex_home.mkdir()
+    hooks = codex_home / "hooks.json"
+    hooks.write_text('{"PreToolUse": [{}]}')
+    monkeypatch.setenv("SABLE_MODE_STATE", str(state))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    rc = doctor.main(["--repo", str(repo), "--claude-dir", str(claude_dir)])
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert f"[Codex hook graph] CLEAN {hooks}" in captured.out
+
+
+def test_doctor_all_claude_execution_map_is_silent_about_codex_hooks(
+    tmp_path, monkeypatch, capsys
+):
+    repo, claude_dir = make_repo(tmp_path)
+    state = tmp_path / "mode.json"
+    _write_provider_state(state, "claude")
+    monkeypatch.setenv("SABLE_MODE_STATE", str(state))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / ".codex"))
+
+    rc = doctor.main(["--repo", str(repo), "--claude-dir", str(claude_dir)])
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert "Codex hook graph" not in captured.out
+    assert "Codex hook graph" not in captured.err

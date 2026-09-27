@@ -215,10 +215,15 @@ PYEOF
 
 run_real_tier() {
   # $1 = "1" (red) or "0" (green); prints OUTCOME=... / DETAIL=... on stdout.
+  # This transport fixture never reads bd. Use the gate's documented
+  # subprocess seam so six real tier invocations do not each cold-initialize
+  # an unrelated host database; real BEADS_DB isolation has its own authority
+  # in test-impact-tier-serialization.sh S7 and test_promote_decision.py.
   FIXTURE_RED="$1" \
   FIXTURE_PADDING="$PADDING" \
   FIXTURE_CLAUSE_LABEL="$CLAUSE_LABEL" \
   FIXTURE_MARKER="$MARKER" \
+  SABLE_MG_BD=true \
   SABLE_MG_IMPACT_LOCK="$TMPROOT/impact-tier.lock" \
   SABLE_MG_IMPACT_WINDOW_LOG="$TMPROOT/windows.jsonl" \
     python3 "$RUNNER" "$REPO" "$SHA"
@@ -238,6 +243,7 @@ run_pass_anchor_tier() {
   FIXTURE_PADDING="$PASS_ANCHOR_PADDING" \
   FIXTURE_MARKER="$PASS_ANCHOR_MARKER" \
   FIXTURE_DETAIL="$PASS_ANCHOR_DETAIL" \
+  SABLE_MG_BD=true \
   SABLE_MG_IMPACT_LOCK="$TMPROOT/impact-tier.lock" \
   SABLE_MG_IMPACT_WINDOW_LOG="$TMPROOT/windows.jsonl" \
     python3 "$RUNNER" "$REPO" "$SHA"
@@ -255,6 +261,7 @@ run_skipcount_tier() {
   FIXTURE_SKIPPED_VALUE="$1" \
   FIXTURE_PADDING="$SKIPCOUNT_PADDING" \
   FIXTURE_MARKER="$SKIPCOUNT_MARKER" \
+  SABLE_MG_BD=true \
   SABLE_MG_IMPACT_LOCK="$TMPROOT/impact-tier.lock" \
   SABLE_MG_IMPACT_WINDOW_LOG="$TMPROOT/windows.jsonl" \
     python3 "$RUNNER" "$REPO" "$SHA"

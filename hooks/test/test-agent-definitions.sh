@@ -85,6 +85,21 @@ assert_grep "$AGENTS_DIR/rudy.md"     "SABLE_RUDY_BASE_URL"    "rudy keeps the t
 assert_grep "$AGENTS_DIR/columbo.md"  "columbo-test-spec"      "columbo keeps the test-spec bead label"
 assert_grep "$AGENTS_DIR/columbo.md"  "it.todo"                "columbo keeps the skeleton-file contract"
 
+# Columbo's portable skill and bead template forbid Python skeleton names like
+# foo.skel.test.py: pytest can discover that path but cannot import its dotted
+# module name. Every user-facing multi-manager surface must retain both halves
+# of the carve-out: the non-collectable filename and the collect-only check.
+for doc in \
+  "$AGENTS_DIR/columbo.md" \
+  "$REPO/templates/multi-manager/roles/columbo.md" \
+  "$REPO/MULTI-MANAGER-PATTERN.md" \
+  "$REPO/PERSONAL-TOOLING.md"
+do
+  label="${doc#"$REPO/"}"
+  assert_grep "$doc" 'skel_<feature-name>[.]py' "$label carries the pytest skeleton-name carve-out"
+  assert_grep "$doc" 'pytest --collect-only' "$label carries the pytest collection-validation step"
+done
+
 # --- Producers must not go idle after filing their end-of-session report bead
 # without ever replying to their spawner. victor is the confirmed repeat
 # offender (observed repeatedly in practice); assert the template carries an

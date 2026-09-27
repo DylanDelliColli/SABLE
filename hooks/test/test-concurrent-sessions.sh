@@ -74,7 +74,8 @@ REPO_B="$(make_repo)"   # → planning
 trap 'rm -f "$SABLE_AGENTS_YAML"; rm -rf "$REPO_A" "$REPO_B"' EXIT
 
 # ---------- two sessions flip independent modes concurrently ----------
-( cd "$REPO_A" && "$MODE_BIN" set execution >/dev/null 2>&1 )
+( cd "$REPO_A" && "$MODE_BIN" set execution --break-glass \
+    --reason "synthetic authority for concurrent-session test" >/dev/null 2>&1 )
 ( cd "$REPO_B" && "$MODE_BIN" set planning  >/dev/null 2>&1 )
 
 assert_eq "repo A reads its own execution mode" "execution" \

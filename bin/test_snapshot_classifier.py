@@ -25,9 +25,11 @@ functions get a tmp_path via the SABLE_MERGE_GATE_STATE seam. Real composition
 (real git, real sandboxed bd, real promote refusal) is
 hooks/test/test-snapshot-freeze.sh.
 """
+import ast
 import importlib.util
 import inspect
 import json
+import textwrap
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -344,8 +346,13 @@ def test_there_is_no_env_kill_switch_for_the_freeze():
     freeze bypass env var would have the opposite polarity and would leave no
     name attached to a bypass — the two ways out are a green snapshot or a
     recorded `sable-snapshot unfreeze`."""
-    fn = inspect.getsource(_freeze_fn())
-    code = fn.split('"""')[2]      # body only — the docstring EXPLAINS the absence
+    tree = ast.parse(textwrap.dedent(inspect.getsource(_freeze_fn())))
+    body = tree.body[0].body
+    if (body and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)):
+        body = body[1:]
+    code = ast.unparse(ast.Module(body=body, type_ignores=[]))
     assert "environ" not in code, "the freeze check reads an env var — that is a silent bypass"
     assert "getenv" not in code
 
