@@ -139,31 +139,27 @@ esac
 # ---------------------------------------------------------------------------
 # Emit helpers — the same hookSpecificOutput shape as notes-clobber-guard.sh.
 # ---------------------------------------------------------------------------
+json_escape() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//$'\n'/\\n}"
+  value="${value//$'\r'/\\r}"
+  value="${value//$'\t'/\\t}"
+  printf '%s' "$value"
+}
+
 allow_with_context() {
-  MSG="$1" python3 -c "
-import json, os
-print(json.dumps({
-    'hookSpecificOutput': {
-        'hookEventName': 'PreToolUse',
-        'permissionDecision': 'allow',
-        'additionalContext': os.environ.get('MSG', '')
-    }
-}))
-"
+  local message
+  message="$(json_escape "$1")"
+  printf '{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow", "additionalContext": "%s"}}\n' "$message"
   exit 0
 }
 
 deny_with_reason() {
-  REASON="$1" python3 -c "
-import json, os
-print(json.dumps({
-    'hookSpecificOutput': {
-        'hookEventName': 'PreToolUse',
-        'permissionDecision': 'deny',
-        'permissionDecisionReason': os.environ.get('REASON', '')
-    }
-}))
-"
+  local reason
+  reason="$(json_escape "$1")"
+  printf '{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": "%s"}}\n' "$reason"
   exit 0
 }
 

@@ -87,6 +87,11 @@ EXIT CODES (identical in both modes — one vocabulary for containment)
                      unresolved and verify by hand.
   4  COULD NOT ASSESS — the integration branch/ref does not resolve, or both
                      methods errored (bad ref, git failure).
+
+PIPELINE WARNING: the exit status is the containment contract. Piping this
+command replaces that status with the last pipeline stage's status unless the
+shell has `set -o pipefail`; run it unpiped or capture its output to a file when
+you need the verdict.
 """
 from __future__ import annotations
 
@@ -297,6 +302,11 @@ def build_parser() -> argparse.ArgumentParser:
                      "--is-ancestor argument order so the inversion behind "
                      "SABLE-gdp05 cannot be expressed, and never judges path "
                      "presence by ls-tree's exit status (SABLE-4snb4).",
+        epilog=(
+            "The exit status is the containment contract. Piping replaces "
+            "this exit status with the last pipeline stage's status; run "
+            "unpiped or use `set -o pipefail`."
+        ),
     )
     parser.add_argument("sha", nargs="?", default=None,
                          help="commit-ish to test for containment (commit mode)")

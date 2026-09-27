@@ -11,10 +11,16 @@ from __future__ import annotations
 import json
 import os
 import shlex
-import subprocess
 from collections.abc import Mapping
 from collections.abc import Sequence
 from pathlib import Path
+
+from sable_mode_store_lib import (
+    ModeStateCorrupt,
+    ModeStateMissing,
+    read_mode_state,
+    resolve_mode_state_path,
+)
 
 PROVIDER_ROLES = ("optimus", "tarzan", "chuck", "worker")
 SUPPORTED_PROVIDERS = frozenset({"claude", "codex"})
@@ -49,6 +55,65 @@ CODEX_REASONING = {
 
 class ProviderMapError(ValueError):
     """The provider map cannot describe a valid execution session."""
+
+
+CODEX_HOOK_GRAPH_REMEDY = (
+    "sable-orchestration-install --user --merge-settings"
+)
+
+
+def codex_hook_graph_path(
+    environment: Mapping[str, str] | None = None,
+) -> Path:
+    """Resolve the user-scope Codex hook graph exactly as the installer does."""
+
+    env = os.environ if environment is None else environment
+    codex_home = (env.get("CODEX_HOME") or "").strip()
+    if codex_home:
+        return Path(codex_home) / "hooks.json"
+    claude_user_dir = (env.get("CLAUDE_USER_DIR") or "").strip()
+    if claude_user_dir:
+        return Path(claude_user_dir).parent / ".codex" / "hooks.json"
+    home = (env.get("HOME") or str(Path.home())).strip()
+    return Path(home) / ".codex" / "hooks.json"
+
+
+def validate_codex_hook_graph(
+    environment: Mapping[str, str] | None = None,
+) -> Path:
+    """Fail closed unless the installed Codex hook graph is non-empty JSON."""
+
+    path = codex_hook_graph_path(environment)
+    try:
+        raw = path.read_text()
+    except FileNotFoundError as exc:
+        raise ProviderMapError(
+            f"Codex hook graph is missing at {path}; install it with: "
+            f"{CODEX_HOOK_GRAPH_REMEDY}"
+        ) from exc
+    except OSError as exc:
+        raise ProviderMapError(
+            f"Codex hook graph cannot be read at {path}: {exc}; repair it with: "
+            f"{CODEX_HOOK_GRAPH_REMEDY}"
+        ) from exc
+    if not raw.strip():
+        raise ProviderMapError(
+            f"Codex hook graph is empty at {path}; install it with: "
+            f"{CODEX_HOOK_GRAPH_REMEDY}"
+        )
+    try:
+        graph = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ProviderMapError(
+            f"Codex hook graph is malformed JSON at {path}: {exc.msg}; "
+            f"repair it with: {CODEX_HOOK_GRAPH_REMEDY}"
+        ) from exc
+    if not isinstance(graph, dict) or not graph:
+        raise ProviderMapError(
+            f"Codex hook graph is empty at {path}; install it with: "
+            f"{CODEX_HOOK_GRAPH_REMEDY}"
+        )
+    return path
 
 
 def default_provider_map() -> dict[str, str]:
@@ -129,26 +194,6 @@ def provider_for_role(state: Mapping[str, object], role: str) -> str:
     return provider_map_from_state(state)[normalized_role]
 
 
-def resolve_mode_state_path(base: str | None = None) -> Path:
-    """Mirror sable-mode's per-repository state resolution for launchers."""
-
-    override = os.environ.get("SABLE_MODE_STATE")
-    if override:
-        return Path(override)
-    cwd = base or os.getcwd()
-    try:
-        common = subprocess.run(
-            ["git", "-C", cwd, "rev-parse", "--git-common-dir"],
-            capture_output=True, text=True, check=True,
-        ).stdout.strip()
-        common_path = Path(common)
-        if not common_path.is_absolute():
-            common_path = Path(cwd) / common_path
-        return common_path.resolve().parent / ".claude/sable/state/mode-state.json"
-    except (OSError, subprocess.CalledProcessError):
-        return Path.home() / ".claude/sable/state/mode-state.json"
-
-
 def execution_provider_map(*, base: str | None = None) -> dict[str, str] | None:
     """Return active execution providers, or None outside execution mode.
 
@@ -156,11 +201,11 @@ def execution_provider_map(*, base: str | None = None) -> dict[str, str] | None:
     is an invariant violation and fails closed rather than selecting Claude.
     """
     path = resolve_mode_state_path(base)
-    if not path.exists():
-        return None
     try:
-        state = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
+        state = read_mode_state(path)
+    except ModeStateMissing:
+        return None
+    except ModeStateCorrupt as exc:
         raise ProviderMapError(
             f"cannot read execution provider map from {path}: {exc}"
         ) from exc
@@ -213,8 +258,23 @@ def interactive_command(
     claude_permission: str = "--permission-mode bypassPermissions",
     cwd: str | None = None,
     add_dirs: Sequence[str] = (),
+    writable_roots: Sequence[str] = (),
 ) -> str:
-    """Shell command for a persistent interactive provider TUI."""
+    """Shell command for a persistent interactive provider TUI.
+
+    ``writable_roots`` is CODEX-ONLY and exists for one reason: Codex's
+    workspace-write sandbox treats ``.git`` as read-only even though it lives
+    inside the workspace — a separate exclusion from the workspace root itself,
+    proven by probe (granting an unrelated root leaves ``.git`` blocked;
+    naming it explicitly unblocks it). Without a grant, ``git fetch`` fails on
+    FETCH_HEAD and no worker can self-push (SABLE-82k8m).
+
+    Callers pass the roots rather than having them derived here, because the
+    correct root is the git COMMON dir, not ``<cwd>/.git``: a worker runs in a
+    LINKED WORKTREE where ``.git`` is a file and the real git dir lives under
+    the main repo. Resolving that needs repo context this function
+    deliberately does not have.
+    """
 
     normalized = normalize_provider(provider)
     model, reasoning = provider_model(normalized, tier)
@@ -228,6 +288,9 @@ def interactive_command(
         "--config", "sandbox_workspace_write.network_access=true",
         "--config", "shell_environment_policy.inherit=all",
     ]
+    if writable_roots:
+        roots = ",".join(f'"{path}"' for path in writable_roots)
+        argv += ["--config", f"sandbox_workspace_write.writable_roots=[{roots}]"]
     if cwd:
         argv += ["--cd", cwd]
     for path in add_dirs:

@@ -190,7 +190,9 @@ else
 
   MAIN="$SCRATCH_ROOT/main"
   mkdir -p "$MAIN"
-  ( cd "$MAIN" && BD_NON_INTERACTIVE=1 bd init --prefix=wpg \
+  # -u BEADS_DB (SABLE-sx1rb): never inherit an ambient BEADS_DB (e.g. the
+  # impact tier's own) — this suite builds and must use its OWN isolated DB.
+  ( cd "$MAIN" && env -u BEADS_DB BD_NON_INTERACTIVE=1 bd init --prefix=wpg \
       --non-interactive --skip-agents --skip-hooks --quiet >/dev/null 2>&1 )
   git -C "$MAIN" config user.email a@b.com
   git -C "$MAIN" config user.name a

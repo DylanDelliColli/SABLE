@@ -257,7 +257,9 @@ fi
 # sandbox DB; the assertions below prove the live repo DB never gained a bead.
 if command -v bd >/dev/null 2>&1; then
   SCRATCH_BEADS_DIR="$(mktemp -d)"
-  ( cd "$SCRATCH_BEADS_DIR" && BD_NON_INTERACTIVE=1 bd init --prefix=sbx \
+  # -u BEADS_DB (SABLE-sx1rb): never inherit an ambient BEADS_DB (e.g. the
+  # impact tier's own) — this suite builds and must use its OWN isolated DB.
+  ( cd "$SCRATCH_BEADS_DIR" && env -u BEADS_DB BD_NON_INTERACTIVE=1 bd init --prefix=sbx \
       --non-interactive --skip-agents --skip-hooks --quiet >/dev/null 2>&1 )
 
   tmux_spawn_ new-window -d -t w: -n stuck 'sleep 60'
@@ -313,13 +315,19 @@ if command -v bd >/dev/null 2>&1; then
   # concurrent bead cannot match BOTH, so this is immune to fleet activity
   # rather than merely unlikely to collide.
   #
-  # Derive the title from bin/sable-msg ITSELF rather than hand-typing it.
+  # Derive the stable title prefix from bin/sable-msg ITSELF rather than
+  # hand-typing it.
   # Hand-typing a format another file owns is what broke the first attempt at
   # this fix: the real title interpolates the FRAMED message (see
   # format_message), so the framing sits between the role and the body and a
   # guessed "...to chuck: sandbox fallback probe" matched nothing —
   # --title-contains then returned 0 unconditionally and the assertion could
-  # not fail. Control (b) below exists to catch precisely that relapse.
+  # not fail. `format_message` now carries a required per-send timestamp, so
+  # reconstructing the whole framed value after the send would be both stale
+  # and nondeterministic. `message_identity` is the production-owned stable
+  # prefix of that frame; passing it through the production title composer
+  # yields a prefix of the real bead title. Control (b) below exists to catch
+  # a non-matching derivation.
   fallback_title="$(SABLE_FIXTURE_BODY="$FIXTURE_BODY" python3 - "$BIN" <<'PY'
 import importlib.util, os, sys
 from importlib.machinery import SourceFileLoader
@@ -327,8 +335,8 @@ loader = SourceFileLoader("sable_msg", os.path.join(sys.argv[1], "sable-msg"))
 spec = importlib.util.spec_from_loader("sable_msg", loader)
 mod = importlib.util.module_from_spec(spec)
 loader.exec_module(mod)
-framed = mod.format_message("lincoln", "chuck", os.environ["SABLE_FIXTURE_BODY"])
-print(mod.fallback_bead_title("chuck", framed), end="")
+identity = mod.message_identity("lincoln", "chuck", os.environ["SABLE_FIXTURE_BODY"])
+print(mod.fallback_bead_title("chuck", identity), end="")
 PY
 )"
   if [ -n "$fallback_title" ] && [ "$fallback_title" != "${fallback_title#*$FIXTURE_BODY}" ]; then
@@ -371,7 +379,9 @@ PY
   # Run against a throwaway "pretend-live" DB — simulating fleet activity by
   # writing to the REAL live DB is the very pollution this leg forbids.
   PRETEND_LIVE_DIR="$(mktemp -d)"
-  ( cd "$PRETEND_LIVE_DIR" && BD_NON_INTERACTIVE=1 bd init --prefix=plv \
+  # -u BEADS_DB (SABLE-sx1rb): never inherit an ambient BEADS_DB (e.g. the
+  # impact tier's own) — this suite builds and must use its OWN isolated DB.
+  ( cd "$PRETEND_LIVE_DIR" && env -u BEADS_DB BD_NON_INTERACTIVE=1 bd init --prefix=plv \
       --non-interactive --skip-agents --skip-hooks --quiet >/dev/null 2>&1 )
   PRETEND_LIVE_DB="$PRETEND_LIVE_DIR/.beads"
 

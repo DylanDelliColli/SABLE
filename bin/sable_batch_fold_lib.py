@@ -174,10 +174,15 @@ def push_batch_ref(repo: str, remote: str, base_sha: str, members: list[FoldMemb
 
     Returns (tip_sha, ref). Raises GateError(22) via fold_chain on any
     conflicting member — nothing is pushed when the fold itself fails."""
-    member_shas = [m.sha for m in members]
+    # setkey is order-independent, so the object standing on that ref must be
+    # order-independent too.  Otherwise the same ref name can describe two
+    # different fold chains depending on caller order.  Canonicalize once at
+    # the push boundary; fold_chain remains an explicitly ordered primitive.
+    canonical = sorted(members, key=lambda member: member.sha)
+    member_shas = [m.sha for m in canonical]
     key = batch_key.setkey(base_sha, member_shas)
     ref = classify.preview_ref_name("batch", key)
-    result = fold_chain(repo, base_sha, members)
+    result = fold_chain(repo, base_sha, canonical)
     git_lib._git(repo, "push", git_lib.resolve_remote_url(repo, remote),
                  f"{result.tip}:refs/heads/{ref}")
     return (result.tip, ref)

@@ -10,7 +10,7 @@ bounce-on-dangling stopgap. Both fleets adopt this one helper.
 
 Three layers, one helper:
 
-  1. FILESYSTEM LOCK at ~/.claude/sable/dolt-push.lock carrying fleet-id + pid +
+  1. FILESYSTEM LOCK at /tmp/sable-<uid>/dolt-push.lock carrying fleet-id + pid +
      timestamp. Acquired before the push, deleted after. A second acquirer waits
      (default up to the TTL) and then fails cleanly rather than interleaving. A
      lock older than the TTL (default 10 min) is treated as stale and broken —
@@ -54,7 +54,10 @@ Usage:
   sable-dolt-push --help
 
 Environment seams (all overridable; the defaults are the production commands):
-  SABLE_DOLT_PUSH_LOCK   lock file path (default ~/.claude/sable/dolt-push.lock)
+  SABLE_DOLT_PUSH_LOCK   lock file path (default /tmp/sable-<uid>/dolt-push.lock;
+                         host-global so it serializes across fleets, and under
+                         /tmp so a Codex workspace-write sandbox can write it —
+                         see default_lock_path for why both matter)
   SABLE_FLEET_ID         fleet id recorded in the lock (default: hostname)
   SABLE_DOLT_LOCK_TTL    stale-break TTL, seconds (default 600)
   SABLE_DOLT_LOCK_WAIT   max wait for a held lock, seconds (default 600)
@@ -122,13 +125,38 @@ class LockContention(Exception):
 
 # --- lock path / fleet-id resolution ----------------------------------------
 
-def default_lock_path(env=None) -> str:
+def default_lock_path(env=None, uid=None) -> str:
+    """Where the cross-fleet push lock lives.
+
+    TWO CONSTRAINTS, and they pull in opposite directions (SABLE-82k8m):
+
+      HOST-GLOBAL. This lock serializes dolt pushes across SEPARATE fleets
+      sharing ONE beads remote (SABLE-ipcf, after the 2026-07-09 cross-fleet
+      corruption). It must NOT be repo- or cwd-derived: per-repo locks mean no
+      mutual exclusion between fleets, which is the corruption itself.
+
+      SANDBOX-WRITABLE. It used to live under ~/.claude, which Codex's
+      workspace-write sandbox makes read-only, so a Codex seat could not create
+      it at all and every push died on OSError 30. Probed against the real
+      sandbox: /tmp is writable, while ~/.claude/sable, /var/tmp and
+      XDG_RUNTIME_DIR are all blocked. /tmp is the only candidate satisfying
+      both constraints without widening the sandbox grant.
+
+    Ephemerality is correct here rather than merely tolerable: the lock carries
+    a stale-break TTL, so a lock surviving a reboot would be a bug, not a
+    feature.
+
+    UID-SCOPED because /tmp is world-writable with a sticky bit — a fixed
+    well-known name is squattable by any other user on the host, which would
+    hijack or deny the fleet's push lock. acquire_lock creates the parent 0700.
+    """
     env = os.environ if env is None else env
     override = env.get("SABLE_DOLT_PUSH_LOCK")
     if override:
         return override
-    home = env.get("HOME", "")
-    return os.path.join(home, ".claude", "sable", "dolt-push.lock")
+    if uid is None:
+        uid = os.getuid()
+    return os.path.join("/tmp", f"sable-{uid}", "dolt-push.lock")
 
 
 def resolve_fleet_id(env=None) -> str:
@@ -220,7 +248,13 @@ def acquire_lock(path, fleet, pid=None, *, ttl=LOCK_TTL_DEFAULT,
     """
     if pid is None:
         pid = os.getpid()
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    # 0700: the default lock now lives under /tmp, which is world-writable with
+    # a sticky bit. Without this the uid-scoped directory would still be
+    # writable by any other user on the host, defeating the point of scoping it
+    # (SABLE-82k8m). mode applies only on CREATION — a pre-existing directory
+    # keeps its permissions, which is deliberate: silently chmod-ing a
+    # directory we may not own is worse than leaving it alone.
+    os.makedirs(os.path.dirname(path) or ".", mode=0o700, exist_ok=True)
     deadline = now_fn() + wait
     while True:
         now = now_fn()

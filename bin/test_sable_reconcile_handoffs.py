@@ -898,6 +898,28 @@ def test_find_work_bead_status_still_resolves_through_the_shared_resolver(monkey
     assert smrh.find_work_bead_status("/repo", "wk-x") == "closed"
 
 
+def test_one_branch_resolution_shares_the_bd_read_across_all_three_views(monkeypatch):
+    calls = []
+    record = _bead(
+        status="closed", hold="wait", by="tarzan",
+        since=_iso_days_ago(1), until="partner lands",
+    )
+    record["metadata"]["serialize_kind"] = "land-together"
+    record["metadata"]["serialize_with"] = "SABLE-peer"
+
+    def fake_bd(repo, *args, check=False):
+        calls.append(args)
+        return _cp(args, 0, json.dumps([record]))
+
+    monkeypatch.setattr(smrh, "_bd", fake_bd)
+    with smrh.one_branch_work_bead_resolution():
+        assert smrh.find_work_bead_hold("/repo", "wk-x")["reason"] == "wait"
+        assert smrh.find_work_bead_matched_pair("/repo", "wk-x")["with"] == "SABLE-peer"
+        assert smrh.find_work_bead_status("/repo", "wk-x") == "closed"
+
+    assert len(calls) == 1, calls
+
+
 # --- a hold must decay LOUDLY, never silently ------------------------------
 
 def test_hold_review_flags_clean_hold_has_none():

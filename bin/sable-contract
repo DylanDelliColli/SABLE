@@ -25,11 +25,14 @@
 # interlock blocks work on them — so writing carries no SABLE_ORCHESTRATION gate.
 #
 # Usage:
-#   sable-contract add "<text>"    Append a contract line (timestamped).
-#   sable-contract set "<text>"    Replace the surface with a single contract.
-#   sable-contract clear           Remove the surface file.
-#   sable-contract show            Print the surface; nonzero if empty/absent.
-#   sable-contract path            Print the resolved surface path (no state needed).
+#   sable-contract add "<text>"           Append a contract line (timestamped).
+#   sable-contract set "<text>"           Replace the surface. REFUSES when the
+#                                         surface is non-empty (SABLE-wx048) —
+#                                         a mode flip wants `add`, not `set`.
+#   sable-contract set --force "<text>"   Deliberately replace a non-empty surface.
+#   sable-contract clear                  Remove the surface file.
+#   sable-contract show                   Print the surface; nonzero if empty/absent.
+#   sable-contract path                   Print the resolved surface path.
 #   sable-contract --help
 
 set -eu
@@ -90,11 +93,14 @@ usage() {
 sable-contract — read/write the SABLE active-contracts surface.
 
 Usage:
-  sable-contract add "<text>"    Append a contract line (timestamped).
-  sable-contract set "<text>"    Replace the surface with a single contract.
-  sable-contract clear           Remove the surface file.
-  sable-contract show            Print the surface; nonzero exit if empty/absent.
-  sable-contract path            Print the resolved surface path (no state needed).
+  sable-contract add "<text>"           Append a contract line (timestamped).
+  sable-contract set "<text>"           Replace the surface. REFUSES (exit 3) when
+                                        the surface is already non-empty — a mode
+                                        flip wants 'add'; see SABLE-wx048.
+  sable-contract set --force "<text>"   Deliberately replace a non-empty surface.
+  sable-contract clear                  Remove the surface file.
+  sable-contract show                   Print the surface; nonzero exit if empty/absent.
+  sable-contract path                   Print the resolved surface path (no state needed).
   sable-contract --help
 
 The surface is read at SessionStart by session-role-anchor.sh and injected into
@@ -126,10 +132,31 @@ case "$cmd" in
         cat "$STATE"
         ;;
     add|set)
+        force=0
         text="${2:-}"
+        if [ "$cmd" = "set" ] && [ "$text" = "--force" ]; then
+            force=1
+            text="${3:-}"
+        fi
         if [ -z "$text" ]; then
             printf 'sable-contract: %s requires <text>\n' "$cmd" >&2
             exit 2
+        fi
+        # SABLE-wx048: `set` TRUNCATES, and /sable-execute prescribed it as the FIRST
+        # call of the mode-flip choreography — so every flip silently erased everything
+        # accumulated since the last one. Measured 2026-07-30: one flip destroyed 25 of
+        # 29 committed lines of operator doctrine, including an entry marked BINDING ON
+        # EVERY INCOMING LINCOLN. The content survived only because SABLE-ztks1 makes
+        # this one file git-tracked, which is luck the mechanism must not depend on.
+        # A durable-state surface whose prescribed first call erases its own history is
+        # a durable-state surface with scheduled amnesia. `add` is the verb a flip
+        # wants; destroying accumulated contracts must be chosen on purpose.
+        if [ "$cmd" = "set" ] && [ "$force" -eq 0 ] && [ -s "$STATE" ]; then
+            printf 'sable-contract: refusing to overwrite %s existing contract line(s) at %s\n' \
+                "$(grep -c '^- ' "$STATE" 2>/dev/null || printf '?')" "$STATE" >&2
+            printf '  Use: sable-contract add "<text>"            to append (what a mode flip wants)\n' >&2
+            printf '  Or:  sable-contract set --force "<text>"    to deliberately replace the surface\n' >&2
+            exit 3
         fi
         mkdir -p "$(dirname "$STATE")"
         ts="$(date +%Y-%m-%dT%H:%M:%S%z)"

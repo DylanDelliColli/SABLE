@@ -70,14 +70,18 @@ There is **one install** — no tiers, no topology choices. It:
 3. Copies the base hook scripts into `~/.claude/hooks/`
 4. Copies the producer agent definitions into `~/.claude/agents/`
 5. Installs the orchestration layer (multi-manager hooks, `agents.yaml`
-   registry, the four pane role files, the SABLE skills) and auto-merges its
-   settings snippet (backed up; existing entries preserved)
+   registry, the four pane role files, the SABLE skills) and prints the exact
+   settings additions/removals/modifications without applying them. The Codex
+   proposal composes the same base TDD/bead gates with the orchestration graph
+   in one atomic settings update.
 6. Prepends the SABLE Prime Directives to `~/.claude/CLAUDE.md` (with a timestamped backup if one already exists)
-7. Prints the base-hook JSON snippet you paste into `~/.claude/settings.json`
-   (does NOT auto-edit that block — you review and paste). The orchestration
-   installer also merges its Claude-style lifecycle hooks into
-   `~/.codex/hooks.json`, so Codex manager/worker panes receive the same
-   shell-command guardrails. The snippet includes the
+7. Prints the Claude base-hook JSON snippet you paste into
+   `~/.claude/settings.json` (does NOT auto-edit that block — you review and
+   paste). After reviewing the proposal, rerun
+   `bash install.sh --merge-settings` to apply orchestration rows to
+   `~/.claude/settings.json` and the complete base + orchestration graph to
+   `~/.codex/hooks.json`; changed files are preserved in named timestamped
+   snapshot directories. The base graph includes the
    `sable-doctor --quiet` SessionStart drift-warn.
 8. Stages (never activates) the reconciliation-floor host timer artifacts under `~/.claude/sable/reconcile-timer/` — activation is a deliberate operator step: one command, `sable-reconcile-timer --install-schedule`, which installs the units *and* verifies afterwards that a schedule really fires (exit 3 if not). By default it sweeps the repo you installed from; set `SABLE_RECONCILE_TARGET_REPO=<repo>[:<repo>...]` before installing to name other fleets, since a timer that sweeps one repo leaves every other fleet on the host unprotected while looking installed (SABLE-5xz68).
 
@@ -113,7 +117,10 @@ After reading, confirm in one short message that you understand and will follow:
    integration tests. Mocking the database in integration tests defeats the purpose.
    Smoke tests are encouraged but not gated.
 3. Issue Discovery: the moment you notice any bug, smell, or unexpected
-   behavior — even tangential to the current task — log a bead immediately.
+   behavior — even tangential to the current task — capture it with
+   `sable-note` before moving on. Captures become beads only through an
+   operator-invoked `/sable-review`, never at reflex speed. The one
+   exception: a defect blocking work in flight gets a bead immediately.
 4. Adoption stage: I am at the [Foundation | Hierarchy | Swarm] stage today.
    Default to single-agent sequential work unless I explicitly ask for swarm
    execution OR I've told you I'm at the Swarm stage. The full methodology
@@ -155,10 +162,14 @@ If `bd close` succeeded the first time without asking for tests, the hooks aren'
 The three-step install above is **global** — it writes hooks, skills, and the Prime Directives into your `~/.claude`, so every project on the machine inherits SABLE. If instead you want SABLE **committed into a single repository** — so teammates get the exact same hooks and skills the moment they clone, with nothing to install into their home directory — use the project scope:
 
 ```bash
-bash install.sh --project=/path/to/your/project
+bash install.sh --project=/path/to/your/project --merge-settings
 ```
 
-Run it from inside the repo and you can drop the path: `install.sh --project` defaults to the current repo's root, resolved through the shared git dir so it works from any linked worktree.
+`--merge-settings` is the explicit consent that creates the committed,
+portable hook registrations. Omit it first if you want to review the exact
+proposal, then rerun with it. From inside the repo you can drop the path:
+`install.sh --project --merge-settings` defaults to the current repo's root,
+resolved through the shared git dir so it works from any linked worktree.
 
 Project scope is **hybrid**, by design:
 
@@ -212,36 +223,46 @@ The install already put in place:
 - `~/.claude/skills/` — the SABLE slash commands (`/sable-plan`, `/sable-execute`,
   `/gaudi`, `/columbo`, `/audit-deep-dive`, `/sable-review`), installed by their
   skill name.
-- The settings snippet, **merged into `~/.claude/settings.json`
-  automatically** (backed up first; existing entries preserved).
+- The exact settings proposal, printed without changing either live settings
+  file. Apply it deliberately with `bash install.sh --merge-settings` after
+  review; existing entries are preserved, changed files are snapshotted, and
+  `~/.codex/hooks.json` receives both the base gates and orchestration hooks in
+  one update.
 - The producer agent definitions in `~/.claude/agents/`.
 
-**Restart Claude Code** after installing so the agent definitions, slash
-commands, and hook registrations load. Lost? `sable --help` prints the whole
-operator map.
+**Restart Claude Code and any open Codex sessions** after installing so the
+agent definitions, slash commands, and hook registrations load. Lost?
+`sable --help` prints the whole operator map.
 
 **Verify orchestration:**
 
 ```bash
 ls ~/.claude/hooks/multi-manager/        # governance hooks present
 head -1 ~/.claude/sable/agents.yaml      # registry present
+grep -E 'tdd-gate|mode-interlock' ~/.codex/hooks.json  # Codex base + orchestration hooks
 sable-mode get                           # mode-state helper resolves (planning|execution)
 sable-mode providers get                 # frozen execution provider map
 ```
 
-Execution defaults to Claude everywhere. To run a mixed interactive fleet,
-freeze the provider map before launching managers:
+Execution defaults to Claude everywhere. After `/sable-plan` records its final
+human-approved handoff receipt, `/sable-execute` can freeze a mixed interactive
+fleet provider map before launching managers:
 
 ```bash
+# Requires the fresh receipt created by sable-mode handoff approve.
 sable-mode set execution --fleet optimus,tarzan,chuck \
-  --providers optimus=claude,tarzan=codex,chuck=claude,worker=codex
+  --providers optimus=codex,tarzan=codex,chuck=codex,worker=codex
 sable-spawn-manager --all
 ```
 
-Managers may use different providers; every worker uses the single `worker`
-provider for that execution session. SABLE launches Codex as a persistent TUI,
-not `codex exec`, and `sable-msg` routes manager/worker messages by tmux pane
-identity regardless of provider.
+Lincoln remains the Claude Code control pane; the provider map above places
+every manager and worker under Codex. Managers may instead use different
+providers, while every worker uses the single `worker` provider for that
+execution session. SABLE launches Codex as a persistent TUI, not `codex exec`,
+and `sable-msg` routes manager/worker messages by tmux pane identity regardless
+of provider. Direct execution without a receipt refuses; the explicit
+emergency path is `sable-mode set execution --break-glass --reason "..."`,
+which persists the bypass instead of silently weakening the handoff.
 
 The mode is **per-repo** — `sable-mode` resolves the state file from the repo you
 are in (`<repo>/.claude/sable/state/mode-state.json`, shared across that repo's

@@ -88,10 +88,10 @@ def test_ownership_separates_the_two_hook_installers(repo, roots):
 
     assert [s.installer for s in base] == [debt.BASE_INSTALL]
     assert [s.installer for s in orch] == [debt.ORCHESTRATION_INSTALL]
-    # The authorization column, not just the tool name: install.sh's larger
-    # blast radius is the operator-facing difference.
-    assert "settings.json" in base[0].authorization
-    assert "install.sh:414" in base[0].authorization
+    # The authorization column, not just the tool name: artifact installation
+    # and settings activation have different consent boundaries.
+    assert "manual paste" in base[0].authorization
+    assert "--merge-settings" in orch[0].authorization
 
 
 def test_multi_manager_rule_wins_over_the_generic_hook_rule(repo, roots):
@@ -511,7 +511,7 @@ def test_report_names_the_discharging_tool_and_its_authorization(roots):
     text = debt.format_ledger_report(debt.discharge_scan([obligation]))
 
     assert "install.sh" in text
-    assert "install.sh:414" in text
+    assert "manual paste" in text
     assert "grep -c -F -e" in text
     assert "SABLE-z95e2" in text
     # The report states its own bound, so an empty ledger cannot be read as a

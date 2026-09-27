@@ -261,6 +261,13 @@ def test_parser_has_no_flag_to_name_the_base_ref_positionally():
     assert args.integration_branch == "main"
 
 
+def test_help_warns_that_piping_masks_the_containment_exit_status():
+    help_text = sc.build_parser().format_help()
+
+    assert "piping replaces this exit status" in help_text.lower()
+    assert "set -o pipefail" in help_text
+
+
 # --- main(): exit codes and could-not-assess path -----------------------------
 
 def test_main_exit_code_contained(tmp_path, capsys):

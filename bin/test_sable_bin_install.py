@@ -87,6 +87,20 @@ def run_install(bin_dir, dest, *extra_args, env=None):
 
 # --- import-check classifier (--classify) --------------------------------------
 
+def test_classify_all_reports_every_tool_in_one_machine_readable_stream(tmp_path):
+    _repo, bin_dir = make_fixture_repo(tmp_path)
+    result = run_install(bin_dir, tmp_path / "dest", "--classify-all")
+    assert result.returncode == 0, result.stderr
+
+    shapes = dict(line.split("\t", 1) for line in result.stdout.splitlines())
+    assert shapes == {
+        "sable-bin-install": "plain",
+        "sable-importer": "snapshot",
+        "sable-nolib-py": "plain",
+        "sable-plain": "plain",
+    }
+
+
 def test_classify_shell_script_is_plain(tmp_path):
     repo, bin_dir = make_fixture_repo(tmp_path)
     result = run_install(bin_dir, tmp_path / "dest", "--classify", "sable-plain")
@@ -191,6 +205,40 @@ def test_classify_real_reconcile_handoffs_is_not_plain(tmp_path):
     subprocess.run(["git", "commit", "-q", "-m", "add real reconcile-handoffs"], cwd=repo, check=True)
     result = run_install(bin_dir, tmp_path / "dest", "--classify", "sable-reconcile-handoffs")
     assert result.stdout.strip() != "plain", result.stderr
+
+
+# --- --copy: entrypoints and their broad sibling-module closure ---------------
+
+def test_copy_installs_support_modules_and_importer_runs_outside_repo(tmp_path):
+    _repo, bin_dir = make_fixture_repo(tmp_path)
+    dest = tmp_path / "dest"
+    result = run_install(bin_dir, dest, "--copy")
+    assert result.returncode == 0, result.stderr
+    assert (dest / "sable_helper_lib.py").is_file()
+
+    outside_cwd = tmp_path / "elsewhere"
+    outside_cwd.mkdir()
+    run_result = subprocess.run(
+        [sys.executable, str(dest / "sable-importer")],
+        cwd=outside_cwd, capture_output=True, text=True, timeout=10,
+    )
+    assert run_result.returncode == 0, run_result.stderr
+    assert "importer ok: helper-lib-v1" in run_result.stdout
+
+
+def test_uninstall_removes_copy_support_but_preserves_unrelated_python(tmp_path):
+    _repo, bin_dir = make_fixture_repo(tmp_path)
+    dest = tmp_path / "dest"
+    result = run_install(bin_dir, dest, "--copy")
+    assert result.returncode == 0, result.stderr
+    unrelated = dest / "unrelated.py"
+    unrelated.write_text("keep = True\n")
+
+    result = run_install(bin_dir, dest, "--uninstall")
+    assert result.returncode == 0, result.stderr
+    assert not (dest / "sable_helper_lib.py").exists()
+    assert not (dest / ".sable-copy-support").exists()
+    assert unrelated.read_text() == "keep = True\n"
 
 
 # --- --pin-snapshot: versioned snapshot dir + atomic repoint --------------------

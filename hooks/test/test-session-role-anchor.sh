@@ -95,6 +95,15 @@ if printf '%s' "$out" | grep -q 'execution'; then pass "9ozz: live orchestration
 if printf '%s' "$out" | grep -q 'LIVE PROTOCOL STATE'; then pass "9ozz: live-protocol banner delimits the surface"; else fail "9ozz: live-protocol banner delimits the surface" "got: ${out:0:200}"; fi
 if printf '%s' "$out" | grep -qi 'reconcile'; then pass "9ozz: boot reconciliation instruction present"; else fail "9ozz: boot reconciliation instruction present" "got: ${out:0:300}"; fi
 
+# Present corrupt state is not the same as absent state. A restarted manager
+# must see that authorization is unavailable instead of silently receiving only
+# its historical role card.
+printf '%s' 'not-json{' > "$LS_MODE"
+out="$(cd "$LS" && printf '%s' "$SS" | SABLE_MODE_STATE="$LS_MODE" CLAUDE_AGENT_NAME=chuck CLAUDE_AGENT_ROLE=manager bash "$HOOK" 2>/dev/null)"
+if printf '%s' "$out" | grep -q 'CORRUPT STATE'; then pass "dbq9p.4: corrupt mode state is loud at manager boot"; else fail "dbq9p.4: corrupt mode state is loud at manager boot" "got: ${out:0:300}"; fi
+if printf '%s' "$out" | grep -q 'Do not dispatch or execute'; then pass "dbq9p.4: corrupt boot surface fails closed operationally"; else fail "dbq9p.4: corrupt boot surface fails closed operationally" "got: ${out:0:300}"; fi
+printf '{"mode":"execution","since":"2026-07-13T09:00:00-0700","fleet":["chuck"]}\n' > "$LS_MODE"
+
 # contracts present via SABLE_ACTIVE_CONTRACTS override, mode absent → still surfaces
 LS2="$(mktemp -d)"
 mkdir -p "$LS2/.claude/sable/roles"

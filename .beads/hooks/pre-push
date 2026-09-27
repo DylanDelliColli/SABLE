@@ -22,3 +22,15 @@ if command -v bd >/dev/null 2>&1; then
   if [ $_bd_exit -ne 0 ]; then exit $_bd_exit; fi
 fi
 # --- END BEADS INTEGRATION v1.0.0 ---
+
+# SABLE push-gate proof check. This deliberately lives OUTSIDE beads' managed
+# markers, so `bd hooks install` preserves it. Git invokes this boundary for
+# both foreground and background pushes (SABLE-fxsfw).
+_sable_hook_dir=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd)
+_sable_repo_root=$(CDPATH= cd -- "$_sable_hook_dir/../.." 2>/dev/null && pwd)
+_sable_gate="$_sable_repo_root/hooks/multi-manager/git-pre-push-attestation.sh"
+if [ ! -x "$_sable_gate" ]; then
+  echo >&2 "sable: REFUSED — push verification did not run: $_sable_gate is missing or not executable. The remote ref was not updated."
+  exit 1
+fi
+"$_sable_gate" "$@" || exit $?

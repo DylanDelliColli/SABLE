@@ -381,9 +381,8 @@ def _selected_suites(repo: str, worktree: str, paths: list[str]) -> list[str]:
 # below best-effort copies one in before invoking the selector, from either
 # of two sources, in priority order:
 #
-#   1. `repo`'s OWN root .testmondata -- CI's copy, when the checkout running
-#      the gate happens to carry one (ci-verify's testmon-cache-warm.sh warms
-#      exactly this file on the runner).
+#   1. `repo`'s OWN root .testmondata, when an operator has warmed that
+#      checkout directly.
 #   2. WARM_TESTMON_FILE under this repo's gate-owned state dir
 #      (snapshot_lib.state_dir -- shared by every worktree of this repo,
 #      resolved through git-common-dir). Chuck's own checkout is NOT
@@ -437,8 +436,7 @@ def _selected_suites(repo: str, worktree: str, paths: list[str]) -> list[str]:
 #   node ids it collected and a checksum of each test FILE (measured) -- but
 #   it can never record which files a test EXECUTES, since nothing executed.
 #   Only a genuinely-executing --testmon/--testmon-noselect run produces
-#   those coverage fingerprints, which is what warm_gate_testmon_cache and
-#   CI's testmon-cache-warm.sh are for.
+#   those coverage fingerprints, which is what warm_gate_testmon_cache is for.
 #
 # Neither existing is the genuinely-cold case, reported honestly below.
 
@@ -502,10 +500,8 @@ def _refresh_warm_testmondata(repo: str, updated: Path) -> None:
 def warm_gate_testmon_cache(repo: str) -> int:
     """Refresh the gate's persisted warm .testmondata (see the module
     comment above) by running tier_selection.py's own --cache-warm directly
-    against `repo` -- the SAME full bin/ suite + tolerant classification of
-    the known pytest-testmon extensionless-file crash that
-    .github/ci/testmon-cache-warm.sh runs on CI's ephemeral runner, just run
-    locally so a checkout that never fetches CI's own copy still gets one.
+    against `repo` -- the full bin/ suite plus tolerant classification of the
+    known pytest-testmon extensionless-file crash.
     Meant to be invoked periodically or by an operator
     (`sable-merge-gate warm-testmon-cache`) -- it pays the full bin/ suite
     itself, which is exactly the cost this bead exists to keep OFF the
@@ -1177,6 +1173,46 @@ def _bounded_failure_detail(stdout: str, limit: int = 4000) -> str:
     return f"{prefix}{excerpt[:limit]}\n[...truncated, {dropped} more char(s) omitted...]"
 
 
+_SUITE_FATAL_ABORT_RE = re.compile(r'^FATAL:', re.MULTILINE)
+
+
+def _is_suite_infra_abort(returncode: int, output: str) -> bool:
+    """True when a hooks/test/*.sh suite's non-zero exit is the SUITE'S OWN
+    fixture-setup abort, not a content test failure (SABLE-sx1rb — the
+    scratch bd DB collision that false-RED'd SABLE-r0mzn and SABLE-6eu9w).
+
+    Every suite under hooks/test/ follows one repo-wide convention — TWO
+    DISTINCT, SEPARATELY-VERIFIED measurements, not one number: bare `exit
+    2` occurs at 44 call sites (grep, `hooks/test/*.sh`), and NONE of those
+    44 sits inside a PASS/FAIL content-accounting branch (`[ "$FAIL" -gt 0
+    ] && exit N` uses exit 1 at every site, never 2) — so exit 2 is never a
+    genuine content-failure exit anywhere in the tree. Independently,
+    `FATAL: ...` self-report lines (optimus's own read, 2026-07-27: 39
+    sites) are ALL fixture/infrastructure in nature (missing files, `cd`
+    failures, clone failures, could-not-init, absent diff-cover/pytest-cov,
+    could-not-extract-bead-ids) and NONE is a content assertion. A genuine
+    content failure always goes through each suite's own PASS/FAIL loop and
+    exits 1, never 2, never via a `FATAL:` line. Requiring BOTH the code
+    and the suite's own `FATAL:` self-report — rather than trusting either
+    alone — is the same prefer-the-self-report-over-the-bare-code
+    discipline SABLE-9yjt5 landed for the coverage floor: an exit 2 without
+    a FATAL line (a future suite reusing the code for something else) reads
+    as content-attributable rather than silently swallowed as
+    infrastructure — fails toward blaming the branch, never toward
+    excusing it.
+
+    THE ASSUMPTION THIS RESTS ON, NAMED SO IT CANNOT DECAY UNEXAMINED: the
+    convention above must keep HOLDING GOING FORWARD. This function has no
+    way to distinguish "genuinely could not build its fixture" from "chose
+    to print FATAL: and exit 2 for a content reason" — it trusts the
+    convention, not the suite's intent. A future suite that prints FATAL:
+    and exits 2 for what is actually a content defect would be silently
+    excused as infrastructure, which is the ONE way this fix fails
+    permissive. Nothing enforces the convention mechanically; it holds only
+    because every site observed at fix time (2026-07-27) honors it."""
+    return returncode == 2 and bool(_SUITE_FATAL_ABORT_RE.search(output or ""))
+
+
 def run_impact_tier(repo: str, tree_sha: str, paths: list[str]) -> tuple[str, str]:
     """Run the cmar4 impact tier against the REAL COMBINED TREE, ONE AT A TIME
     PER SEAT (SABLE-jd5fj.13), and report (GREEN|RED|ERROR, detail).
@@ -1307,14 +1343,30 @@ def _impact_isolated_env(parent: str | os.PathLike) -> dict[str, str]:
     env["HOME"] = str(home)
     env["TMPDIR"] = str(scratch_tmp)
 
+    # SABLE_MG_BD is the gate's documented subprocess seam. An explicit
+    # override owns its own state (normally a deterministic test double), so
+    # discovering some unrelated host `bd` and cold-initializing a real store
+    # here violates the seam and adds seconds to every injected-tier scenario.
+    # The production path leaves SABLE_MG_BD unset and still receives the
+    # isolated real store below.
+    if "SABLE_MG_BD" in os.environ:
+        return env
+
     if shutil.which("bd") is None:
         return env
 
     beads_root = parent / "beads"
     beads_root.mkdir(parents=True, exist_ok=True)
+    # SABLE-sx1rb (Part B, tarzan): this is the isolation-CONSTRUCTING init —
+    # it must run under the isolated `env` built above (HOME/TMPDIR already
+    # scoped to `parent`), not the caller's real os.environ. Running it
+    # against the real HOME contradicts this function's own docstring and can
+    # touch the operator's real dolt config/registry. This is a real,
+    # independent hardening fix — it does NOT change the pointer the shell
+    # suites below inherit (BEADS_DB is set AFTER this call, at :1284/below).
     init = subprocess.run(
         ["bd", "init", "--prefix=impacttier"], cwd=str(beads_root),
-        env={**os.environ, "BD_NON_INTERACTIVE": "1"},
+        env={**env, "BD_NON_INTERACTIVE": "1"},
         text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60,
     )
     if init.returncode != 0:
@@ -1426,6 +1478,18 @@ def _run_impact_tier_locked(repo: str, tree_sha: str, paths: list[str],
                     _record_phase(phases, f"shell:{suite}", _t0)
                 ran.append(suite)
                 if cp.returncode != 0:
+                    # SABLE-sx1rb: an INFRASTRUCTURE fault (the suite could
+                    # not build its own fixture) is not a property of the
+                    # branch under test and must not name it — IMPACT_ERROR,
+                    # not IMPACT_RED, exactly like the worktree-checkout and
+                    # missing-manifest cases above. A genuine content
+                    # failure (exit 1, or exit 2 without the suite's own
+                    # FATAL self-report) still returns IMPACT_RED unchanged.
+                    if _is_suite_infra_abort(cp.returncode, cp.stdout):
+                        return (IMPACT_ERROR,
+                            f"{suite} could not build its own test fixture on the combined "
+                            f"tree (rc={cp.returncode}, infrastructure — not a defect on the "
+                            f"branch): {_bounded_failure_detail(cp.stdout)}")
                     return (IMPACT_RED, f"{suite} FAILED on the combined tree (rc={cp.returncode}): "
                                         f"{_bounded_failure_detail(cp.stdout)}")
 
@@ -1666,32 +1730,39 @@ def assert_not_frozen(repo: str) -> None:
 # event at the promote; the damage is an invariant that only holds jointly
 # now half-landed.
 #
-# The fix is a metadata field ON THE BEAD ITSELF (`landing_pair`, set the
-# same way chuck.md's `hold` metadata already is: `bd update <id>
-# --set-metadata landing_pair=<counterpart-id>[,<counterpart-id>...]`) so the
-# declaration lives where THIS function already looks, instead of somewhere
-# it never reads. A solo promote of either half is refused, naming the
-# counterpart, unless the counterpart is explicitly named on THIS SAME
-# promote call via --with-pair (the operator's mechanical acknowledgement
-# that both halves are being promoted together) or the counterpart has
-# ALREADY landed.
+# The declaration is metadata ON BOTH BEADS plus a Beads `relates-to` edge.
+# The edge is not itself landing policy; it is the durable reverse index that
+# lets B's ordinary `bd show B --json` expose A's metadata when A declares B.
+# That distinction matters because `relates-to` is also the project's generic
+# see-also relation.  The only supported writer is declare_landing_pair() /
+# remove_landing_pair(), exposed by `sable-merge-gate landing-pair`: it creates
+# the reverse index first, then writes the same canonical member set to both
+# beads in one `bd update` invocation.  If that write is interrupted after only
+# one record changes, either endpoint sees the mismatch through the relation
+# and refuses. Removal clears both metadata records in one command; the
+# policy-neutral relation remains as history rather than risking deletion of a
+# pre-existing see-also link.
+#
+# A solo promote of either half is refused, naming the counterpart, unless the
+# counterpart has ALREADY landed. An unlanded pair is authorized only as
+# concrete members of land_batch()'s single integration-ref update; a
+# caller-supplied acknowledgement cannot stand in for co-landing.
 #
 # "Landed" is deliberately NOT bead status. SABLE-d5iku (chuck.md) already
 # established that a CLOSED bead is not a MERGED bead — status flips at the
 # worker's push, landing happens only at chuck's promote — so reusing status
 # here would silently reopen the exact gap that bead documents. Instead this
-# reads for the literal marker every successful path through THIS module's
-# own promote() already writes via _append_evidence: "promoted
-# byte-identical to" appears in a bead's notes if and only if some earlier
-# promote() call actually landed it.
+# reads for the literal markers every successful path through THIS module's
+# own writers append as evidence. This preserves recovery from a historical
+# half-landing without confusing CLOSED with LANDED.
 
 _LANDING_PAIR_KEY = "landing_pair"
 _LANDED_MARKER = "promoted byte-identical to"
+_BATCH_LANDED_MARKER = "BATCH LANDED:"
 
 
 class LandingPairRefused(Exception):
-    """A bead's declared `landing_pair` counterpart is neither landed nor
-    named via --with-pair on this promote call."""
+    """Landing-pair authority is unsatisfied or its declaration is corrupt."""
 
 
 def _bd_show(repo: str, bead_id: str) -> subprocess.CompletedProcess:
@@ -1727,47 +1798,283 @@ def _bd_show_json(repo: str, bead_id: str) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def parse_with_pair(values: list[str]) -> frozenset[str]:
-    """--with-pair CLI values (repeatable, or comma-separated) -> a flat id
-    set. Lives here, not in the CLI, so bin/sable-merge-gate stays thin."""
-    return frozenset(tok.strip() for raw in values for tok in raw.split(",") if tok.strip())
+def _landing_pair_ids(record: dict, bead_id: str) -> frozenset[str]:
+    """Parse one record's declaration into its *other* member ids.
 
-
-def declared_landing_pair(repo: str, bead: str) -> frozenset[str]:
-    """The bead ids <bead> itself declares via `metadata.landing_pair`
-    (comma/whitespace-separated). Empty when unset, unreadable, or bead is
-    falsy — "no pairing declared" is the correct default for every bead this
-    mechanism does not apply to, which is almost all of them."""
-    if not bead:
+    The authoritative writer stores the same canonical ``A,B`` value on A and
+    B so one multi-id Beads update cannot compute two divergent values.  Legacy
+    ``A: B`` / ``B: A`` records remain readable.  In both representations the
+    current bead is not its own counterpart.
+    """
+    metadata = record.get("metadata") or {}
+    if not isinstance(metadata, dict):
         return frozenset()
-    raw = (_bd_show_json(repo, bead).get("metadata") or {}).get(_LANDING_PAIR_KEY) or ""
-    return frozenset(tok.strip() for tok in re.split(r"[,\s]+", raw) if tok.strip())
+    raw = metadata.get(_LANDING_PAIR_KEY) or ""
+    if not isinstance(raw, str):
+        return frozenset()
+    ids = {tok.strip() for tok in re.split(r"[,\s]+", raw) if tok.strip()}
+    ids.discard(bead_id)
+    return frozenset(ids)
+
+
+def _related_records(record: dict) -> dict[str, dict]:
+    """The bidirectional `relates-to` records embedded by `bd show --json`."""
+    related = {}
+    dependencies = record.get("dependencies") or []
+    if not isinstance(dependencies, list):
+        return related
+    for dependency in dependencies:
+        if (not isinstance(dependency, dict)
+                or dependency.get("dependency_type") != "relates-to"):
+            continue
+        bead_id = str(dependency.get("id") or "").strip()
+        if bead_id:
+            related[bead_id] = dependency
+    return related
+
+
+def validated_landing_pair(
+        repo: str, bead: str,
+        ) -> tuple[frozenset[str], dict[str, dict]]:
+    """Return a reciprocal declaration and the already-read counterpart rows.
+
+    One ordinary ``bd show`` supplies the bead, every related endpoint, and
+    those endpoints' metadata.  That keeps the unpaired path at exactly the
+    pre-existing one process read while making reverse-only declarations
+    visible.  A generic relation with no landing metadata on either endpoint
+    remains inert.
+    """
+    if not bead:
+        return frozenset(), {}
+    record = _bd_show_json(repo, bead)
+    if not record:
+        # Preserve the historical default for unit fixtures and environments
+        # where Beads itself is absent.  When a declaration is readable but a
+        # counterpart/index is not, the checks below are fail-closed.
+        return frozenset(), {}
+
+    own = _landing_pair_ids(record, bead)
+    related = _related_records(record)
+    reverse = frozenset(
+        related_id for related_id, related_record in related.items()
+        if bead in _landing_pair_ids(related_record, related_id))
+    candidates = own | reverse
+    if not candidates:
+        return frozenset(), related
+
+    problems = []
+    for counterpart in sorted(candidates):
+        if counterpart not in related:
+            problems.append(
+                f"{bead}->{counterpart} has no relates-to reverse index")
+        if counterpart not in own:
+            problems.append(f"{bead} does not declare {counterpart}")
+        if counterpart not in reverse:
+            problems.append(f"{counterpart} does not declare {bead}")
+    if problems:
+        pair = ", ".join(sorted({bead, *candidates}))
+        raise LandingPairRefused(
+            f"asymmetric landing-pair declaration for [{pair}] "
+            f"(SABLE-8mfe6): {'; '.join(problems)}. Refusing every landing "
+            f"writer until `sable-merge-gate landing-pair declare` repairs it "
+            f"or `sable-merge-gate landing-pair remove` clears it.")
+    return own, related
+
+
+def _bd_pair_mutation(repo: str, args: list[str], description: str) -> None:
+    cp = git_lib._run(
+        git_lib._tool("SABLE_MG_BD", "bd") + args,
+        cwd=repo, check=False)
+    if cp.returncode != 0:
+        detail = cp.stdout.strip()[:500] or f"exit {cp.returncode}"
+        raise GateError(
+            classify.EXIT_PRECONDITION,
+            f"could not {description}: {detail}")
+
+
+def _pair_records(repo: str, first: str, second: str) -> tuple[dict, dict]:
+    if not first or not second or first == second:
+        raise GateError(
+            classify.EXIT_PRECONDITION,
+            "landing-pair members must be two distinct, non-empty bead ids")
+    first_record = _bd_show_json(repo, first)
+    second_record = _bd_show_json(repo, second)
+    if not first_record or not second_record:
+        missing = first if not first_record else second
+        raise GateError(
+            classify.EXIT_PRECONDITION,
+            f"cannot change landing pair: bead {missing!r} is unreadable")
+    return first_record, second_record
+
+
+def declare_landing_pair(repo: str, first: str, second: str) -> None:
+    """Create or repair one mechanically reciprocal two-bead declaration.
+
+    The relation is written first.  It is policy-neutral by itself, but once
+    either metadata row exists it makes that row visible from both endpoints.
+    Therefore any interrupted/partial multi-id metadata update blocks both
+    writers instead of reopening serial promotion on the blank side.
+    """
+    first_record, second_record = _pair_records(repo, first, second)
+    expected = {first, second}
+    for bead_id, record in ((first, first_record), (second, second_record)):
+        existing = set(_landing_pair_ids(record, bead_id))
+        if existing and existing != expected - {bead_id}:
+            raise GateError(
+                classify.EXIT_PRECONDITION,
+                f"{bead_id} already declares a different landing pair: "
+                f"{', '.join(sorted(existing))}")
+
+    _bd_pair_mutation(
+        repo, ["dep", "relate", first, second],
+        f"create landing-pair reverse index for {first}/{second}")
+    canonical = ",".join(sorted(expected))
+    _bd_pair_mutation(
+        repo,
+        ["update", first, second, "--set-metadata",
+         f"{_LANDING_PAIR_KEY}={canonical}"],
+        f"declare reciprocal landing pair {first}/{second}")
+    try:
+        first_pair, _ = validated_landing_pair(repo, first)
+        second_pair, _ = validated_landing_pair(repo, second)
+    except LandingPairRefused as exc:
+        raise GateError(classify.EXIT_PAIR_REFUSED, str(exc)) from exc
+    if first_pair != {second} or second_pair != {first}:
+        raise GateError(
+            classify.EXIT_PAIR_REFUSED,
+            f"landing-pair write for {first}/{second} did not round-trip "
+            f"reciprocally; promotion remains refused")
+
+
+def remove_landing_pair(repo: str, first: str, second: str) -> None:
+    """Remove both declarations while preserving the generic relation."""
+    first_record, second_record = _pair_records(repo, first, second)
+    first_pair = set(_landing_pair_ids(first_record, first))
+    second_pair = set(_landing_pair_ids(second_record, second))
+    if second not in first_pair and first not in second_pair:
+        raise GateError(
+            classify.EXIT_PRECONDITION,
+            f"{first}/{second} do not declare a landing pair")
+    if first_pair - {second} or second_pair - {first}:
+        raise GateError(
+            classify.EXIT_PRECONDITION,
+            f"refusing to remove only part of a larger landing-pair group: "
+            f"{first}={sorted(first_pair)}, {second}={sorted(second_pair)}")
+
+    # Metadata disappears from both records in one multi-id command. If Beads
+    # stops after only one row, the relation exposes the surviving declaration
+    # to both endpoints and both gates refuse. The generic relation deliberately
+    # remains: it may have predated the pair, and without provenance metadata it
+    # would be unsafe for this narrowly-scoped command to delete it.
+    _bd_pair_mutation(
+        repo,
+        ["update", first, second, "--unset-metadata", _LANDING_PAIR_KEY],
+        f"clear reciprocal landing pair {first}/{second}")
+
+    first_after, second_after = _pair_records(repo, first, second)
+    if (_landing_pair_ids(first_after, first)
+            or _landing_pair_ids(second_after, second)):
+        raise GateError(
+            classify.EXIT_PAIR_REFUSED,
+            f"landing-pair removal for {first}/{second} did not clear both "
+            f"records; promotion remains refused")
+
+
+def register_landing_pair_subcommand(subparsers) -> None:
+    """Keep the merge-gate CLI thin while exposing the sole pair writer."""
+    pair = subparsers.add_parser(
+        "landing-pair",
+        help="declare/remove a mechanically reciprocal MUST-LAND-TOGETHER pair")
+    actions = pair.add_subparsers(dest="landing_pair_action", required=True)
+    for action in ("declare", "remove"):
+        command = actions.add_parser(action)
+        command.add_argument("first", help="first bead id")
+        command.add_argument("second", help="second bead id")
+        command.add_argument(
+            "--repo", default=os.environ.get("SABLE_MG_REPO", os.getcwd()))
+
+
+def dispatch_landing_pair_command(args) -> int:
+    if args.landing_pair_action == "declare":
+        declare_landing_pair(args.repo, args.first, args.second)
+    else:
+        remove_landing_pair(args.repo, args.first, args.second)
+    return 0
+
+
+def _record_landed(record: dict) -> bool:
+    notes = record.get("notes") or ""
+    return _LANDED_MARKER in notes or _BATCH_LANDED_MARKER in notes
 
 
 def _bead_landed(repo: str, bead_id: str) -> bool:
-    notes = _bd_show_json(repo, bead_id).get("notes") or ""
-    return _LANDED_MARKER in notes
+    return _record_landed(_bd_show_json(repo, bead_id))
 
 
-def assert_landing_pair_satisfied(repo: str, bead: str,
-                                  with_pair: frozenset[str] = frozenset()) -> None:
+def bead_landed(repo: str, bead_id: str) -> bool:
+    """Public read Interface for the landing marker this authority writes."""
+    return _bead_landed(repo, bead_id)
+
+
+def assert_landing_pair_satisfied(repo: str, bead: str) -> None:
     """Refuse a solo promote of <bead> when it declares a `landing_pair`
-    counterpart that is neither already landed nor named in <with_pair> (the
-    --with-pair CLI flag, i.e. this SAME promote call). Two unpaired beads —
-    no `landing_pair` metadata at all — are never touched by this check,
-    however similar their footprints: it discriminates on the declared
-    relation, not on any file-level property."""
-    for counterpart in declared_landing_pair(repo, bead):
-        if counterpart in with_pair:
-            continue
-        if _bead_landed(repo, counterpart):
+    counterpart that has not already landed. Two unpaired beads — no
+    `landing_pair` metadata at all — are never touched by this check, however
+    similar their footprints: it discriminates on the declared relation, not
+    on any file-level property."""
+    counterparts, related = validated_landing_pair(repo, bead)
+    for counterpart in counterparts:
+        if _record_landed(related.get(counterpart) or {}):
             continue
         raise LandingPairRefused(
             f"{bead} declares metadata.{_LANDING_PAIR_KEY}={counterpart!r} (SABLE-rzkw7: "
-            f"MUST-LAND-TOGETHER) and {counterpart} is neither landed nor named on this "
-            f"promote call. Refusing a solo promote of {bead}. Promote both together — "
-            f"sable-merge-gate promote --bead {bead} --branch <branch> --with-pair {counterpart} "
-            f"— or wait for {counterpart} to land first.")
+            f"MUST-LAND-TOGETHER) and {counterpart} has not landed. Refusing a solo "
+            f"promote of {bead}. Co-land both exact branches through one atomic "
+            f"`sable-merge-gate batch-cycle` or pre-verified `land-batch` operation, "
+            f"or use this recovery path only after {counterpart} genuinely lands.")
+
+
+def assert_batch_landing_pairs_satisfied(repo: str, members: list) -> None:
+    """Apply the existing MUST-LAND-TOGETHER authority to a whole batch.
+
+    Every bead named in ``members`` will share the same atomic integration-ref
+    write. A counterpart absent from that concrete set still refuses exactly
+    like a solo promote.
+    """
+    batch_beads = frozenset(
+        bead_id for member in members for bead_id in member.bead_ids)
+    for bead_id in batch_beads:
+        try:
+            counterparts, related = validated_landing_pair(repo, bead_id)
+        except LandingPairRefused as exc:
+            raise GateError(classify.EXIT_PAIR_REFUSED, str(exc)) from exc
+        for counterpart in counterparts:
+            if (counterpart in batch_beads
+                    or _record_landed(related.get(counterpart) or {})):
+                continue
+            raise GateError(
+                classify.EXIT_PAIR_REFUSED,
+                f"{bead_id} declares metadata.{_LANDING_PAIR_KEY}={counterpart!r} "
+                f"(SABLE-rzkw7: MUST-LAND-TOGETHER), but {counterpart} is neither "
+                f"already landed nor a member of this atomic batch. Nothing landed.")
+
+
+def assert_batch_members_identified(members: list) -> None:
+    """Every landing member must name the bead identities its write covers.
+
+    Pair authority is defined over beads, so accepting a beadless member would
+    make it invisible to the final writer's independent membership check.
+    Bisection may still inspect beadless branches; only a landing is denied.
+    """
+    unnamed = [
+        member.branch for member in members
+        if not member.bead_ids or any(not bead_id for bead_id in member.bead_ids)
+    ]
+    if unnamed:
+        raise GateError(
+            classify.EXIT_PRECONDITION,
+            "batch landing requires at least one bead id for every member; "
+            f"pair authority cannot inspect beadless branch(es): {', '.join(unnamed)}")
 
 
 # --------------------------------------------------------------------------
@@ -2098,7 +2405,7 @@ def _coverage_floor_report(signal, run, decision) -> str:
 # re-derives NO clause of it: it never computes a footprint, never resolves
 # the gate-class roster, never reads a hold, never runs a fold check. A clause
 # appearing in two places is precisely the drift the factoring exists to
-# prevent, and bin/test_sable_gate_promote_lib.py asserts the absence
+# prevent, and bin/test_sable_gate_promote_lib_integration.py asserts the absence
 # structurally (test_the_auto_promote_assert_re_derives_no_mechanical_clause)
 # so the property is checked rather than promised.
 #
@@ -2861,7 +3168,7 @@ class BatchMember:
 
 
 BATCH_RECORD_FILE = "batch-records.jsonl"
-BATCH_RECORD_SCHEMA_VERSION = 1
+BATCH_RECORD_SCHEMA_VERSION = 2
 
 # Outcome constants, mirroring the ACTION_* / IMPACT_* module-level-constant
 # style above rather than inventing an enum this bead's siblings (the
@@ -2897,8 +3204,10 @@ class BatchRecord:
     child (SABLE-be4lo.8): a batch that went red and was bisected still
     produces a promote record — it just records WHO was named (culprit) and
     the verbatim report the seat and the fleet saw (report_lines), rather than
-    a landing. They default to absent so every pre-bisection caller, and every
-    record already persisted, reconstructs unchanged."""
+    a landing. ``fold_tip`` and ``recorded_at`` bind a successful manifest to
+    the exact landed object and its post-fast-forward observation time, which
+    lets derive-at-read telemetry measure members without a parallel writer.
+    They default to absent so every older record reconstructs unchanged."""
     base_sha: str
     setkey: str
     combined_ref: str
@@ -2907,11 +3216,14 @@ class BatchRecord:
     members: tuple[BatchMember, ...]
     culprit: str = ""
     report_lines: tuple[str, ...] = ()
+    fold_tip: str = ""
+    recorded_at: float = 0.0
 
     @classmethod
     def from_members(cls, base_sha: str, members: list[BatchMember], *,
                      combined_ref: str, outcome: str, fold_disjoint: bool,
-                     culprit: str = "", report_lines: tuple[str, ...] = ()) -> "BatchRecord":
+                     culprit: str = "", report_lines: tuple[str, ...] = (),
+                     fold_tip: str = "", recorded_at: float = 0.0) -> "BatchRecord":
         """The only constructor that canonicalizes: members is re-sorted by
         tip_sha (the same key setkey() sorts on) before anything is stored or
         hashed, so a caller's admission order can never leak into the
@@ -2925,7 +3237,8 @@ class BatchRecord:
         key = batch_key.setkey(base_sha, [m.tip_sha for m in canonical])
         return cls(base_sha=base_sha, setkey=key, combined_ref=combined_ref,
                    outcome=outcome, fold_disjoint=fold_disjoint, members=canonical,
-                   culprit=culprit, report_lines=tuple(report_lines))
+                   culprit=culprit, report_lines=tuple(report_lines),
+                   fold_tip=fold_tip, recorded_at=recorded_at)
 
     def member_branches(self) -> tuple[str, ...]:
         return tuple(m.branch for m in self.members)
@@ -2950,6 +3263,8 @@ class BatchRecord:
             "members": [m.to_dict() for m in self.members],
             "culprit": self.culprit,
             "report_lines": list(self.report_lines),
+            "fold_tip": self.fold_tip,
+            "recorded_at": self.recorded_at,
         }
 
     @classmethod
@@ -2960,6 +3275,10 @@ class BatchRecord:
         by from_members at write time, and from_dict's job is to reproduce
         exactly what was written, not to re-derive it."""
         members = tuple(BatchMember.from_dict(m) for m in (data.get("members") or ()))
+        try:
+            recorded_at = float(data.get("recorded_at") or 0.0)
+        except (TypeError, ValueError):
+            recorded_at = 0.0
         return cls(
             base_sha=str(data.get("base_sha", "")),
             setkey=str(data.get("setkey", "")),
@@ -2969,6 +3288,8 @@ class BatchRecord:
             members=members,
             culprit=str(data.get("culprit", "")),
             report_lines=tuple(data.get("report_lines") or ()),
+            fold_tip=str(data.get("fold_tip", "")),
+            recorded_at=recorded_at,
         )
 
 
@@ -2986,10 +3307,18 @@ def _stamp_batch_record(repo: str | os.PathLike, record: BatchRecord) -> None:
         path = Path(override) if override else (
             snapshot_lib.ensure_state_dir(repo) / BATCH_RECORD_FILE)
         path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a") as fh:
-            fh.write(json.dumps(record.to_dict()) + "\n")
-    except OSError:
-        pass
+        payload = (json.dumps(record.to_dict()) + "\n").encode()
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            os.write(fd, payload)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        print(
+            f"sable-merge-gate: WARNING could not persist batch manifest: {exc}",
+            file=sys.stderr)
 
 
 def read_batch_records(repo: str | os.PathLike = ".") -> list[BatchRecord]:
@@ -3283,7 +3612,6 @@ def _adoption_miss_optimistic(bead: str, branch: str, base: str, repo: str, remo
 def promote(bead: str, branch: str, base: str, repo: str, remote: str,
             manager: str, override: str | None,
             coverage_override: str | None = None,
-            with_pair: frozenset[str] = frozenset(),
             auto: bool = False) -> int:
     # FIRST, before any git work: is the fleet frozen? (SABLE-jd5fj.5)
     assert_not_frozen(repo)
@@ -3291,7 +3619,7 @@ def promote(bead: str, branch: str, base: str, repo: str, remote: str,
     # freeze read above: does <bead> declare a MUST-LAND-TOGETHER counterpart
     # that this solo promote would silently split? (SABLE-rzkw7)
     try:
-        assert_landing_pair_satisfied(repo, bead, with_pair)
+        assert_landing_pair_satisfied(repo, bead)
     except LandingPairRefused as exc:
         raise GateError(classify.EXIT_PAIR_REFUSED, str(exc)) from exc
     base_ref = classify.qualify_remote_ref(remote, base)
@@ -3634,8 +3962,45 @@ def _fold_tip_built_on(repo: str, base_sha: str, fold_tip: str, member_count: in
     return cp.returncode == 0 and cp.stdout.strip() == base_sha
 
 
+def assert_exact_green_batch_verdict(
+        verdict: classify.Verdict, fold_tip: str, combined_ref: str) -> None:
+    """Authorize a batch integration-ref write from one exact-object verdict.
+
+    A batch ref exists before CI starts, so ref existence is only a trigger,
+    never evidence.  The writer requires a completed, non-override GREEN
+    verdict whose own identity fields bind both the exact fold tip and the
+    exact combined ref.  Keeping this check inside the writer makes it
+    impossible for a new caller to reproduce the old ``land-batch`` bug by
+    resolving a pending ref and calling :func:`land_batch` directly.
+    """
+    if not combined_ref:
+        raise GateError(
+            classify.EXIT_PRECONDITION,
+            "batch landing requires the exact combined ci-verify ref; an empty "
+            "ref cannot bind a verdict to the object being landed")
+    if not verdict.complete:
+        raise GateError(
+            classify.EXIT_PRECONDITION,
+            f"batch verdict for {combined_ref} is statusless/pending; no integration "
+            "write is authorized")
+    if verdict.preview_sha != fold_tip or verdict.ref != combined_ref:
+        raise GateError(
+            classify.EXIT_INTEGRITY,
+            f"batch verdict identity mismatch: verdict binds "
+            f"{verdict.ref or '<no-ref>'}/{(verdict.preview_sha or '<no-sha>')[:7]}, "
+            f"but landing requested {combined_ref}/{fold_tip[:7]}")
+    if verdict.outcome != classify.GREEN or verdict.conclusion == "override":
+        raise GateError(
+            verdict.exit_code if verdict.outcome != classify.GREEN
+            else classify.EXIT_PRECONDITION,
+            f"batch verdict for {combined_ref}/{fold_tip[:7]} is "
+            f"{verdict.outcome}/{verdict.conclusion}, not an exact CI GREEN; "
+            "nothing landed")
+
+
 def land_batch(repo: str, remote: str, base: str, base_sha: str, fold_tip: str,
-               members: list, *, budget: dict, combined_ref: str = "",
+               members: list, *, budget: dict, combined_ref: str,
+               verdict: classify.Verdict,
                manager: str = "lincoln") -> BatchLandResult:
     """Land a verified batch fold chain onto the integration branch, whole or
     not at all. `fold_tip` is the SAME combined object CI verified on
@@ -3646,12 +4011,16 @@ def land_batch(repo: str, remote: str, base: str, base_sha: str, fold_tip: str,
 
     Never raises on a stale base or a losing push race — those are RETURNED as
     REFORM / FELL_BACK_SERIAL results so the caller can act on the disposition.
-    Raises only on a true precondition breach (budget absent → GateError 3;
-    empty batch → EmptyBatchError; a fold_tip not built on base_sha →
-    GateError 3) or the post-push integrity failure (GateError 4)."""
+    Raises only on a true precondition breach (missing/non-green/mismatched
+    verdict; budget absent → GateError 3; empty batch → EmptyBatchError; a
+    fold_tip not built on base_sha → GateError 3) or the post-push integrity
+    failure (GateError 4)."""
     # 0. Freeze first — the same before-any-git-work read promote() opens with.
     assert_not_frozen(repo)
-    # 1. BUDGET REFUSAL — before any git work.
+    # 1. AUTHORITY + BUDGET REFUSAL — before any git work.
+    assert_exact_green_batch_verdict(verdict, fold_tip, combined_ref)
+    assert_batch_members_identified(members)
+    assert_batch_landing_pairs_satisfied(repo, members)
     assert_batch_budget_present(budget)
     if not members:
         raise EmptyBatchError(
@@ -3719,7 +4088,8 @@ def land_batch(repo: str, remote: str, base: str, base_sha: str, fold_tip: str,
     try:
         record = BatchRecord.from_members(
             base_sha, list(members), combined_ref=combined_ref,
-            outcome=BATCH_OUTCOME_LANDED, fold_disjoint=True)
+            outcome=BATCH_OUTCOME_LANDED, fold_disjoint=True,
+            fold_tip=resolved_tip, recorded_at=time.time())
         _stamp_batch_record(repo, record)
     except Exception as exc:  # noqa: BLE001 — a landed batch must stay landed
         print(f"sable-merge-gate: batch record skipped after unexpected error: {exc}",
@@ -3735,7 +4105,9 @@ def land_batch(repo: str, remote: str, base: str, base_sha: str, fold_tip: str,
 
 
 def resolve_batch_members(repo: str, remote: str, base_sha: str, member_specs: list,
-                          command: str) -> list[BatchMember]:
+                          command: str, *, refresh_refs: bool = True,
+                          expected_tips: dict[str, str] | None = None
+                          ) -> list[BatchMember]:
     """Turn raw `branch` / `branch:BEAD[,BEAD...]` CLI specs into the typed
     BatchMember set both batch entrypoints (land-batch, bisect-batch) need.
 
@@ -3745,13 +4117,25 @@ def resolve_batch_members(repo: str, remote: str, base_sha: str, member_specs: l
     Shotgun Surgery risk the epic's architecture review flagged on the
     (base, branch)-pair sites, in its member-set form. Raises EXIT_USAGE on an
     empty spec list: a batch command with no members is a usage error, never a
-    vacuous no-op (SABLE-p9n7k)."""
+    vacuous no-op (SABLE-p9n7k). ``refresh_refs=False`` is only for a caller
+    that already fetched and sealed a remote-tracking snapshot (batch-drain);
+    that caller also supplies ``expected_tips`` so another process refreshing
+    a remote-tracking ref cannot mutate the sealed object. Explicit commands
+    retain the refresh default."""
     members: list[BatchMember] = []
     for spec in member_specs:
         branch, _, bead_part = spec.partition(":")
         bead_ids = tuple(b for b in bead_part.split(",") if b)
-        git_lib._git(repo, "fetch", remote, branch, check=False)
-        tip = git_lib.resolve_commit(repo, classify.qualify_remote_ref(remote, branch))
+        if command == "land-batch" and not bead_ids:
+            raise GateError(
+                classify.EXIT_USAGE,
+                f"land-batch member {branch!r} has no bead id; use "
+                f"--member {branch}:BEAD_ID so final pair authority can inspect it")
+        if refresh_refs:
+            git_lib._git(repo, "fetch", remote, branch, check=False)
+        tip = git_lib.resolve_commit(
+            repo, (expected_tips or {}).get(branch)
+            or classify.qualify_remote_ref(remote, branch))
         paths = tuple(sorted(footprint_lib.changed_paths(repo, base_sha, tip)))
         members.append(BatchMember(branch, tip, bead_ids, paths))
     if not members:
@@ -3770,8 +4154,8 @@ def land_batch_from_refs(base: str, member_specs: list, repo: str, remote: str,
     (test_cli_is_thin).
 
     `base` is the raw --base value (None → resolved here via resolve_base, the
-    same precedence promote() uses); `member_specs` are raw `branch` or
-    `branch:BEAD[,BEAD...]` strings."""
+    same precedence promote() uses); every landing `member_spec` must be
+    `branch:BEAD[,BEAD...]` so the final pair authority can inspect it."""
     base = git_lib.resolve_base(base, repo)
     base_ref = classify.qualify_remote_ref(remote, base)
     git_lib._git(repo, "fetch", remote, base, check=False)
@@ -3789,8 +4173,14 @@ def land_batch_from_refs(base: str, member_specs: list, repo: str, remote: str,
             f"no verified combined object to land: {combined_ref} is absent on "
             f"{remote}. Form + CI-verify the batch (sable_batch_fold_lib.push_batch_ref) "
             f"before landing it.")
-    result = land_batch(repo, remote, base, base_sha, fold_tip, members,
-                        budget=budget, combined_ref=combined_ref, manager=manager)
+    verdict = preview.acquire_verdict(repo, combined_ref, fold_tip)
+    try:
+        result = land_batch(
+            repo, remote, base, base_sha, fold_tip, members,
+            budget=budget, combined_ref=combined_ref, verdict=verdict,
+            manager=manager)
+    finally:
+        preview.delete_ci_ref(repo, remote, combined_ref)
     print(result.reason)
     return result.exit_code
 
@@ -3806,7 +4196,8 @@ def register_land_batch(sub) -> None:
     lb.add_argument("--base", default=None, help="integration branch to land onto; "
                     "same resolution as promote")
     lb.add_argument("--member", action="append", default=[], dest="members", required=True,
-                    metavar="BRANCH[:BEAD[,BEAD...]]", help="repeatable; one per batch member")
+                    metavar="BRANCH:BEAD[,BEAD...]",
+                    help="repeatable; one identified member per batch")
     lb.add_argument("--repo", default=os.environ.get("SABLE_MG_REPO", os.getcwd()))
     lb.add_argument("--remote", default=os.environ.get("SABLE_MG_REMOTE", "origin"))
     lb.add_argument("--manager", default="lincoln")

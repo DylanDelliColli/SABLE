@@ -259,12 +259,104 @@ sys.exit(0 if any(isinstance(b, dict) and b.get('id') == want for b in data) els
     # checkout's DB, so the literal path is the wrong one).
     BEADS_WORKSPACE=$(bd -C "$BEADS_ROOT" where 2>/dev/null | head -1 | tr -d '[:space:]')
 
+    # DISPATCH AUTHORITY for the scratch repo (SABLE-0dg7n).
+    #
+    # sable-spawn-worker refuses to dispatch (exit 15) before ANY governance
+    # work when it is running for a fleet but cannot read valid execution
+    # authority. `current_dispatch_authority` treats a repo with NO mode-state
+    # as a standalone invocation and returns None — EXCEPT when the ambient
+    # environment says SABLE_AGENT_ROLE/CLAUDE_AGENT_ROLE=manager, where absence
+    # fails closed instead. That is correct behaviour (deleting the state under
+    # a live manager must not silently de-govern dispatch), but this fixture
+    # builds a throwaway repo and never wrote the state, so every real dispatch
+    # below aborted at rc=15 long before the dep-merge advisory it exists to
+    # test. The six WIRING assertions failed on every branch while the suite
+    # still reported 15 green.
+    #
+    # MEASURED, both directions, because the two candidate causes are
+    # compatible and neither is sufficient alone: run from a manager/worker
+    # pane (role inherited) the suite failed 6; with the fleet environment
+    # scrubbed it passed 21. So the fix cannot be "unset the role" — that only
+    # hides the failure from one of the two ways this suite is really invoked.
+    # Writing valid authority makes the WIRING leg reach the intended rc=5 in
+    # BOTH shapes, and the guard itself is left untouched.
+    #
+    # The receipt is minted by the REAL library (`_digest` and
+    # `validate_execution_authority` from bin/sable_handoff_lib.py) and written
+    # at the program's OWN resolved path (`resolve_mode_state_path`), so no part
+    # of the receipt schema or the path rule is re-implemented here. A future
+    # change to either breaks this setup loudly, with a named cause, instead of
+    # regressing to six opaque rc=15s.
+    write_dispatch_authority() {
+      ( cd "$WORK" && env -u SABLE_MODE_STATE python3 - "$REPO/bin" "$DEPENDENT_ID" "$INT_BRANCH" <<'PY'
+import json, sys
+
+sys.path.insert(0, sys.argv[1])
+from sable_handoff_lib import _digest, validate_execution_authority
+from sable_mode_store_lib import resolve_mode_state_path
+
+dependent_id, int_branch = sys.argv[2], sys.argv[3]
+receipt = {
+    "version": 1,
+    "kind": "approved",
+    "tier": "quick",
+    # The dispatch set is exactly the bead this fixture dispatches. A scope
+    # that did not name it would be refused as out-of-scope (also exit 15),
+    # which would look identical to the defect being fixed.
+    "scope": [dependent_id],
+    "approved_at": "2026-07-31T00:00:00Z",
+    "approved_by": "test-dep-merge-state.sh fixture",
+    "base": {"ref": int_branch, "sha": "0" * 40},
+    "evidence_sha256": _digest({"fixture": "test-dep-merge-state.sh"}),
+}
+receipt["receipt_id"] = _digest(receipt)
+state = {"mode": "execution", "since": "2026-07-31", "handoff": receipt}
+
+# Refuse to write state the real validator would reject: a fixture that
+# silently writes unusable authority reproduces the very failure it fixes.
+validate_execution_authority(state)
+
+path = resolve_mode_state_path()
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+print(path)
+PY
+      )
+    }
+
+    MODE_STATE_PATH=$(write_dispatch_authority)
+    AUTHORITY_RC=$?
+
+    # PRECONDITION, asserted rather than assumed (SABLE-0dg7n test spec): the
+    # scratch repo carries readable, VALID execution authority BEFORE the first
+    # real dispatch. Validity is judged by the same validator the program uses,
+    # so a future guard change fails here by name instead of six opaque rc=15s
+    # four assertions later.
+    if [ "$AUTHORITY_RC" -eq 0 ] && [ -r "$MODE_STATE_PATH" ] \
+       && ( cd "$WORK" && env -u SABLE_MODE_STATE python3 -c "
+import sys
+sys.path.insert(0, sys.argv[1])
+from sable_handoff_lib import read_execution_authority
+read_execution_authority()
+" "$REPO/bin" >/dev/null 2>&1 ); then
+      pass "fixture: the scratch repo carries VALID execution dispatch authority before any real sable-spawn-worker run (precondition for the WIRING leg)"
+    else
+      fail "fixture: the scratch repo carries VALID execution dispatch authority before any real sable-spawn-worker run (precondition for the WIRING leg)" \
+           "rc=$AUTHORITY_RC path=${MODE_STATE_PATH:-<unresolved>} — the WIRING assertions below will abort at exit 15 without this"
+    fi
+
     spawn_governance_run() {
       # $1.. = extra env assignments; runs the real program from the fixture
       # repo, with the worker-pane guard and host-load guard neutralized (this
       # suite is itself frequently run from inside a worker pane) and tmux
       # pointed at a socket with no server, so capacity fails open at 0 workers.
-      ( cd "$WORK" && env -u SABLE_WORKER_PANE \
+      #
+      # SABLE_MODE_STATE is unset so mode-state always resolves to the scratch
+      # repo written above. Inherited from a pane it would point the dispatch
+      # guard at the REAL repo's authority, whose scope does not name this
+      # fixture's bead — an out-of-scope refusal that looks exactly like the
+      # rc=15 this bead fixed.
+      ( cd "$WORK" && env -u SABLE_WORKER_PANE -u SABLE_MODE_STATE \
           SABLE_MAX_LOAD_PER_CORE=0 \
           SABLE_TMUX_SOCKET="$FIX/no-such-tmux-socket" \
           BEADS_DIR="$BEADS_WORKSPACE" \
@@ -307,6 +399,42 @@ PY
     else
       fail "WIRING: the warning is emitted BEFORE the governance chain's first bd write (refused at duplicate-dispatch, exit 5)" \
            "expected rc=5, got rc=$SPAWN_RC — if the chain changed, this test's safe-abort no longer holds and the suite may be writing to bd. output: ${SPAWN_OUT:-<empty>}"
+    fi
+
+    # --- 4b-control: the authority setup above must be LOAD-BEARING ---------
+    #
+    # Remove ONLY the mode-state and the named rc=15 refusal must come back. A
+    # setup step nobody proves is doing work is indistinguishable from a
+    # decorative one, and this particular step is easy to delete by accident:
+    # everything above it still passes without it, in a scrubbed environment.
+    #
+    # The manager role is FORCED here rather than inherited, because that is
+    # what makes the guard fail closed on absence. Left to the ambient
+    # environment this control would silently stop biting whenever the suite is
+    # run with the fleet variables scrubbed — a control that only sometimes
+    # arms is the failure mode this file already paid for once.
+    mv -f "$MODE_STATE_PATH" "$MODE_STATE_PATH.control" 2>/dev/null
+    SPAWN_NOAUTH=$(spawn_governance_run SABLE_AGENT_ROLE=manager CLAUDE_AGENT_ROLE=manager)
+    SPAWN_NOAUTH_RC=$?
+    if [ "$SPAWN_NOAUTH_RC" -eq 15 ] \
+       && echo "$SPAWN_NOAUTH" | grep -q 'dispatch-scope refused' \
+       && echo "$SPAWN_NOAUTH" | grep -q 'no mode state'; then
+      pass "fixture guard: removing the mode-state restores the named exit-15 dispatch-scope refusal (the authority setup is load-bearing, not decorative)"
+    else
+      fail "fixture guard: removing the mode-state restores the named exit-15 dispatch-scope refusal (the authority setup is load-bearing, not decorative)" \
+           "expected rc=15 naming 'no mode state', got rc=$SPAWN_NOAUTH_RC output: ${SPAWN_NOAUTH:-<empty>}"
+    fi
+    mv -f "$MODE_STATE_PATH.control" "$MODE_STATE_PATH" 2>/dev/null
+
+    # Restoring is asserted too: a control that leaves the fixture broken would
+    # cascade into four opaque failures below with no cause named at the site.
+    SPAWN_REARMED=$(spawn_governance_run SABLE_AGENT_ROLE=manager CLAUDE_AGENT_ROLE=manager)
+    SPAWN_REARMED_RC=$?
+    if [ "$SPAWN_REARMED_RC" -eq 5 ]; then
+      pass "fixture guard: restoring the mode-state returns the real dispatch path to the exit-5 safe-abort (control left the fixture intact)"
+    else
+      fail "fixture guard: restoring the mode-state returns the real dispatch path to the exit-5 safe-abort (control left the fixture intact)" \
+           "expected rc=5, got rc=$SPAWN_REARMED_RC output: ${SPAWN_REARMED:-<empty>}"
     fi
 
     # Complement: the kill switch must actually kill it. An advisory nobody can

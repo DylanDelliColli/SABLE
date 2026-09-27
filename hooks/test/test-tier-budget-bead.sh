@@ -84,7 +84,9 @@ open(p, 'w').write(s)
 BD_INIT_OK=0
 for _ in 1 2 3 4; do
   rm -rf "$REPO_DIR/.beads"
-  ( cd "$REPO_DIR" && env HOME="$BD_HOME" BD_NON_INTERACTIVE=1 CI=true bd init --non-interactive >/dev/null 2>&1 )
+  # -u BEADS_DB (SABLE-sx1rb): never inherit an ambient BEADS_DB (e.g. the
+  # impact tier's own) — this suite builds and must use its OWN sandbox DB.
+  ( cd "$REPO_DIR" && env -u BEADS_DB HOME="$BD_HOME" BD_NON_INTERACTIVE=1 CI=true bd init --non-interactive >/dev/null 2>&1 )
   if [ -f "$REPO_DIR/.beads/config.yaml" ]; then BD_INIT_OK=1; break; fi
 done
 
@@ -96,7 +98,9 @@ if [ "$BD_INIT_OK" -ne 1 ]; then
 fi
 
 bd_in_sandbox() {
-  ( cd "$REPO_DIR" && env HOME="$BD_HOME" BD_NON_INTERACTIVE=1 CI=true bd "$@" )
+  # -u BEADS_DB (SABLE-sx1rb): every call through here must resolve against
+  # $REPO_DIR's own sandbox DB by CWD/HOME, never an ambient BEADS_DB.
+  ( cd "$REPO_DIR" && env -u BEADS_DB HOME="$BD_HOME" BD_NON_INTERACTIVE=1 CI=true bd "$@" )
 }
 
 bd_count_suite_optimization() {

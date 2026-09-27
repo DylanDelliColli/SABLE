@@ -12,14 +12,12 @@ under "Composing with import-graph tools" -- this module is that recipe,
 generalized to its sibling selector (pytest-testmon) instead of an import-graph
 tool.
 
-.testmondata lifecycle -- the real decision in this bead (dispatch note,
-optimus, SABLE-cmar4.3): CI runners are ephemeral, so the coverage map ships
-as a GitHub Actions cache artifact keyed on ref+SHA with branch-prefix
-restore-keys (see .github/workflows/ci-verify.yml) and pytest-testmon
-incrementally updates it on every run. On a cache MISS -- no prior
-.testmondata restored, e.g. a brand-new branch or an evicted cache -- this
-module falls back to a conservative FULL run of bin/, and deliberately does
-NOT consult pytest-impact for a partial selection in that case either: a
+.testmondata lifecycle: this selector serves the local merge-preview impact
+tier. Sealed-candidate CI does not use it and always runs the complete suite.
+Operators can refresh the local map explicitly with `sable-merge-gate
+warm-testmon-cache`. On a cache MISS this module falls back to a conservative
+FULL run of bin/, and deliberately does NOT consult pytest-impact for a
+partial selection in that case either: a
 silently empty testmon map paired with a narrow fixture-only selector could
 select close to nothing while "passing" by not running -- exactly the
 silent-green failure class SABLE-7v3z and this epic exist to eliminate.
@@ -40,7 +38,9 @@ to avoid.
 """
 from __future__ import annotations
 
+import argparse
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -411,9 +411,8 @@ def print_diff_cover_scope(repo_root: Path, compare_ref: str) -> int:
 
 
 # --- .testmondata cache-warm classification (SABLE-cmar4.3 second revise) ----
-# ci-verify.yml runs the FULL bin/ suite a second time with --testmon-noselect
-# purely to keep .testmondata warm for this module's selector (see module
-# docstring). pytest-testmon 2.2.0 has a real, reproduced defect: its own
+# The opt-in local cache warmer runs the full bin/ suite with
+# --testmon-noselect. pytest-testmon 2.2.0 has a real, reproduced defect: its own
 # SourceTree.get_file() (testmon/testmon_core.py:93) unconditionally does
 # `filename.rsplit(".", 1)[1]` to compute an "extension" for every file its
 # Coverage() instance measured; a filename with NO DOT makes rsplit return a
@@ -468,21 +467,23 @@ def classify_cache_warm_outcome(returncode: int, output: str) -> bool:
     return bool(re.search(r"\d+ passed", output))
 
 
-def run_cache_warm(repo_root: Path, extra_pytest_args: Optional[List[str]] = None) -> int:
-    """Actually execute the full bin/ suite with --testmon-noselect (mirrors
-    ci-verify.yml's cache-warm step exactly) and apply
-    classify_cache_warm_outcome to the result, returning 0 for a real pass or
-    a tolerated known-crash, and the real returncode for anything else.
+def run_cache_warm(repo_root: Path) -> int:
+    """Execute the opt-in full-suite local cache warm and classify its result.
 
-    extra_pytest_args exists only for this module's own integration test,
-    which runs this function against bin/ from a test IN bin/ -- it needs
-    --ignore=<this file> to avoid the nested pytest run recursing into
-    itself. ci-verify.yml's real invocation passes none.
+    Returns 0 for a real pass or a tolerated known crash, the real positive
+    returncode for an ordinary failure, and 128+signal for a signal-killed
+    child. The latter keeps the CLI failure status conventional and legible
+    instead of feeding a negative SystemExit through Python's modulo-256
+    mapping (SIGTERM -15 would otherwise surface as an opaque 241).
+
+    The behavior is integration-tested against a minimal crash-capable
+    fixture; ordinary test collection never recursively runs this repo's
+    complete suite.
     """
     result = subprocess.run(
         [
             sys.executable, "-m", "pytest", "bin/", "-q", "-p", "no:cacheprovider",
-            "--testmon-noselect", *(extra_pytest_args or []),
+            "--testmon-noselect",
         ],
         cwd=repo_root,
         capture_output=True,
@@ -499,22 +500,52 @@ def run_cache_warm(repo_root: Path, extra_pytest_args: Optional[List[str]] = Non
                 file=sys.stderr,
             )
         return 0
+    if result.returncode < 0:
+        signum = -result.returncode
+        try:
+            signal_name = signal.Signals(signum).name
+        except ValueError:
+            signal_name = "UNKNOWN"
+        normalized_returncode = 128 + signum
+        print(
+            "tier_selection: cache-warm child was killed by signal "
+            f"{signal_name} ({signum}); cache warm failed "
+            f"(exit {normalized_returncode})",
+            file=sys.stderr,
+        )
+        return normalized_returncode
     return result.returncode
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="tier_selection.py",
+        description="Conservative pytest-testmon/pytest-impact gate selector.",
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--cache-warm", action="store_true",
+        help="execute the full suite once to refresh .testmondata",
+    )
+    mode.add_argument(
+        "--diff-cover-scope", metavar="COMPARE_REF",
+        help="print the safe coverage scope for COMPARE_REF",
+    )
+    parser.add_argument(
+        "--base", default="HEAD",
+        help="comparison ref for impact selection (default: HEAD)",
+    )
+    return parser
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     repo_root = Path(__file__).resolve().parent.parent
-    args = argv if argv is not None else sys.argv[1:]
-    if "--cache-warm" in args:
+    args = build_parser().parse_args(argv)
+    if args.cache_warm:
         return run_cache_warm(repo_root)
-    for arg in args:
-        if arg.startswith("--diff-cover-scope="):
-            return print_diff_cover_scope(repo_root, arg.split("=", 1)[1])
-    base_ref = "HEAD"
-    for arg in args:
-        if arg.startswith("--base="):
-            base_ref = arg.split("=", 1)[1]
-    return run_impact_tier(repo_root, base_ref)
+    if args.diff_cover_scope:
+        return print_diff_cover_scope(repo_root, args.diff_cover_scope)
+    return run_impact_tier(repo_root, args.base)
 
 
 if __name__ == "__main__":

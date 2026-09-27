@@ -49,6 +49,19 @@ COMMAND=$(echo "$PARSED" | sed -n '3p')
 
 [ -z "$COMMAND" ] && exit 0
 
+deny_with_reason() {
+  TDD_GATE_DENY_REASON="$1" python3 -c "
+import json, os
+print(json.dumps({
+    'hookSpecificOutput': {
+        'hookEventName': 'PreToolUse',
+        'permissionDecision': 'deny',
+        'permissionDecisionReason': os.environ['TDD_GATE_DENY_REASON'],
+    }
+}))
+"
+}
+
 # Only act on bd close commands
 echo "$COMMAND" | grep -q '^bd close' || exit 0
 
@@ -90,6 +103,8 @@ print(' '.join(ids))
 ID_COUNT=$(echo "$BEAD_ARGS" | wc -w)
 
 # Single-bead close: check [no-test] escape hatch
+MARKER_LOOKUP_FAILURE=""
+MARKER_SCAN_DETAIL=""
 if [ "$ID_COUNT" -eq 1 ]; then
   BEAD_ID="$BEAD_ARGS"
   # Check for the [no-test] marker in BOTH the notes AND the description field
@@ -99,15 +114,43 @@ if [ "$ID_COUNT" -eq 1 ]; then
   # the description — the close was denied, then mis-reported as success
   # (SABLE-u0c6), leaving the bead in_progress with a pushed branch. Scanning
   # both fields is the cheapest, most forgiving fix.
-  MARKER_FIELDS=$(bd show "$BEAD_ID" --json 2>/dev/null | python3 -c "
+  #
+  # SABLE-wkxtl: a failed bd lookup is NOT equivalent to a successful lookup
+  # with no marker. Preserve the lookup/parser status and stderr so, if no test
+  # evidence can independently authorize this close, the final denial names
+  # the real failure instead of telling the author to add a marker they may
+  # already have added.
+  if MARKER_ERR_FILE=$(mktemp "${TMPDIR:-/tmp}/sable-tdd-gate-marker.XXXXXX"); then
+    if MARKER_JSON=$(bd show "$BEAD_ID" --json 2>"$MARKER_ERR_FILE"); then
+      if MARKER_FIELDS=$(printf '%s' "$MARKER_JSON" | python3 -c "
 import json, sys
 data = json.load(sys.stdin)
-if isinstance(data, list) and len(data) > 0:
-    print(data[0].get('notes', '') or '')
-    print(data[0].get('description', '') or '')
-" 2>/dev/null || echo "")
-  if echo "$MARKER_FIELDS" | grep -q '\[no-test\]'; then
-    exit 0  # Escape hatch: allow close without test evidence
+if not isinstance(data, list) or not data or not isinstance(data[0], dict):
+    raise ValueError('expected a non-empty JSON list containing one bead object')
+print(data[0].get('notes', '') or '')
+print(data[0].get('description', '') or '')
+" 2>"$MARKER_ERR_FILE"); then
+        MARKER_BYTES=$(printf '%s' "$MARKER_FIELDS" | wc -c | tr -d '[:space:]')
+        MARKER_SCAN_DETAIL=" Marker lookup succeeded and scanned ${MARKER_BYTES:-0} bytes across notes and description; [no-test] was absent."
+        if printf '%s\n' "$MARKER_FIELDS" | grep -q '\[no-test\]'; then
+          rm -f -- "$MARKER_ERR_FILE"
+          exit 0  # Escape hatch: allow close without test evidence
+        fi
+      else
+        MARKER_PARSE_RC=$?
+        MARKER_PARSE_ERROR=$(tr '\n' ' ' < "$MARKER_ERR_FILE")
+        [ -n "$MARKER_PARSE_ERROR" ] || MARKER_PARSE_ERROR="no parser stderr"
+        MARKER_LOOKUP_FAILURE="TDD gate: bd show returned unreadable JSON while checking the no-test escape hatch for $BEAD_ID (parser exit $MARKER_PARSE_RC): $MARKER_PARSE_ERROR. Close remains blocked because no test evidence is available; retry after bd is healthy."
+      fi
+    else
+      MARKER_LOOKUP_RC=$?
+      MARKER_LOOKUP_ERROR=$(tr '\n' ' ' < "$MARKER_ERR_FILE")
+      [ -n "$MARKER_LOOKUP_ERROR" ] || MARKER_LOOKUP_ERROR="no stderr"
+      MARKER_LOOKUP_FAILURE="TDD gate: bd show failed while checking the no-test escape hatch for $BEAD_ID (exit $MARKER_LOOKUP_RC): $MARKER_LOOKUP_ERROR. Close remains blocked because no test evidence is available; retry after bd is healthy."
+    fi
+    rm -f -- "$MARKER_ERR_FILE"
+  else
+    MARKER_LOOKUP_FAILURE="TDD gate: could not create a temporary diagnostic file while checking the no-test escape hatch for $BEAD_ID. Close remains blocked because no test evidence is available; retry after the temporary directory is writable."
   fi
 fi
 
@@ -176,13 +219,8 @@ print(m.group(1) if m else '')
 fi
 
 # No evidence found — block the close
-python3 -c "
-import json
-print(json.dumps({
-    'hookSpecificOutput': {
-        'hookEventName': 'PreToolUse',
-        'permissionDecision': 'deny',
-        'permissionDecisionReason': 'TDD gate: No tests were run this session. Run your test suite first (npm test, pytest, etc.). For non-code beads: add [no-test] to bead notes and close individually.'
-    }
-}))
-"
+if [ -n "$MARKER_LOOKUP_FAILURE" ]; then
+  deny_with_reason "$MARKER_LOOKUP_FAILURE"
+else
+  deny_with_reason "TDD gate: No tests were run this session. Run your test suite first (npm test, pytest, etc.). For non-code beads: add [no-test] to bead notes and close individually.$MARKER_SCAN_DETAIL"
+fi

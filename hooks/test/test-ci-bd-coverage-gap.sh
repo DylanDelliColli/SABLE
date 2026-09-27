@@ -15,21 +15,19 @@
 # Runs unconditionally — it does not need bd itself, only needs to be ABLE
 # to remove it, which works whether or not this environment has it.
 #
-# THE NEGATIVE CONTROL (bd present) is the complement: with bd on PATH, both
-# suites must report STRICTLY MORE subtests than their own bd-absent run
-# (above) reported, with zero skips — proving the bd-absent branch above is
-# a real skip of real coverage, not a suite that always reports fewer tests
-# than it has. Asserted as a relative property (bd-present count > bd-absent
-# count) rather than a hardcoded literal, so growing either fixture suite's
-# subtest count over time does not re-red this control (SABLE-xanum — a
-# literal '18/18' stood in for this property and broke the day
-# test-dep-merge-state.sh legitimately grew from 18 to 20 subtests).
-# Self-skips loudly if bd is not on PATH here (SABLE-59zu clean room) — this
-# suite's own real-bd leg is exactly the shape it is testing for, so it is
-# registered here as a fixture, not lectured about elsewhere.
+# The real-bd complement is NOT re-run here. Both target suites are themselves
+# entries in shell-run-set.sh's ALLOW list, where their real-bd assertions run
+# once authoritatively on a host that carries bd. Re-running them from this
+# wrapper duplicated the two slowest real-bd E2Es (including fresh Dolt
+# stores) merely to prove that "not skipped" differs from "skipped". The cheap
+# polarity below owns the loud-skip transport contract; the target suites own
+# their real behavior. shell-run-set --check-loud-skip also requires both
+# targets to remain in ALLOW, so that complement cannot silently disappear.
 #
 # Run with:
 #   bash hooks/test/test-ci-bd-coverage-gap.sh
+#
+# sable-test-load: nested-runner -- composes only the cheap bd-absent polarity; each real-bd E2E remains authoritative in ALLOW
 
 set -uo pipefail
 
@@ -202,72 +200,7 @@ else
        "$REQUIRE_ALL_DETAIL (parsed='${OV_NOBD_SKIPPED:-<none>}' output=$OUT_OV_NOBD)"
 fi
 
-# ---------------------------------------------------------------------------
-# NEGATIVE CONTROL: bd PRESENT — full subtest counts, zero skips. Self-skips
-# loudly (never silently) if this environment has no real bd (SABLE-59zu).
-# ---------------------------------------------------------------------------
-if ! command -v bd >/dev/null 2>&1; then
-  skip "negative control: bd not on PATH here (SABLE-59zu clean room) — the bd-absent half above already ran for real and is the assertion that matters in that environment"
-else
-  OUT_DM_BD=$(bash "$DEP_MERGE" 2>&1)
-  RC_DM_BD=$?
-  DM_BD_TESTS=$(printf '%s' "$OUT_DM_BD" | grep -oE 'Tests: [0-9]+' | tail -1 | grep -oE '[0-9]+')
-  DM_BD_SKIPPED=$(printf '%s' "$OUT_DM_BD" | grep -oE 'Skipped: [0-9]+' | tail -1 | grep -oE '[0-9]+')
-  [ "$RC_DM_BD" -eq 0 ]; _dm_c1=$?
-  [ "${DM_BD_TESTS:-0}" -gt "${DM_NOBD_TESTS:-0}" ]; _dm_c2=$?
-  [ "${DM_BD_SKIPPED:-1}" -eq 0 ]; _dm_c3=$?
-  # SABLE-muew7: a conjunction's RED must name WHICH clause broke, not just
-  # that the control failed — three agents burned an evening on this exact
-  # control's twin (below) unable to tell rc, count, and skip-state apart.
-  require_all "test-dep-merge-state.sh bd-present negative control" \
-    "rc is 0" "$_dm_c1" \
-    "bd-present tests > bd-absent tests" "$_dm_c2" \
-    "Skipped == 0" "$_dm_c3"
-  if [ "$REQUIRE_ALL_OK" -eq 1 ]; then
-    pass "negative control: test-dep-merge-state.sh with bd PRESENT reports strictly more subtests than bd-absent (${DM_BD_TESTS:-<none>} > ${DM_NOBD_TESTS:-<none>}), Skipped: 0"
-  else
-    fail "negative control: test-dep-merge-state.sh with bd PRESENT reports strictly more subtests than bd-absent, Skipped: 0" \
-         "$REQUIRE_ALL_DETAIL (rc=$RC_DM_BD bd-present tests=${DM_BD_TESTS:-<none>} bd-absent tests=${DM_NOBD_TESTS:-<none>} skipped=${DM_BD_SKIPPED:-<none>})"
-  fi
-
-  OUT_OV_BD=$(bash "$OVERLAP" 2>&1)
-  RC_OV_BD=$?
-  OV_BD_TESTS=$(printf '%s' "$OUT_OV_BD" | grep -oE 'Tests: [0-9]+' | tail -1 | grep -oE '[0-9]+')
-  [ "$RC_OV_BD" -eq 0 ]; _ov_c1=$?
-  [ "${OV_BD_TESTS:-0}" -gt "${OV_NOBD_TESTS:-0}" ]; _ov_c2=$?
-  ! printf '%s' "$OUT_OV_BD" | grep -q 'Skipped:'; _ov_c3=$?
-  # SABLE-muew7 / SABLE-1gnuj: THIS is the control whose collapsed single
-  # boolean cost three agents an evening — chuck saw it FAIL, tarzan saw it
-  # PASS on two trees, and nobody could say whether rc or the Skipped-line
-  # check was the differing conjunct, because the control only ever emitted
-  # PASS or FAIL. require_all's report is the fix for exactly this.
-  require_all "test-overlap-dispatch-e2e.sh bd-present negative control" \
-    "rc is 0" "$_ov_c1" \
-    "bd-present tests > bd-absent tests" "$_ov_c2" \
-    "no Skipped line at all" "$_ov_c3"
-  if [ "$REQUIRE_ALL_OK" -eq 1 ]; then
-    pass "negative control: test-overlap-dispatch-e2e.sh with bd PRESENT reports strictly more subtests than bd-absent (${OV_BD_TESTS:-<none>} > ${OV_NOBD_TESTS:-<none>}), no Skipped line at all"
-  else
-    fail "negative control: test-overlap-dispatch-e2e.sh with bd PRESENT reports strictly more subtests than bd-absent, no Skipped line at all" \
-         "$REQUIRE_ALL_DETAIL (rc=$RC_OV_BD bd-present tests=${OV_BD_TESTS:-<none>} bd-absent tests=${OV_NOBD_TESTS:-<none>} output=$OUT_OV_BD)"
-  fi
-
-  # THE DISTINGUISHING PROPERTY, stated directly: the bd-absent and bd-
-  # present summaries for the SAME suite must never be able to read as the
-  # same result. Tests-count is the sharpest signal (7 vs 18, 0 vs 5).
-  if [ "${DM_BD_TESTS:-0}" != "${DM_NOBD_TESTS:-0}" ]; then
-    pass "distinguishing property: test-dep-merge-state.sh's Tests count differs between bd-absent and bd-present runs"
-  else
-    fail "distinguishing property: test-dep-merge-state.sh's Tests count differs between bd-absent and bd-present runs" \
-         "bd-present tests=$DM_BD_TESTS bd-absent tests=$DM_NOBD_TESTS"
-  fi
-  if [ "${OV_BD_TESTS:-0}" != "${OV_NOBD_TESTS:-0}" ]; then
-    pass "distinguishing property: test-overlap-dispatch-e2e.sh's Tests count differs between bd-absent and bd-present runs"
-  else
-    fail "distinguishing property: test-overlap-dispatch-e2e.sh's Tests count differs between bd-absent and bd-present runs" \
-         "bd-present tests=$OV_BD_TESTS bd-absent tests=$OV_NOBD_TESTS"
-  fi
-fi
+skip "real-bd complement runs once in each target suite's own ALLOW entry; this wrapper does not duplicate either E2E"
 
 echo
 echo "=========================================="

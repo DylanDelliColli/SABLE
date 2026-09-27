@@ -12,6 +12,11 @@ design structurally prevented it). Consistent with the SABLE-8b41 telemetry
 direction: a reporting tool over existing bd/git/gh sources, not a new
 capture mechanism (relate, do not block).
 
+Serial promotions are derived from git + base-branch Actions observations.
+Batched member promotions come from the batch landing authority's own durable
+manifest, including its exact fold SHA and post-fast-forward timestamp; the
+report does not infer batch landings from fold commit dates.
+
 The report NEVER uses git commit dates as a push-to-landed latency proxy
 (SABLE-jxgm4: commit-tree stamps a merge commit's dates at preview-build
 time, before the CI wait it is meant to measure -- and, for a rebuilt

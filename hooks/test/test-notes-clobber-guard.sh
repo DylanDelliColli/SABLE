@@ -59,6 +59,19 @@ esac
 STUB
 chmod +x "$STUB_DIR/bd"
 
+# Curated tool PATH for Door A. It contains every command the hook needs before
+# the no-bd branch, and cannot accidentally inherit a host's /usr/bin/bd.
+NO_BD_DIR="$FIXTURE_DIR/no-bd-bin"
+mkdir -p "$NO_BD_DIR"
+for required_tool in bash cat head python3; do
+  required_path="$(command -v "$required_tool" 2>/dev/null || true)"
+  if [ -z "$required_path" ]; then
+    fail "no-bd fixture has its required toolchain" "missing: $required_tool"
+    exit 2
+  fi
+  ln -s "$required_path" "$NO_BD_DIR/$required_tool"
+done
+
 json() { # <command> -> PreToolUse hook input
   python3 -c "
 import json, sys
@@ -70,8 +83,7 @@ print(json.dumps({'tool_name': 'Bash', 'tool_input': {'command': sys.argv[1]}, '
 run_hook() {
   local cmd="$1" nobd="${2:-}" path
   if [ "$nobd" = "--no-bd" ]; then
-    path="$FIXTURE_DIR/empty-bin:/usr/bin:/bin"
-    mkdir -p "$FIXTURE_DIR/empty-bin"
+    path="$NO_BD_DIR"
   else
     path="$STUB_DIR:$PATH"
   fi
@@ -98,6 +110,23 @@ print(hso.get('permissionDecision') or '<malformed>')
 "
 }
 
+# additional_context_of <hook stdout> -> the documented context string, or
+# '<malformed>' when the output is not a valid PreToolUse hook envelope.
+additional_context_of() {
+  printf '%s' "$1" | python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+except Exception:
+    print('<malformed>'); sys.exit(0)
+hso = d.get('hookSpecificOutput')
+if not isinstance(hso, dict) or hso.get('hookEventName') != 'PreToolUse':
+    print('<malformed>'); sys.exit(0)
+context = hso.get('additionalContext')
+print(context if isinstance(context, str) else '<malformed>')
+"
+}
+
 # assert_decision <label> <expected: deny|allow|<none>> <command> [--no-bd]
 assert_decision() {
   local label="$1" expected="$2" cmd="$3" nobd="${4:-}" out got
@@ -110,10 +139,10 @@ assert_decision() {
   fi
 }
 
-# assert_mentions <label> <needle> <command>
+# assert_mentions <label> <needle> <command> [--no-bd]
 assert_mentions() {
-  local label="$1" needle="$2" cmd="$3" out
-  out="$(run_hook "$cmd")"
+  local label="$1" needle="$2" cmd="$3" nobd="${4:-}" out
+  out="$(run_hook "$cmd" "$nobd")"
   if printf '%s' "$out" | grep -qF -- "$needle"; then
     pass "$label"
   else
@@ -207,8 +236,23 @@ assert_decision "bd create --notes is not an update and is untouched" \
 assert_decision "--append-notes plus --notes in one invocation is not denied" \
   '<none>' 'bd update SABLE-nonempty --append-notes "a" --notes "b"'
 
-assert_decision "no bd on PATH exits silently (the guarded write cannot happen either)" \
-  '<none>' 'bd update SABLE-nonempty --notes "x"' --no-bd
+if PATH="$NO_BD_DIR" command -v bd >/dev/null 2>&1; then
+  fail "no-bd fixture proves bd is unreachable" \
+    "bd unexpectedly resolves inside curated PATH=$NO_BD_DIR"
+else
+  pass "no-bd fixture proves bd is unreachable"
+fi
+
+NO_BD_OUT="$(run_hook 'bd update SABLE-nonempty --notes "x"' --no-bd)"
+NO_BD_DECISION="$(decision_of "$NO_BD_OUT")"
+NO_BD_CONTEXT="$(additional_context_of "$NO_BD_OUT")"
+if [ "$NO_BD_DECISION" = "allow" ] \
+   && printf '%s' "$NO_BD_CONTEXT" | grep -qF "not available on the hook's PATH"; then
+  pass "no bd on PATH fails OPEN through Door A with unique loud context"
+else
+  fail "no bd on PATH fails OPEN through Door A with unique loud context" \
+    "decision='$NO_BD_DECISION' context='$NO_BD_CONTEXT' raw='${NO_BD_OUT:-<empty>}'"
+fi
 
 # ===========================================================================
 # Empty / degenerate hook input must never crash or deny (#16047 empty-stdin

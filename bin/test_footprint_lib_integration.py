@@ -298,3 +298,35 @@ def test_real_bead_with_prose_section_does_not_hide_a_dropped_path(bare_bd_sandb
     with pytest.raises(fp.FootprintUndetermined) as exc_info:
         fp.declared_reads(str(work), bead_id)
     assert "Makefile" in str(exc_info.value)
+
+
+# The merge-train admission loop consumes two real bead declarations at once.
+# Keep those real-bd controls at the integration boundary instead of hiding
+# them in test_footprint_lib.py's otherwise ordinary suite.
+def test_real_declared_footprints_of_a_disjoint_pair_admit(sandbox):
+    work, home = sandbox
+    bead_a = _bd_create(
+        work, home, "Trains member.\n\n## File footprint\nbin/member_a.py\n")
+    bead_b = _bd_create(
+        work, home, "Trains member.\n\n## File footprint\nbin/member_b.py\n")
+
+    verdict = fp.is_disjoint(
+        fp.declared_footprint(str(work), bead_a),
+        fp.declared_footprint(str(work), bead_b),
+    )
+    assert verdict.disjoint is True, verdict.reason
+
+
+def test_real_declared_footprints_of_an_overlapping_pair_exclude(sandbox):
+    work, home = sandbox
+    bead_a = _bd_create(
+        work, home, "Trains member.\n\n## File footprint\nbin/shared_module.py\n")
+    bead_b = _bd_create(
+        work, home, "Trains member.\n\n## File footprint\nbin/shared_module.py\n")
+
+    verdict = fp.is_disjoint(
+        fp.declared_footprint(str(work), bead_a),
+        fp.declared_footprint(str(work), bead_b),
+    )
+    assert verdict.disjoint is False
+    assert "bin/shared_module.py" in verdict.reason

@@ -71,19 +71,23 @@ except Exception:
     d = {}
 print(d.get('agent_id', '') or '')
 print(d.get('agent_type', '') or '')
+print('__SABLE_ID_PARSED__')
 " 2>/dev/null) || parsed=""
-  agent_id=$(printf '%s\n' "$parsed" | sed -n '1p')
-  agent_type=$(printf '%s\n' "$parsed" | sed -n '2p')
+  local -a identity_fields=()
+  mapfile -t identity_fields <<< "$parsed"
+  agent_id="${identity_fields[0]:-}"
+  agent_type="${identity_fields[1]:-}"
 
   if [ -n "$agent_id" ]; then
     SABLE_ID_IS_SUBAGENT=1
     if [ -n "$agent_type" ]; then
-      SABLE_ID_NAME=$(printf '%s' "$agent_type" | tr '[:upper:]' '[:lower:]')
+      SABLE_ID_NAME="${agent_type,,}"
       SABLE_ID_SOURCE="agent_type"
     fi
     # NOTE: env deliberately not consulted — it belongs to the parent session.
   elif [ -n "${SABLE_AGENT_NAME:-${CLAUDE_AGENT_NAME:-}}" ]; then
-    SABLE_ID_NAME=$(printf '%s' "${SABLE_AGENT_NAME:-$CLAUDE_AGENT_NAME}" | tr '[:upper:]' '[:lower:]')
+    SABLE_ID_NAME="${SABLE_AGENT_NAME:-$CLAUDE_AGENT_NAME}"
+    SABLE_ID_NAME="${SABLE_ID_NAME,,}"
     SABLE_ID_SOURCE="env"
   fi
 
@@ -624,7 +628,11 @@ sable_resolve_test_timeout() {
 # DELETED per the clean-break operator decision — identity (env or agent_type) is
 # authoritative.
 #
-# Sets: SABLE_DISPATCH_ACTIVE (0|1), SABLE_DISPATCH_LANE (lowercase name or "").
+# Sets: SABLE_DISPATCH_ACTIVE (0|1), SABLE_DISPATCH_LANE (lowercase name or ""),
+# and SABLE_DISPATCH_STATE_STATUS (identity|missing|valid|corrupt). The status
+# keeps a missing mode file distinct from a present file that cannot authorize
+# dispatch. mode-interlock.sh is the enforcement authority for the latter; these
+# dispatch helpers still stand down rather than inventing a lane.
 # Mode-state path: resolved per-repo from the hook-input cwd via
 # sable_mode_state_path (SABLE-5hck), unified with bin/sable-mode and
 # mode-interlock.sh. SABLE_MODE_STATE still overrides (tests + d50.4).
@@ -632,6 +640,7 @@ sable_resolve_dispatch_lane() {
   local json="${1:-}"
   SABLE_DISPATCH_ACTIVE=0
   SABLE_DISPATCH_LANE=""
+  SABLE_DISPATCH_STATE_STATUS="identity"
 
   sable_resolve_identity "$json"
 
@@ -670,15 +679,29 @@ except Exception:
     print('')
 " 2>/dev/null)
   mode_file="$(sable_mode_state_path "$cwd")"
-  [ -f "$mode_file" ] || return 0
+  if [ ! -f "$mode_file" ]; then
+    SABLE_DISPATCH_STATE_STATUS="missing"
+    return 0
+  fi
   local mode
   mode=$(MODE_FILE="$mode_file" python3 -c "
 import json, os
 try:
-    print(json.load(open(os.environ['MODE_FILE'])).get('mode', ''))
+    data = json.load(open(os.environ['MODE_FILE']))
+    if not isinstance(data, dict):
+        raise ValueError('state root is not an object')
+    mode = data.get('mode', '')
+    if mode not in ('planning', 'execution'):
+        raise ValueError('invalid mode')
+    print(mode)
 except Exception:
-    print('')
+    print('__SABLE_STATE_CORRUPT__')
 " 2>/dev/null)
+  if [ "$mode" = "__SABLE_STATE_CORRUPT__" ]; then
+    SABLE_DISPATCH_STATE_STATUS="corrupt"
+    return 0
+  fi
+  SABLE_DISPATCH_STATE_STATUS="valid"
   [ "$mode" = "execution" ] || return 0
 
   # Lincoln main session in execution mode: lane = self. (Contract invariant 4 —

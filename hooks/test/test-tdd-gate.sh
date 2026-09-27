@@ -335,6 +335,72 @@ else
 fi
 rm -rf "$P84B_DIR"
 
+# ---------- SABLE-wkxtl: bd lookup failure is not marker absence ----------
+# These three legs keep the lookup state-space explicit. A backend failure
+# must remain fail-closed, but it must surface bd's status/stderr instead of
+# giving the impossible advice to add a marker that may already be present.
+WKXTL_DIR=$(mktemp -d)
+
+# Failure leg: bd itself fails. The diagnostic must name that failure and must
+# not reuse the successful-scan / marker-absent advice.
+cat > "$WKXTL_DIR/bd" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "show" ] && [[ "$*" == *"--json"* ]]; then
+  echo "store-locked" >&2
+  exit 7
+fi
+exit 0
+EOF
+chmod +x "$WKXTL_DIR/bd"
+WKXTL_FAIL_OUT=$(run_gate_stub 'bd close SABLE-lookupfail' "$WKXTL_DIR")
+if echo "$WKXTL_FAIL_OUT" | grep -q 'bd show failed' \
+  && echo "$WKXTL_FAIL_OUT" | grep -q 'exit 7' \
+  && echo "$WKXTL_FAIL_OUT" | grep -q 'store-locked' \
+  && ! echo "$WKXTL_FAIL_OUT" | grep -q 'add \[no-test\] to bead notes'; then
+  pa_pass "wkxtl: bd show failure is loud and distinct from an absent marker"
+else
+  pa_fail "wkxtl: bd show failure is loud and distinct from an absent marker" \
+    "expected bd/exit-7/store-locked diagnostic without add-marker advice; got: ${WKXTL_FAIL_OUT:-<empty>}"
+fi
+
+# Positive control: successful lookup with the marker still allows.
+cat > "$WKXTL_DIR/bd" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "show" ] && [[ "$*" == *"--json"* ]]; then
+  printf '%s\n' '[{"id":"SABLE-marker","notes":"[no-test] docs only","description":""}]'
+  exit 0
+fi
+exit 0
+EOF
+WKXTL_MARKER_OUT=$(run_gate_stub 'bd close SABLE-marker' "$WKXTL_DIR")
+if [ -z "$WKXTL_MARKER_OUT" ]; then
+  pa_pass "wkxtl control: successful lookup with [no-test] still allows"
+else
+  pa_fail "wkxtl control: successful lookup with [no-test] still allows" \
+    "expected silent allow; got: $WKXTL_MARKER_OUT"
+fi
+
+# Negative control: successful lookup without the marker keeps the ordinary
+# no-tests denial and actionable add-marker advice.
+cat > "$WKXTL_DIR/bd" <<'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "show" ] && [[ "$*" == *"--json"* ]]; then
+  printf '%s\n' '[{"id":"SABLE-nomarker","notes":"","description":"code change"}]'
+  exit 0
+fi
+exit 0
+EOF
+WKXTL_ABSENT_OUT=$(run_gate_stub 'bd close SABLE-nomarker' "$WKXTL_DIR")
+if echo "$WKXTL_ABSENT_OUT" | grep -q '"permissionDecision": "deny"' \
+  && echo "$WKXTL_ABSENT_OUT" | grep -q 'add \[no-test\] to bead notes' \
+  && ! echo "$WKXTL_ABSENT_OUT" | grep -q 'bd show failed'; then
+  pa_pass "wkxtl control: successful lookup without marker keeps add-marker denial"
+else
+  pa_fail "wkxtl control: successful lookup without marker keeps add-marker denial" \
+    "expected ordinary add-marker denial; got: ${WKXTL_ABSENT_OUT:-<empty>}"
+fi
+rm -rf "$WKXTL_DIR"
+
 # ---------- SABLE-d72/lcs: per-agent evidence keying ----------
 # The gate must read the SAME per-agent key tdd-evidence.sh writes: with agent_id
 # present, /tmp/tdd-evidence-<sid>-<agent_id>; without, the session-global file.

@@ -55,9 +55,11 @@ empty candidate list (see `degenerate_single_band` in build_report).
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -437,6 +439,218 @@ def rank_shell_suites(durations: dict[str, float]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Static heavyweight-boundary declarations
+# ---------------------------------------------------------------------------
+
+# A declaration is deliberately file-scoped: the useful decision is whether
+# a suite is allowed to cross a heavyweight process boundary at all, not
+# whether every individual call site repeats boilerplate. The reason after
+# `--` is mandatory so a declaration records why the composition is worth its
+# cost instead of becoming a content-free suppression.
+_LOAD_DECLARATION = re.compile(
+    r"^\s*#\s*sable-test-load:\s*([a-z0-9_, -]+?)\s+--\s+\S",
+    re.MULTILINE,
+)
+
+# Shell wrappers usually execute a variable. Some name it *_SUITE; others use
+# domain names such as DEP_MERGE and assign the real test-*.sh path above the
+# call. Track both shapes so variable naming cannot hide a suite-of-suite
+# multiplier. Restricting the detector to executable bash calls still avoids
+# parser fixtures that merely store "bash hooks/test/test-example.sh" as text.
+_SHELL_RUN_VARIABLE = re.compile(
+    r'\bbash\s+"?\$\{?([A-Z][A-Z0-9_]*)\}?'
+)
+_SHELL_TEST_VARIABLE_ASSIGNMENT = re.compile(
+    r'^\s*([A-Z][A-Z0-9_]*)=.*'
+    r'(?:hooks/test|\$\{?TESTDIR\}?)/test-[A-Za-z0-9_.-]+\.sh\b'
+)
+_PYTEST_ARGV_LITERAL = re.compile(r"""['"]pytest['"]""")
+
+
+def _declared_load_kinds(source: str) -> set[str]:
+    kinds: set[str] = set()
+    for match in _LOAD_DECLARATION.finditer(source):
+        kinds.update(
+            item.strip()
+            for item in match.group(1).split(",")
+            if item.strip()
+        )
+    return kinds
+
+
+def _python_nested_runner_lines(source: str) -> list[int]:
+    """Lines that launch pytest as a child process.
+
+    `pytest.main([__file__])` under a script's ordinary `if __name__` helper
+    is intentionally not a nested boundary during collection. Subprocess
+    pytest and calls into this Module's real coverage runner are.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+
+    parents = {
+        child: parent
+        for parent in ast.walk(tree)
+        for child in ast.iter_child_nodes(parent)
+    }
+
+    def is_intercepted_by_monkeypatch(call: ast.Call) -> bool:
+        current = parents.get(call)
+        while current is not None:
+            if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                arg_names = {
+                    arg.arg
+                    for arg in (
+                        list(current.args.posonlyargs)
+                        + list(current.args.args)
+                        + list(current.args.kwonlyargs)
+                    )
+                }
+                if "monkeypatch" in arg_names:
+                    return True
+            current = parents.get(current)
+        return False
+
+    lines: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        # Synthetic unit tests commonly exercise argv construction by
+        # monkeypatching subprocess.run. They cross no real process boundary
+        # and must not be made to carry a misleading load declaration.
+        if is_intercepted_by_monkeypatch(node):
+            continue
+        func = node.func
+        func_name = func.id if isinstance(func, ast.Name) else (
+            func.attr if isinstance(func, ast.Attribute) else ""
+        )
+        if func_name == "run_python_suite_with_coverage":
+            lines.add(node.lineno)
+            continue
+        if func_name not in {"run", "Popen", "check_call", "check_output"} or not node.args:
+            continue
+        tokens = {
+            child.value
+            for child in ast.walk(node.args[0])
+            if isinstance(child, ast.Constant) and isinstance(child.value, str)
+        }
+        if "pytest" in tokens:
+            lines.add(node.lineno)
+    return sorted(lines)
+
+
+def _shell_nested_runner_lines(source: str) -> list[int]:
+    lines = source.splitlines()
+    test_variables = {
+        match.group(1)
+        for line in lines
+        if (match := _SHELL_TEST_VARIABLE_ASSIGNMENT.search(line))
+    }
+    nested_lines = []
+    for lineno, line in enumerate(lines, start=1):
+        if line.lstrip().startswith("#"):
+            continue
+        # shlex keeps a quoted parser-fixture string such as
+        # "bash hooks/test/test-example.sh" as ONE token, while a command is
+        # two tokens (`bash`, path). That distinction avoids charging tests of
+        # shell-command parsers for merely storing example input.
+        try:
+            tokens = list(shlex.shlex(
+                line, posix=True, punctuation_chars=";&|()"
+            ))
+        except ValueError:
+            tokens = []
+        for index, token in enumerate(tokens):
+            if token != "bash":
+                continue
+            arg_index = index + 1
+            while arg_index < len(tokens) and tokens[arg_index].startswith("-"):
+                arg_index += 1
+            if arg_index >= len(tokens):
+                continue
+            target = tokens[arg_index]
+            basename = Path(target).name
+            is_test_suite = bool(
+                re.fullmatch(r"test-[A-Za-z0-9_.-]+\.sh", basename)
+            )
+            is_tier_runner = basename in {
+                "shell-run-set.sh", "test-tiers.sh"
+            }
+            if not is_test_suite and not is_tier_runner:
+                continue
+            if is_tier_runner:
+                command_tail = tokens[arg_index + 1:]
+                if "--run" not in command_tail:
+                    continue
+            nested_lines.append(lineno)
+            break
+        if nested_lines and nested_lines[-1] == lineno:
+            continue
+        for match in _SHELL_RUN_VARIABLE.finditer(line):
+            variable = match.group(1)
+            if variable.endswith("SUITE") or variable in test_variables:
+                nested_lines.append(lineno)
+                break
+    return nested_lines
+
+
+def scan_test_load_boundaries(
+    paths: list[Path], *, repo_root: Optional[Path] = None
+) -> list[dict]:
+    """Inventory statically visible nested test runners.
+
+    Returns one record per boundary with a declaration verdict. This scan is
+    intentionally cheap enough for every pre-push/CI classification pass; it
+    prevents a new suite-of-suite multiplier from silently entering ordinary
+    test paths without rerunning the suites merely to discover the problem.
+    """
+    root = Path(repo_root).resolve() if repo_root is not None else None
+    records: list[dict] = []
+    for raw_path in sorted(Path(p) for p in paths):
+        path = raw_path.resolve()
+        if not path.is_file():
+            continue
+        source = path.read_text(errors="replace")
+        declared_kinds = _declared_load_kinds(source)
+        if path.suffix == ".sh":
+            lines = _shell_nested_runner_lines(source)
+        elif path.suffix == ".py":
+            lines = (
+                _python_nested_runner_lines(source)
+                if (
+                    "run_python_suite_with_coverage" in source
+                    or (
+                        "subprocess" in source
+                        and _PYTEST_ARGV_LITERAL.search(source)
+                    )
+                )
+                else []
+            )
+        else:
+            lines = []
+
+        try:
+            display_path = str(path.relative_to(root)) if root is not None else str(path)
+        except ValueError:
+            display_path = str(path)
+        for lineno in lines:
+            records.append({
+                "path": display_path,
+                "line": lineno,
+                "kind": "nested-runner",
+                "declared": "nested-runner" in declared_kinds,
+            })
+    records.sort(key=lambda r: (r["path"], r["line"], r["kind"]))
+    return records
+
+
+def undeclared_load_boundaries(records: list[dict]) -> list[dict]:
+    return [record for record in records if not record["declared"]]
+
+
+# ---------------------------------------------------------------------------
 # Report assembly + output formatting
 # ---------------------------------------------------------------------------
 
@@ -520,6 +734,12 @@ def _default_shell_suites(repo_root: Path) -> list[str]:
     )
 
 
+def _default_test_sources(repo_root: Path) -> list[Path]:
+    return sorted((repo_root / "bin").glob("test_*.py")) + sorted(
+        (repo_root / "hooks" / "test").glob("test-*.sh")
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="columbo-cost-prefilter",
@@ -549,6 +769,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "--repo-root", default=None,
         help="Repo root to run from (default: this script's grandparent dir).",
     )
+    p.add_argument(
+        "--check-load-declarations", action="store_true",
+        help=(
+            "Statically reject nested test runners without a file-level "
+            "'# sable-test-load: nested-runner -- REASON' declaration; "
+            "does not execute tests."
+        ),
+    )
     p.add_argument("--json", action="store_true", help="Emit JSON instead of text.")
     return p
 
@@ -558,6 +786,31 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     repo_root = Path(args.repo_root).resolve() if args.repo_root else REPO_ROOT
+    if args.check_load_declarations:
+        records = scan_test_load_boundaries(
+            _default_test_sources(repo_root), repo_root=repo_root
+        )
+        violations = undeclared_load_boundaries(records)
+        if args.json:
+            print(json.dumps({
+                "load_boundaries": records,
+                "undeclared": violations,
+            }, indent=2))
+        elif violations:
+            for record in violations:
+                print(
+                    f"{record['path']}:{record['line']}: undeclared "
+                    f"{record['kind']} (add '# sable-test-load: "
+                    f"{record['kind']} -- REASON')",
+                    file=sys.stderr,
+                )
+        else:
+            print(
+                "columbo-cost-prefilter: "
+                f"{len(records)} heavyweight test boundary/boundaries declared"
+            )
+        return 1 if violations else 0
+
     python_targets = args.python_targets or ["bin/"]
     cov_targets = args.cov_targets or ["bin"]
     shell_suites = args.shell_suites or _default_shell_suites(repo_root)

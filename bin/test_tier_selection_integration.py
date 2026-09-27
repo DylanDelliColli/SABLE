@@ -7,11 +7,15 @@ no mocked pytest. Self-skips (SABLE-59zu clean-room contract: missing dep is
 a skip, never a false-fail/false-pass) when either plugin isn't importable in
 this interpreter.
 """
+# sable-test-load: nested-runner -- defining E2E exercises real pytest-testmon selection and fallback
 import importlib.util
+import os
 import signal
+import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 from textwrap import dedent
 
@@ -198,120 +202,6 @@ def test_missing_testmondata_falls_back_to_full_run_for_real_repo(fixture_repo):
     assert "2 passed" in result.stdout
 
 
-# --- cache-warm regression: real full bin/ suite, real testmon crash ---------
-# (SABLE-cmar4.3 second revise, mandated by chuck's CI root-cause on preview
-# 4a46439 / branch 2795ee2). This is deliberately NOT the synthetic
-# fixture_repo above: run_cache_warm's tolerance has to hold against THIS
-# repo's actual bin/ layout (44 extensionless files, 34 of them python by
-# shebang -- counted 2026-07-26, up from the ~23 this comment first recorded --
-# loaded in-process via SourceFileLoader by real bin/test_*.py suites). Red by
-# construction before the cmar4.3 second revise landed -- exit 3 with every
-# test passing; run_cache_warm's classify_cache_warm_outcome must turn that
-# into exit 0.
-#
-# CORRECTION (SABLE-jd5fj.19): an earlier revision of this comment added "which
-# a fresh temp repo cannot reproduce". That is FALSE, measured. One
-# extensionless python file that a test loads in-process is enough -- see
-# extensionless_repo at the bottom of this file, where the crash reproduces in a
-# synthetic tmp repo in ~0.1s. Only the REAL-REPO SCOPE is what this particular
-# test needs, not reproducibility, which is why the sentence mattered: believing
-# it stops the next person from writing the cheap synthetic A/B that isolates
-# --collect-only as the variable.
-
-_THIS_FILE_RELATIVE = "bin/" + Path(__file__).name
-
-
-# WHY THIS ASSERTION EXPLAINS ITSELF (SABLE-jd5fj.19 revise, measured 2026-07-26)
-#
-# `assert rc == 0` used to be bare, and a bare red here is UNDIAGNOSABLE: it
-# reports `assert -15 == 0` and nothing else. That collapsed two failures
-# that need OPPOSITE responses into one indistinguishable red --
-#   rc > 0  the nested run exited on its own and classify_cache_warm_outcome
-#           refused to tolerate it. A REAL regression: the suite went red, or
-#           the crash-tolerance carve-out stopped matching. Must block a merge.
-#   rc < 0  the nested pytest was killed by a SIGNAL. run_cache_warm's
-#           tolerance logic cannot produce a negative rc at all, so this is
-#           not a tolerance failure -- the child process was destroyed from
-#           outside. Correct response is to re-run, not to change code.
-# -- and the collapse cost a full review cycle: this test was read as a
-# branch regression on the strength of `-15`, and the hypothesis (new unit
-# tests in bin/ interacting with the nested full-suite run) was reasonable
-# and wrong. A base-vs-branch control cleared it, and an isolated SIGTERM
-# delivered to only the nested pytest reproduced `assert -15 == 0` exactly,
-# including the truncated captured stdout.
-#
-# It is deliberately still a FAILURE in both cases -- a killed run proves
-# nothing and must never be tolerated or retried into a green. Only the
-# legibility of the red changes.
-
-
-def _explain_cache_warm_rc(rc):
-    """The message the bare assert should have carried. Pure; unit-tested in
-    both polarities below so it cannot silently stop discriminating."""
-    if rc < 0:
-        sig = signal.Signals(-rc).name if -rc in signal.Signals.__members__.values() \
-            else f"signal {-rc}"
-        return (
-            f"the nested cache-warm pytest was KILLED BY {sig} (rc={rc}). This is "
-            "NOT a cache-warm tolerance failure -- classify_cache_warm_outcome only "
-            "ever returns a returncode the child chose for itself, and a child that "
-            "picks its own exit status never yields a negative one. Something "
-            "destroyed the process. SIGTERM/SIGKILL here means an external agent "
-            "(an agent-harness or tool wall-clock timeout, a manual interrupt, a "
-            "concurrent reaper) reached the child; SIGSEGV/SIGBUS would instead mean "
-            "the interpreter itself crashed and IS worth investigating. Re-run "
-            "before treating this as a code regression -- and if you are bisecting a "
-            "branch, take a base-vs-branch control, because this red carries no "
-            "information about the diff."
-        )
-    return (
-        f"the nested cache-warm pytest exited {rc} and classify_cache_warm_outcome "
-        "refused to tolerate it. This IS a real regression: either a test in bin/ "
-        "went red, or the pytest-testmon extensionless-file carve-out stopped "
-        "matching (it requires the crash markers AND an 'N passed' line AND no "
-        "'N failed'/'N error'). Read the captured stdout above -- run_cache_warm "
-        "echoes the whole nested run -- and start from its summary line."
-    )
-
-
-def test_real_repo_full_suite_testmon_noselect_crash_is_tolerated():
-    # --ignore=<this file> avoids the nested pytest run recursing into the
-    # test that is currently invoking it (this suite runs bin/ broadly).
-    repo_root = Path(__file__).resolve().parent.parent
-    rc = ts.run_cache_warm(repo_root, extra_pytest_args=[f"--ignore={_THIS_FILE_RELATIVE}"])
-    assert rc == 0, _explain_cache_warm_rc(rc)
-
-
-def test_explain_cache_warm_rc_names_the_signal_for_a_killed_child():
-    msg = _explain_cache_warm_rc(-15)
-
-    assert "SIGTERM" in msg
-    assert "NOT a cache-warm tolerance failure" in msg
-    # The actionable half: a killed child means re-run, not edit code.
-    assert "Re-run" in msg
-
-
-def test_negative_control_explain_cache_warm_rc_does_not_cry_signal_for_a_real_failure():
-    # BOTH polarities. A message that called every red a killed child would be
-    # exactly as undiagnosable as the bare assert was, in the opposite
-    # direction -- it would talk a genuine suite regression into a re-run.
-    msg = _explain_cache_warm_rc(3)
-
-    assert "real regression" in msg
-    assert "KILLED" not in msg
-    assert "SIGTERM" not in msg
-    assert "Re-run" not in msg
-
-
-def test_explain_cache_warm_rc_falls_back_when_the_signal_number_is_unknown():
-    # -99 is not a real signal; the helper must still say something true
-    # rather than raise inside an assertion message and mask the failure.
-    msg = _explain_cache_warm_rc(-99)
-
-    assert "signal 99" in msg
-    assert "NOT a cache-warm tolerance failure" in msg
-
-
 # --- the extensionless-file crash: reachable by EXECUTION, not by collection -
 # (SABLE-jd5fj.19)
 #
@@ -408,6 +298,78 @@ def test_positive_control_executing_testmon_run_crashes_on_this_fixture(extensio
     assert "pytest_runtest_logreport" in output, output
 
 
+def test_cache_warm_tolerates_known_crash_on_minimal_fixture(extensionless_repo, capfd):
+    rc = ts.run_cache_warm(extensionless_repo)
+    output = "".join(capfd.readouterr())
+
+    assert rc == 0, output
+    for marker in _EXTENSIONLESS_CRASH_MARKERS:
+        assert marker in output
+    assert "KNOWN pytest-testmon extensionless-file crash tolerated" in output
+
+
+def test_real_cache_warm_cli_reports_signal_death(tmp_path):
+    """The real CLI must translate a killed nested pytest into a legible
+    signal-specific failure, not Python's opaque negative-SystemExit status."""
+    repo = tmp_path / "repo"
+    bin_dir = repo / "bin"
+    bin_dir.mkdir(parents=True)
+    shutil.copy2(Path(ts.__file__), bin_dir / "tier_selection.py")
+    child_pid_file = repo / "pytest-child.pid"
+    (bin_dir / "test_slow.py").write_text(
+        dedent(
+            """\
+            import os
+            import time
+            from pathlib import Path
+
+            def test_slow():
+                Path(__file__).resolve().parents[1].joinpath(
+                    "pytest-child.pid"
+                ).write_text(str(os.getpid()))
+                time.sleep(30)
+            """
+        )
+    )
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "baseline")
+
+    proc = subprocess.Popen(
+        [sys.executable, str(bin_dir / "tier_selection.py"), "--cache-warm"],
+        cwd=repo,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 15
+        while not child_pid_file.exists() and time.monotonic() < deadline:
+            if proc.poll() is not None:
+                stdout, stderr = proc.communicate()
+                pytest.fail(
+                    "cache-warm wrapper exited before its nested pytest ran:\n"
+                    f"stdout:\n{stdout}\nstderr:\n{stderr}"
+                )
+            time.sleep(0.02)
+
+        assert child_pid_file.exists(), (
+            "nested pytest never reached the deliberately slow test")
+        child_pid = int(child_pid_file.read_text())
+        os.kill(child_pid, signal.SIGTERM)
+        stdout, stderr = proc.communicate(timeout=10)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+
+    assert proc.returncode == 128 + signal.SIGTERM, (stdout, stderr)
+    assert "killed by signal SIGTERM (15)" in stderr
+    assert "test failure" not in stderr.lower()
+
+
 def test_collect_only_testmon_is_clean_on_the_same_fixture(extensionless_repo):
     # Same corpus, same plugin, ONE flag different -- and this is the real
     # collector the tier calls, not a hand-written argv.
@@ -441,7 +403,7 @@ def test_collect_only_never_records_executed_coverage_fingerprints(extensionless
     the node ids it collected plus a checksum of each test FILE. What it can
     never record is which files a test EXECUTES, because nothing executed. That
     is both why an impact-tier run can never keep the coverage map fresh (only
-    warm_gate_testmon_cache / testmon-cache-warm.sh can) and why it never
+    the opt-in warm_gate_testmon_cache path can) and why it never
     reaches get_tests_fingerprints, the crash site.
     """
     result = ts._pytest_collect_only(extensionless_repo, ["--testmon"])

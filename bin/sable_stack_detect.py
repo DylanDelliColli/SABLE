@@ -9,6 +9,7 @@ onboarding skill (SABLE-gn7a.4). Three responsibilities:
 
          val=$(sed -n 's/^testCommand=//p'      "$repo/.sable" | head -1)
          val=$(sed -n 's/^integrationBranch=//p' "$repo/.sable" | head -1)
+         val=$(sed -n 's/^testTimeout=//p'       "$repo/.sable" | head -1)
 
      so a line is a valid `KEY=` line **iff** it begins with exactly `KEY=`
      (case-sensitive, no whitespace before the key and none around the `=`);
@@ -44,11 +45,12 @@ import re
 import subprocess
 from typing import NamedTuple, Optional
 
-# The two keys the lib-identity.sh resolvers understand. Order is the order
+# The three keys the lib-identity.sh resolvers understand. Order is the order
 # validate() tries them per line; they are disjoint so order is immaterial.
 TEST_COMMAND_KEY = "testCommand"
 INTEGRATION_BRANCH_KEY = "integrationBranch"
-KNOWN_KEYS = (TEST_COMMAND_KEY, INTEGRATION_BRANCH_KEY)
+TEST_TIMEOUT_KEY = "testTimeout"
+KNOWN_KEYS = (TEST_COMMAND_KEY, INTEGRATION_BRANCH_KEY, TEST_TIMEOUT_KEY)
 
 # Explicit "no framework detected" signal (Detection.signal). A sentinel string,
 # not None/"" — the skill branches on it to ask the human, so it must be
@@ -159,11 +161,15 @@ def _reject_multiline(value: str, key: str):
 
 
 def build_sable(*, test_command: Optional[str] = None,
-                integration_branch: Optional[str] = None) -> str:
-    """Render `.sable` content: `testCommand=<value>` and/or
-    `integrationBranch=<value>`, in that order, each a single line, exactly as
-    the confirmed values (no escaping, no reflow — the grammar is verbatim).
-    Trailing newline when non-empty; empty string when nothing to write."""
+                integration_branch: Optional[str] = None,
+                test_timeout: Optional[str] = None) -> str:
+    """Render `.sable` content for any resolver-backed key.
+
+    Keys are emitted in testCommand/integrationBranch/testTimeout order, each
+    as a single line and exactly as supplied (no escaping or reflow — the
+    grammar is verbatim). Trailing newline when non-empty; empty string when
+    nothing is supplied.
+    """
     lines = []
     if test_command is not None:
         _reject_multiline(test_command, TEST_COMMAND_KEY)
@@ -171,6 +177,9 @@ def build_sable(*, test_command: Optional[str] = None,
     if integration_branch is not None:
         _reject_multiline(integration_branch, INTEGRATION_BRANCH_KEY)
         lines.append(INTEGRATION_BRANCH_KEY + "=" + integration_branch)
+    if test_timeout is not None:
+        _reject_multiline(test_timeout, TEST_TIMEOUT_KEY)
+        lines.append(TEST_TIMEOUT_KEY + "=" + test_timeout)
     if not lines:
         return ""
     return "\n".join(lines) + "\n"
@@ -178,13 +187,15 @@ def build_sable(*, test_command: Optional[str] = None,
 
 def write(path: str, *, test_command: Optional[str] = None,
           integration_branch: Optional[str] = None,
+          test_timeout: Optional[str] = None,
           execute_result: "Optional[ExecuteResult]" = None) -> str:
     """Write a `.sable` file at `path` and return the content written.
 
     Refuses (WriteRefused) to persist a `testCommand=` line unless
     `execute_result` is a passing ExecuteResult — the execute-once run must
     have actually succeeded. `integrationBranch=` carries no execution and is
-    written unconditionally. The refusal surfaces the failing exit code.
+    written unconditionally, as is `testTimeout=`. The refusal surfaces the
+    failing exit code.
     """
     if test_command is not None:
         if execute_result is None:
@@ -200,7 +211,8 @@ def write(path: str, *, test_command: Optional[str] = None,
                 exit_code=execute_result.exit_code,
             )
     content = build_sable(test_command=test_command,
-                          integration_branch=integration_branch)
+                          integration_branch=integration_branch,
+                          test_timeout=test_timeout)
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(content)
     return content

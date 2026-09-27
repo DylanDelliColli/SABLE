@@ -106,6 +106,7 @@ def test_real_own_container_is_not_flagged_phantom_or_ghost(throwaway_container)
     allowed_bits = preflight.EXIT_PHANTOM | preflight.EXIT_GHOST | preflight.EXIT_ERROR
     assert result.returncode & ~allowed_bits == 0, result.stdout + result.stderr
     payload = json.loads(result.stdout)
+    assert payload["probe_container_id"], f"host-namespace probe did not complete: {payload}"
     full_id = subprocess.run(
         ["docker", "inspect", throwaway_container, "--format", "{{.Id}}"],
         capture_output=True, text=True, timeout=10,

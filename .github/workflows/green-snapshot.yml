@@ -104,7 +104,7 @@ jobs:
           # SABLE-cmar4.6's third revise, but this line never did.
           # bin/test_clean_room_dep_parity.py checks mechanically that these
           # two clean-room install lines cannot silently drift apart again.
-          pip install pytest pytest-testmon pytest-impact pytest-cov diff_cover
+          pip install -r .github/ci/test-requirements.txt
 
       # gh (SABLE-apt5a): deliberately NOT checked or installed here. Unlike
       # ci-verify.yml's SABLE-r3i6 dedup guard and sable-merge-gate's
@@ -122,7 +122,14 @@ jobs:
           git config --global init.defaultBranch master
 
       - name: pytest — full bin/ suite
-        run: python -m pytest bin/ -q -p no:cacheprovider
+        # Actions runners are ephemeral, so this run has no prior local
+        # baseline to diff. The SABLE reporter still names every skipped
+        # node; cross-run ADDED/REMOVED comparison is available to persistent
+        # manager checkouts, not across these disposable workflow machines.
+        run: python -m pytest bin/ -q -rs -p no:cacheprovider --sable-report-skip-set
+
+      - name: Test-load declarations (SABLE-ssu6v — nested runners are explicit)
+        run: python bin/columbo-cost-prefilter.py --check-load-declarations
 
       - name: Green snapshot — full_snapshot tier, retry-as-classifier
         id: snapshot

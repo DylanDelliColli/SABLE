@@ -10,6 +10,8 @@ Proves: a worker WINDOW is created, its pane is tagged
 (@sable_role=worker/@sable_bead/@sable_status=running), the dispatch prompt file
 is written, and the read-instruction is delivered into the pane.
 """
+import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -18,17 +20,77 @@ import subprocess
 import tempfile
 import time
 import uuid
+from importlib.machinery import SourceFileLoader
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 BIN = Path(__file__).resolve().parent / "sable-spawn-worker"
+_LOADER = SourceFileLoader("sable_spawn_worker_integration", str(BIN))
+_SPEC = importlib.util.spec_from_loader("sable_spawn_worker_integration", _LOADER)
+ssw = importlib.util.module_from_spec(_SPEC)
+_LOADER.exec_module(ssw)
 HAVE_TMUX = shutil.which("tmux") is not None
 HAVE_BD = shutil.which("bd") is not None
 BEAD = "SABLE-bldh.2"  # an open bead in this repo (read-only here)
 BUNDLE_SIBLING = "SABLE-06dr"  # a second open bead, used only as --bundle sibling (read-only here)
-pytestmark = pytest.mark.skipif(not (HAVE_TMUX and HAVE_BD),
-                                reason="needs tmux + bd")
+pytestmark = pytest.mark.skipif(not HAVE_TMUX, reason="needs tmux")
+
+
+@pytest.fixture(autouse=True)
+def require_bd_except_for_missing_bd_regression(request):
+    """Only the Door-A regression is designed to run without host ``bd``."""
+    if (
+        not HAVE_BD
+        and request.node.name != "test_dispatch_succeeds_with_bd_absent"
+    ):
+        pytest.skip("needs bd")
+
+
+def _signed_authority(*, kind="break-glass", tier=None, scope=()):
+    proof = {
+        "version": 1,
+        "kind": kind,
+        "approved_by": "test-operator",
+        "approved_at": "2026-07-28T00:00:00+00:00",
+        "base": {"ref": "HEAD", "sha": "a" * 40},
+    }
+    if kind == "break-glass":
+        proof.update({
+            "reason": "synthetic unbounded authority for existing spawn tests",
+            "failed_checks": ["test fixture"],
+        })
+    else:
+        proof.update({
+            "tier": tier,
+            "scope": list(scope),
+            "planning_since": "2026-07-28T00:00:00+00:00",
+            "artifacts": {},
+            "swarm": None,
+            "evidence_sha256": "e" * 64,
+        })
+    proof["receipt_id"] = hashlib.sha256(
+        json.dumps(
+            proof, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode()
+    ).hexdigest()
+    return proof
+
+
+def _write_execution_state(path, authority):
+    path.write_text(json.dumps({"mode": "execution", "handoff": authority}))
+
+
+def _wait_until(predicate, *, timeout=3.0, interval=0.02, description="condition"):
+    """Poll an observable boundary instead of paying a fixed scheduler delay."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        value = predicate()
+        if value:
+            return value
+        time.sleep(interval)
+    raise AssertionError(f"timed out waiting for {description}")
 
 
 @pytest.fixture()
@@ -37,10 +99,25 @@ def sock():
     # the host session the manager spawns workers into
     subprocess.run(["tmux", "-L", s, "new-session", "-d", "-s", "sable",
                     "-x", "200", "-y", "50", "bash --noprofile --norc"], check=True)
-    time.sleep(0.4)
+    _wait_until(
+        lambda: subprocess.run(
+            ["tmux", "-L", s, "has-session", "-t", "sable"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ).returncode == 0,
+        description="tmux host session",
+    )
     yield s
     subprocess.run(["tmux", "-L", s, "kill-server"],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+@pytest.fixture(autouse=True)
+def execution_mode_state(tmp_path, monkeypatch):
+    """Launch tests must not inherit the checkout's live planning/execution mode."""
+    state = tmp_path / "mode-state.json"
+    _write_execution_state(state, _signed_authority())
+    monkeypatch.setenv("SABLE_MODE_STATE", str(state))
 
 
 def _tmux(s, *args):
@@ -62,17 +139,61 @@ def _clean_env(**overrides):
     return env
 
 
+def _curated_path_without_bd(path: Path) -> str:
+    """Keep the real dispatch prerequisites while proving ``bd`` is absent."""
+    path.mkdir()
+    for command in ("bash", "git", "tmux"):
+        executable = shutil.which(command)
+        assert executable is not None, f"integration prerequisite missing: {command}"
+        (path / command).symlink_to(Path(executable).resolve())
+    curated = str(path)
+    assert shutil.which("bd", path=curated) is None
+    return curated
+
+
 def _refs_snapshot(repo: Path) -> set[str]:
-    """Full refs/heads snapshot of `repo` — used to assert a fixture that
-    mutates branches (worktree add/remove, branch -D) leaves the real repo's
-    tracked-branch set byte-identical before vs after (SABLE-0ssz.4)."""
+    """Return the names of every local branch in ``repo``."""
     r = subprocess.run(["git", "-C", str(repo), "for-each-ref", "refs/heads",
                         "--format=%(refname)"],
                        capture_output=True, text=True, check=True)
     return set(r.stdout.split())
 
 
+def test_approved_handoff_refuses_outside_scope_before_external_work(tmp_path):
+    _write_execution_state(
+        Path(os.environ["SABLE_MODE_STATE"]),
+        _signed_authority(kind="approved", tier="quick", scope=[BEAD]),
+    )
+    dispatch_dir = tmp_path / "dispatch"
+    env = _clean_env(
+        SABLE_TMUX_SOCKET=f"absent-{uuid.uuid4().hex[:8]}",
+        SABLE_TMUX_SESSION="absent",
+        SABLE_DISPATCH_DIR=str(dispatch_dir),
+        SABLE_MAX_LOAD_PER_CORE="0",
+    )
+
+    result = subprocess.run(
+        [
+            "python3", str(BIN), BUNDLE_SIBLING,
+            "--worktree", str(tmp_path / "worktree"),
+            "--skip-governance",
+        ],
+        capture_output=True, text=True, env=env,
+    )
+
+    assert result.returncode == 15, result.stderr
+    assert BUNDLE_SIBLING in result.stderr
+    assert "outside" in result.stderr
+    assert "receipt" in result.stderr
+    assert not dispatch_dir.exists(), \
+        "scope refusal happened after dispatch artifacts were written"
+
+
 def test_spawn_creates_tagged_worker_window(sock):
+    _write_execution_state(
+        Path(os.environ["SABLE_MODE_STATE"]),
+        _signed_authority(kind="approved", tier="quick", scope=[BEAD]),
+    )
     with tempfile.TemporaryDirectory() as wt, tempfile.TemporaryDirectory() as dd:
         env = {
             **_clean_env(),
@@ -91,7 +212,7 @@ def test_spawn_creates_tagged_worker_window(sock):
             capture_output=True, text=True, env=env,
         )
         assert r.returncode == 0, r.stderr
-        time.sleep(0.6)
+        _wait_for_worker_count(sock, BEAD)
 
         # the dispatch prompt file was written
         dispatch = Path(dd) / f"{BEAD}.md"
@@ -128,6 +249,75 @@ def test_spawn_creates_tagged_worker_window(sock):
         assert "worker-sable-bldh-2" in win
 
 
+def test_dispatch_succeeds_with_bd_absent(sock, tmp_path, monkeypatch, capsys):
+    """The optional comments read must not turn ``bd`` into a launch prerequisite.
+
+    The mandatory bead record is supplied at the existing ``_run`` seam so the
+    rest of ``main`` is exercised unchanged: real git reads, prompt write, tmux
+    window creation/tagging, and dispatch delivery all run with a PATH that has
+    no ``bd`` executable.
+    """
+    bead_id = "SABLE-7rp12"
+    bead = [{
+        "id": bead_id,
+        "title": "Dispatch without optional comments",
+        "description": "Prove the worker dispatch survives a missing bd binary.",
+        "notes": "",
+        "labels": [],
+        "status": "open",
+    }]
+    real_run = ssw._run
+
+    def run_with_bead_fixture(args):
+        if args == ["bd", "show", bead_id, "--json"]:
+            return json.dumps(bead)
+        return real_run(args)
+
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    dispatch_dir = tmp_path / "dispatch"
+    monkeypatch.setattr(ssw, "_run", run_with_bead_fixture)
+    monkeypatch.setenv("PATH", _curated_path_without_bd(tmp_path / "path"))
+    monkeypatch.setenv("SABLE_TMUX_SOCKET", sock)
+    monkeypatch.setenv("SABLE_TMUX_SESSION", "sable")
+    monkeypatch.setenv("SABLE_WORKER_CMD", "bash --noprofile --norc")
+    monkeypatch.setenv("SABLE_DISPATCH_DIR", str(dispatch_dir))
+    monkeypatch.setenv("SABLE_DISPATCH_READY_TIMEOUT", "0")
+    monkeypatch.setenv("SABLE_MAX_LOAD_PER_CORE", "0")
+    monkeypatch.setenv("SABLE_DISPATCH_POLL_INTERVAL", "0.05")
+    monkeypatch.setenv("SABLE_DISPATCH_SUBMIT_TRIES", "2")
+    monkeypatch.delenv("SABLE_WORKER_PANE", raising=False)
+    monkeypatch.delenv("SABLE_LANE", raising=False)
+    monkeypatch.delenv("SABLE_ROLE", raising=False)
+    monkeypatch.delenv("CLAUDE_AGENT_NAME", raising=False)
+
+    result = ssw.main([
+        bead_id,
+        "--worktree", str(worktree),
+        "--model", "haiku",
+        "--skip-governance",
+    ])
+
+    assert result == 0
+    _wait_for_worker_count(sock, bead_id)
+    dispatch = dispatch_dir / f"{bead_id}.md"
+    assert dispatch.exists()
+    assert bead_id in dispatch.read_text()
+    listing = _tmux(
+        sock, "list-panes", "-a", "-F",
+        "#{@sable_role} #{@sable_bead} #{@sable_status}",
+    ).stdout
+    assert any(
+        line.startswith("worker") and bead_id in line and "running" in line
+        for line in listing.splitlines()
+    ), listing
+    stderr = capsys.readouterr().err
+    assert f"could not fetch comments for {bead_id}" in stderr
+    assert "bd" in stderr
+    assert "No such file or directory" in stderr
+    assert f"spawned {ssw.window_name(bead_id)} for {bead_id}" in stderr
+
+
 def test_spawn_bundle_renders_all_bead_descriptions_into_prompt(sock):
     """SABLE-q13h TEST SPEC: the dispatch prompt for a bundle must contain all
     bundled bead ids + descriptions, not just the lead's — end to end through
@@ -151,7 +341,9 @@ def test_spawn_bundle_renders_all_bead_descriptions_into_prompt(sock):
             capture_output=True, text=True, env=env,
         )
         assert r.returncode == 0, r.stderr
-        time.sleep(0.6)
+        assert "BREAK-GLASS receipt" in r.stderr, \
+            "the unbounded dispatch bypass was not surfaced"
+        _wait_for_worker_count(sock, BEAD)
 
         dispatch = Path(dd) / f"{BEAD}.md"
         assert dispatch.exists()
@@ -230,7 +422,10 @@ def test_worker_prompt_file_contains_notes(sock):
                 capture_output=True, text=True, env=env,
             )
             assert r.returncode == 0, r.stderr
-            time.sleep(0.6)
+            _wait_until(
+                lambda: (Path(dd) / f"{bead_id}.md").exists(),
+                description=f"dispatch file for {bead_id}",
+            )
             body = (Path(dd) / f"{bead_id}.md").read_text()
             assert desc_marker in body   # positive control: probe finds what IS pushed
             assert notes_marker in body  # the fix: notes now reach the prompt too
@@ -277,7 +472,10 @@ def test_worker_prompt_file_contains_comments(sock):
                 capture_output=True, text=True, env=env,
             )
             assert r.returncode == 0, r.stderr
-            time.sleep(0.6)
+            _wait_until(
+                lambda: (Path(dd) / f"{bead_id}.md").exists(),
+                description=f"dispatch file for {bead_id}",
+            )
             body = (Path(dd) / f"{bead_id}.md").read_text()
             assert desc_marker in body
             assert comment_marker in body
@@ -334,13 +532,16 @@ def test_dispatch_refused_on_notes_only_bead(sock):
                 capture_output=True, text=True, env=env,
             )
             assert r2.returncode == 0, r2.stderr
-            time.sleep(0.6)
+            _wait_until(
+                lambda: (Path(dd) / f"{bead_id}.md").exists(),
+                description=f"dispatch file for {bead_id}",
+            )
             assert (Path(dd) / f"{bead_id}.md").exists()
     finally:
         _delete_scratch_bead(bead_id)
 
 
-def test_spawn_without_worktree_lands_where_dispatch_points(sock):
+def test_spawn_without_worktree_lands_where_dispatch_points(sock, request):
     """SABLE-bldh.11 regression: with NO --worktree, the path `bd worktree create`
     actually creates MUST equal the path embedded in the dispatch file (== the
     tmux -c target) AND exist on disk. The original bug created the worktree
@@ -354,7 +555,25 @@ def test_spawn_without_worktree_lands_where_dispatch_points(sock):
     # SABLE-0ssz.4: fail fast on an orphan left by a prior hard-killed run
     # instead of silently colliding with `bd worktree create`'s own error.
     assert not expected.exists(), f"orphan worktree from a prior run at {expected}"
-    before_refs = _refs_snapshot(repo)
+    # SABLE-3yk8m: model an unrelated fleet actor creating a branch after this
+    # test starts. Cleanup must prove that this test's own artifacts are gone
+    # without treating legitimate concurrent repository activity as leakage.
+    unrelated_branch = f"wk-unrelated-{uuid.uuid4().hex[:8]}"
+    subprocess.run(
+        ["git", "-C", str(repo), "branch", unrelated_branch, "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    def cleanup_unrelated_branch():
+        subprocess.run(
+            ["git", "-C", str(repo), "branch", "-D", unrelated_branch],
+            capture_output=True,
+            text=True,
+        )
+
+    request.addfinalizer(cleanup_unrelated_branch)
     with tempfile.TemporaryDirectory() as dd:
         env = {
             **_clean_env(),
@@ -387,10 +606,10 @@ def test_spawn_without_worktree_lands_where_dispatch_points(sock):
                            capture_output=True, text=True)
             subprocess.run(["git", "-C", str(repo), "branch", "-D", wt_name],
                            capture_output=True, text=True)
-            # SABLE-0ssz.4: the real repo's branch set must be byte-identical
-            # before vs after — proves cleanup removed everything this run
-            # created and nothing else leaked.
-            assert _refs_snapshot(repo) == before_refs
+            refs_after_cleanup = _refs_snapshot(repo)
+            assert f"refs/heads/{wt_name}" not in refs_after_cleanup
+            assert f"refs/heads/{unrelated_branch}" in refs_after_cleanup
+            assert not expected.exists()
 
 
 def test_spawn_scope_already_prefixed_is_idempotent(sock):
@@ -477,10 +696,21 @@ def test_worker_window_inherits_lane_manager_identity(sock):
     """SABLE-bldh.13 regression: the worker window must carry the invoking lane
     manager's CLAUDE_AGENT_NAME (+ manager role) so its push's for-chuck handoff
     fires (post-push-merge-notify gates on manager identity) and is attributed to
-    the lane, not the session-default 'lincoln'. Verified by dumping the worker
-    process env to a file."""
+    the lane, not the session-default 'lincoln'. SABLE-ndaup additionally
+    requires the worker window to disable Claude Code's generated prompt
+    suggestions. Verified by dumping the worker process env to a file."""
     with tempfile.TemporaryDirectory() as wt, tempfile.TemporaryDirectory() as dd:
         dump = Path(dd) / "worker-env.txt"
+        # A contradictory session value proves the worker's value comes from
+        # worker_env_args' per-window `-e`, not ambient tmux inheritance.
+        _tmux(
+            sock,
+            "set-environment",
+            "-t",
+            "sable",
+            "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION",
+            "1",
+        )
         env = {
             **_clean_env(),
             "SABLE_TMUX_SOCKET": sock,
@@ -500,7 +730,10 @@ def test_worker_window_inherits_lane_manager_identity(sock):
             capture_output=True, text=True, env=env,
         )
         assert r.returncode == 0, r.stderr
-        time.sleep(0.8)
+        _wait_until(
+            lambda: dump.exists() and "SABLE_WORKER_PANE=1" in dump.read_text(),
+            description="worker environment dump",
+        )
         content = dump.read_text() if dump.exists() else ""
         assert "CLAUDE_AGENT_NAME=optimus" in content, content
         assert "CLAUDE_AGENT_ROLE=manager" in content, content
@@ -510,6 +743,7 @@ def test_worker_window_inherits_lane_manager_identity(sock):
         # re-dispatching its own bead) — while the manager identity above is
         # still present for the post-push for-chuck handoff.
         assert "SABLE_WORKER_PANE=1" in content, content
+        assert "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=0" in content, content
 
 
 def test_dispatch_from_worker_pane_is_refused(sock):
@@ -582,7 +816,7 @@ def test_worker_bypass_gate_is_accepted(sock):
             capture_output=True, text=True, env=env,
         )
         assert r.returncode == 0, r.stderr
-        time.sleep(0.5)
+        _wait_until(rec.exists, description="accepted startup-gate key")
         assert rec.exists(), "stand-in never received a key (gate not accepted)"
         assert rec.read_text().strip() == "2", rec.read_text()
 
@@ -882,7 +1116,7 @@ def test_second_spawn_for_in_progress_bead_is_refused(sock):
             capture_output=True, text=True, env=env,
         )
         assert r1.returncode == 0, r1.stderr
-        time.sleep(0.5)
+        _wait_for_worker_count(sock, bead_id)
 
         r2 = subprocess.run(
             ["python3", str(BIN), bead_id, "--worktree", wt2, "--model", "haiku"],
@@ -950,6 +1184,13 @@ def _worker_panes(sock, bead_id):
             if line.startswith("worker") and bead_id in line]
 
 
+def _wait_for_worker_count(sock, bead_id, count=1):
+    return _wait_until(
+        lambda: len(_worker_panes(sock, bead_id)) == count,
+        description=f"{count} worker pane(s) for {bead_id}",
+    )
+
+
 def test_unreadable_footprint_dispatch_does_not_silently_proceed(sock):
     """SABLE-47try: the dispatching bead's '## File footprint' heading is
     PRESENT but names no path, while an overlapping bead is genuinely
@@ -987,7 +1228,7 @@ def test_bead_declaring_no_footprint_still_dispatches_over_active_claim(sock):
             capture_output=True, text=True, env=_overlap_env(stub_dir, sock, dd),
         )
         assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
-        time.sleep(0.5)
+        _wait_for_worker_count(sock, "FAKE-47try-target")
         assert len(_worker_panes(sock, "FAKE-47try-target")) == 1
 
 
@@ -1054,7 +1295,7 @@ def test_claim_then_hold_first_dispatch_succeeds(sock):
             capture_output=True, text=True, env=env,
         )
         assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
-        time.sleep(0.5)
+        _wait_for_worker_count(sock, bead_id)
 
         # the dispatch prompt file was written for the bead
         assert (Path(dd) / f"{bead_id}.md").exists()
@@ -1236,7 +1477,7 @@ def test_claim_skipped_when_bead_already_assigned_to_dispatching_lane(sock):
         )
         assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
         assert "skipping redundant bd update --claim" in r.stderr
-        time.sleep(0.5)
+        _wait_for_worker_count(sock, bead_id)
 
         assert (Path(dd) / f"{bead_id}.md").exists()
         listing = _tmux(sock, "list-panes", "-a", "-F",
@@ -1289,7 +1530,6 @@ def test_claim_skip_still_flips_open_bead_to_in_progress(sock):
         assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
         assert "skipping redundant bd update --claim" in r.stderr
         assert "open -> in_progress" in r.stderr
-        time.sleep(0.3)
 
         data = json.loads(db_path.read_text())
         assert data[0]["status"] == "in_progress", data
@@ -1337,7 +1577,6 @@ def test_claim_skip_does_not_churn_already_in_progress_bead(sock):
         assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
         assert "skipping redundant bd update --claim" in r.stderr
         assert "open -> in_progress" not in r.stderr
-        time.sleep(0.3)
 
         data = json.loads(db_path.read_text())
         assert data[0]["status"] == "in_progress", data
@@ -1384,7 +1623,6 @@ def test_claim_still_runs_when_bead_assigned_to_different_lane(sock):
         )
         assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
         assert "skipping redundant bd update --claim" not in r.stderr
-        time.sleep(0.3)
 
         data = json.loads(db_path.read_text())
         assert data[0]["assignee"] == "test-worker", data
@@ -1480,7 +1718,12 @@ def test_worker_pane_flips_done_on_process_exit_without_worker_action(sock):
             capture_output=True, text=True, env=env,
         )
         assert rr.returncode == 0, rr.stderr
-        time.sleep(0.4)
+        _wait_until(
+            lambda: pane not in _tmux(
+                sock, "list-panes", "-a", "-F", "#{pane_id}"
+            ).stdout.splitlines(),
+            description=f"reap of pane {pane}",
+        )
         remaining = _tmux(sock, "list-panes", "-a", "-F", "#{pane_id}").stdout
         assert pane not in remaining.splitlines(), remaining
 
@@ -1566,7 +1809,7 @@ def test_respawn_reopens_closed_bead_and_releases_stale_tree_claim(sock):
             capture_output=True, text=True, env=env,
         )
         assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
-        time.sleep(0.5)
+        _wait_for_worker_count(sock, bead_id)
 
         # (a) the closed bead was reopened to in_progress — no reclaim crash
         assert "reopened closed bead" in r.stderr, r.stderr
@@ -1711,7 +1954,7 @@ def test_spawn_stamps_owning_lane_on_worker_pane(sock):
             capture_output=True, text=True, env=env,
         )
         assert r.returncode == 0, r.stderr
-        time.sleep(0.6)
+        _wait_for_worker_count(sock, BEAD)
 
         lane_tags = _tmux(sock, "list-panes", "-a",
                           "-F", "#{@sable_role} #{@sable_lane}").stdout
@@ -1759,7 +2002,6 @@ def test_dispatch_tags_bead_with_branch_metadata(sock):
             capture_output=True, text=True, env=env,
         )
         assert r.returncode == 0, r.stderr
-        time.sleep(0.3)
 
         show = subprocess.run(["bd", "show", bead_id, "--json"], env=env,
                               capture_output=True, text=True)
@@ -1802,7 +2044,6 @@ def test_skip_governance_dispatch_does_not_write_branch_metadata(sock):
             capture_output=True, text=True, env=env,
         )
         assert r.returncode == 0, r.stderr
-        time.sleep(0.3)
 
         show = subprocess.run(["bd", "show", bead_id, "--json"], env=env,
                               capture_output=True, text=True)
@@ -1898,7 +2139,7 @@ def test_default_dispatch_announces_the_default_and_stamps_what_launched(sock):
             capture_output=True, text=True, env=env,
         )
         assert r.returncode == 0, r.stderr
-        time.sleep(0.4)
+        _wait_for_worker_count(sock, bead_id)
 
         # (mn1da) the choice is legible at dispatch: model named, default named
         assert "sonnet" in r.stderr
@@ -1938,7 +2179,7 @@ def test_stamp_records_the_model_that_launched_not_the_one_requested(sock):
             capture_output=True, text=True, env=env,
         )
         assert r.returncode == 0, r.stderr
-        time.sleep(0.4)
+        _wait_for_worker_count(sock, bead_id)
 
         assert "--model opus" in _pane_start_command(sock, bead_id)
         assert _model_meta(env, bead_id)["model"] == "opus"
@@ -1969,7 +2210,7 @@ def test_stamp_says_unknown_rather_than_asserting_an_unlaunched_model(sock):
             capture_output=True, text=True, env=env,
         )
         assert r.returncode == 0, r.stderr
-        time.sleep(0.4)
+        _wait_for_worker_count(sock, bead_id)
 
         assert _model_meta(env, bead_id) == {"model": "unknown",
                                              "model_source": "worker-cmd-override"}
@@ -2013,7 +2254,7 @@ def test_refused_spawn_leaves_no_attribution_and_redispatch_records_the_tier_tha
             capture_output=True, text=True, env=env,
         )
         assert r2.returncode == 0, r2.stderr
-        time.sleep(0.4)
+        _wait_for_worker_count(sock, bead_id)
 
         assert "--model opus" in _pane_start_command(sock, bead_id)
         assert _model_meta(env, bead_id) == {"model": "opus",
@@ -2045,7 +2286,7 @@ def test_skip_governance_dispatch_does_not_stamp_model_metadata(sock):
             capture_output=True, text=True, env=env,
         )
         assert r.returncode == 0, r.stderr
-        time.sleep(0.4)
+        _wait_for_worker_count(sock, bead_id)
 
         assert _model_meta(env, bead_id) == {}
         assert "model=sonnet model_source=default" in r.stderr
@@ -2104,21 +2345,56 @@ def test_the_tool_under_test_is_this_branch_not_the_installed_symlink():
     assert "str(BIN)" in source
 
 
-@pytest.fixture()
-def real_bd_repo():
+@pytest.fixture(scope="session")
+def real_bd_template(tmp_path_factory):
     """A REAL bd store — embedded dolt, the same backend the fleet runs — in a
     throwaway git repo. Not a stand-in CLI and not the project database: the
     dispatch-prep brief for this bead is explicit that stray scratch beads feed
-    the very overlap_check under repair, so nothing here is allowed to touch
-    the project's beads. The whole store dies with the temp dir."""
-    with tempfile.TemporaryDirectory() as d:
-        repo = Path(d)
-        subprocess.run(["git", "init", "-q", str(repo)], check=True)
-        init = subprocess.run(["bd", "init", "--prefix", "FZTEST"],
-                              cwd=repo, capture_output=True, text=True)
-        if init.returncode != 0:
-            pytest.skip(f"could not create an isolated bd store: {init.stderr[-400:]}")
-        yield repo
+    the very overlap_check under repair. Build the cold baseline once; each
+    consumer receives a deep copy from ``real_bd_repo`` below."""
+    # The module's autouse skip guard cannot cover this: it is function-scoped,
+    # and pytest resolves this SESSION-scoped fixture first, so in a bd-less
+    # environment we reach the subprocess call before any skip can fire. The
+    # returncode check below is likewise unreachable — a missing binary raises
+    # FileNotFoundError rather than returning nonzero. That is why the CI clean
+    # room (python + tmux only, deliberately NO bd) reported 6 ERRORS instead of
+    # 6 skips, breaking the ci-verify contract that every test must pass or
+    # self-skip there (SABLE-59zu).
+    if not HAVE_BD:
+        pytest.skip("needs bd")
+    repo = tmp_path_factory.mktemp("spawn-worker-real-bd-template")
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    init = subprocess.run(["bd", "init", "--prefix", "FZTEST"],
+                          cwd=repo, capture_output=True, text=True)
+    if init.returncode != 0:
+        pytest.skip(f"could not create an isolated bd store: {init.stderr[-400:]}")
+    return repo
+
+
+@pytest.fixture()
+def real_bd_repo(real_bd_template, tmp_path):
+    """An isolated deep copy of the immutable real-BD session baseline."""
+    repo = tmp_path / "real-bd-repo"
+    shutil.copytree(real_bd_template, repo)
+    return repo
+
+
+def test_real_bd_fixture_copies_share_no_mutable_state(real_bd_template, tmp_path):
+    """Guard the speedup: no Git or embedded-Dolt file is shared by copies."""
+    left = tmp_path / "left"
+    right = tmp_path / "right"
+    shutil.copytree(real_bd_template, left)
+    shutil.copytree(real_bd_template, right)
+
+    compared = 0
+    for left_file in (left / ".beads").rglob("*"):
+        if not left_file.is_file():
+            continue
+        right_file = right / ".beads" / left_file.relative_to(left / ".beads")
+        if right_file.is_file():
+            compared += 1
+            assert not os.path.samefile(left_file, right_file), left_file
+    assert compared > 0, "isolation probe compared no copied beads files"
 
 
 def _bd(repo: Path, *args) -> str:
@@ -2176,8 +2452,12 @@ def test_real_bd_bundle_sharing_a_declared_path_dispatches(sock, real_bd_repo):
     """THE BEAD, end to end, at the size it actually fired (SABLE-k9syl: tarzan's
     live 3-bead bundle). THREE REAL beads in a REAL bd store, all declaring
     shared_target.py — which is the ordinary reason to bundle them into one
-    worktree — dispatched as one bundle through the real CLI. Before the fix the
-    invocation claimed the siblings, then denied itself against its own claims:
+    worktree — dispatched as one bundle through the real CLI. It deliberately
+    uses repeated ``--bundle A --bundle B`` flags, preserving SABLE-xrcce's
+    parser regression at the real process/store boundary without running this
+    same 3-bead success path twice. Before the fixes, either the first sibling
+    was silently dropped or the invocation claimed the siblings and then denied
+    itself against its own claims:
 
         - SABLE-bjabn (…, in-progress): hooks/test/test-tier-red-capture.sh
         SCHEDULING CONSTRAINT: dispatch denied.
@@ -2190,20 +2470,22 @@ def test_real_bd_bundle_sharing_a_declared_path_dispatches(sock, real_bd_repo):
 
     with tempfile.TemporaryDirectory() as dd, tempfile.TemporaryDirectory() as wt:
         r = subprocess.run(
-            ["python3", str(BIN), lead, "--bundle", f"{sib_a},{sib_b}",
+            ["python3", str(BIN), lead,
+             "--bundle", sib_a, "--bundle", sib_b,
              "--worktree", wt, "--model", "haiku"],
             capture_output=True, text=True, env=_real_bd_env(sock, dd),
             cwd=real_bd_repo,
         )
         assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
         assert "SCHEDULING CONSTRAINT" not in r.stderr
-        time.sleep(0.6)
+        _wait_for_worker_count(sock, lead)
 
         # a worker pane really exists for the lead bead
         assert len(_worker_panes(sock, lead)) == 1
         # and the dispatch prompt binds the worker to ALL THREE beads
         prompt = (Path(dd) / f"{lead}.md").read_text()
-        assert sib_a in prompt and sib_b in prompt
+        assert sib_a in prompt, "the first --bundle occurrence was dropped"
+        assert sib_b in prompt
 
     # Every bundle member is claimed in the REAL store, matching the live pane —
     # status AND assignee. This is also the POSITIVE CONTROL for the complement
@@ -2275,49 +2557,6 @@ def test_real_bd_foreign_overlap_denies_and_leaves_the_bundle_open(sock, real_bd
         status, assignee = after[bid]
         assert status == "open", bid
         assert assignee == "", f"{bid} left assigned to {assignee!r} by a refusal"
-
-
-# --- SABLE-xrcce: the repeated `--bundle` flag form must not silently drop --
-
-
-def test_real_bd_bundle_repeated_flag_form_dispatches_all_three(sock, real_bd_repo):
-    """TEST SPEC (SABLE-xrcce), the leg a unit test on argparse alone would not
-    catch: THREE REAL beads in a REAL bd store, dispatched with the REPEATED
-    `--bundle` flag form (the exact shape from the bug report:
-    `--bundle A --bundle B`), not the comma-separated form the other bundle
-    integration test uses. Pre-fix, argparse's default store action kept only
-    the LAST `--bundle` value, so `sib_a` never made it into the parsed bundle
-    at all: it stayed OPEN while lead + sib_b went in_progress, and the
-    dispatch prompt never named it. Post-fix, ALL THREE must read in_progress
-    and the tool's stdout/prompt must name all three."""
-    _assert_bin_is_this_branch()
-    lead = _new_bead(real_bd_repo, "repeated-flag bundle lead", _FOOTPRINT)
-    sib_a = _new_bead(real_bd_repo, "repeated-flag bundle sibling a", _FOOTPRINT)
-    sib_b = _new_bead(real_bd_repo, "repeated-flag bundle sibling b", _FOOTPRINT)
-
-    with tempfile.TemporaryDirectory() as dd, tempfile.TemporaryDirectory() as wt:
-        r = subprocess.run(
-            ["python3", str(BIN), lead,
-             "--bundle", sib_a, "--bundle", sib_b,
-             "--worktree", wt, "--model", "haiku"],
-            capture_output=True, text=True, env=_real_bd_env(sock, dd),
-            cwd=real_bd_repo,
-        )
-        assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
-        assert "SCHEDULING CONSTRAINT" not in r.stderr
-        time.sleep(0.6)
-
-        assert len(_worker_panes(sock, lead)) == 1
-        prompt = (Path(dd) / f"{lead}.md").read_text()
-        # THE DEFECT, precisely: sib_a is the FIRST --bundle value, the one
-        # argparse's pre-fix _StoreAction silently discarded.
-        assert sib_a in prompt, "the first --bundle occurrence was dropped"
-        assert sib_b in prompt
-
-    for bid in (lead, sib_a, sib_b):
-        status, assignee = _status_and_assignee(real_bd_repo, bid)
-        assert status == "in_progress", bid
-        assert assignee, bid
 
 
 # --- SABLE-zv0h6: a failed pre-spawn refresh must reach the WORKER's prompt -
@@ -2403,7 +2642,7 @@ def test_real_bd_no_declaration_dispatches_and_announces_loudly(sock, real_bd_re
         assert r.returncode == 0, f"stdout={r.stdout!r} stderr={r.stderr!r}"
         assert "NO-DECLARATION" in r.stderr
         assert bead_b in r.stderr
-        time.sleep(0.6)
+        _wait_for_worker_count(sock, bead_b)
         assert len(_worker_panes(sock, bead_b)) == 1
 
     status, assignee = _status_and_assignee(real_bd_repo, bead_b)
@@ -2461,6 +2700,134 @@ def test_real_bd_widening_past_declaration_is_named_against_a_real_git_diff(real
     assert report is not None
     assert "undeclared_extra.py" in report
     assert "shared_target.py" not in report
+
+
+# --- SABLE-9qqrv: the Codex sandbox grant, enforced by a real sandbox --------
+#
+# WHY THIS CANNOT BE A UNIT TEST. The shipped defect passed every unit test in
+# bin/test_sable_spawn_worker.py all the way into production: asserting that a
+# path appears in a rendered flag says nothing about whether the kernel will let
+# a worker write there. The class of bug is "the grant does not cover what the
+# worker actually needs", and only a real write, denied by a real sandbox,
+# distinguishes a working grant from an inert one.
+#
+# The sandbox here is bubblewrap, which is what Codex's workspace-write posture
+# is built on for Linux: everything read-only, then the granted roots re-bound
+# read-write. The bind set is derived from `codex_writable_roots` — the SAME
+# function the spawn path renders into `sandbox_workspace_write.writable_roots`
+# — so if production stops granting the store, the positive case goes red here
+# rather than in a live worker pane.
+#
+# `/tmp` is deliberately NOT bound writable even though Codex grants it: the
+# fixture lives under /tmp, so binding it would make the negative control
+# unfalsifiable. TMPDIR is pointed inside the worktree instead, which keeps the
+# only writable surfaces the ones under test.
+
+HAVE_BWRAP = shutil.which("bwrap") is not None
+
+
+def _bwrap(writable, chdir, argv, tmpdir):
+    """Run `argv` with ONLY `writable` writable — the workspace-write shape."""
+    cmd = ["bwrap", "--ro-bind", "/", "/", "--dev-bind", "/dev", "/dev",
+           "--proc", "/proc"]
+    for path in writable:
+        cmd += ["--bind", str(path), str(path)]
+    cmd += ["--chdir", str(chdir), "--setenv", "TMPDIR", str(tmpdir), "--"]
+    return subprocess.run(cmd + list(argv), capture_output=True, text=True)
+
+
+@pytest.fixture(scope="module")
+def codex_sandbox_repo(tmp_path_factory):
+    """A repo whose beads store and feedback dir sit OUTSIDE the worker's
+    worktree — the real production shape, where the store is a sibling of the
+    shared `.git` and the worktree is a sibling of the checkout itself."""
+    if not HAVE_BWRAP:
+        pytest.skip("needs bwrap (the Linux primitive Codex sandboxes with)")
+    tmp = tmp_path_factory.mktemp("codexgrant")
+    work, wt = _repo_with_linked_worktree(tmp)
+    init = subprocess.run(["bd", "init", "--prefix", "TSTX"], cwd=work,
+                          capture_output=True, text=True)
+    if init.returncode != 0:
+        pytest.skip(f"bd init unavailable here: {init.stderr.strip()[:200]}")
+    feedback = tmp / "feedback"
+    feedback.mkdir()
+    scratch = wt / ".tmp"
+    scratch.mkdir()
+
+    mp = pytest.MonkeyPatch()
+    mp.setenv("SABLE_FEEDBACK_DIR", str(feedback))
+    roots = ssw.codex_writable_roots(str(wt))
+    mp.undo()
+
+    yield SimpleNamespace(work=work, wt=wt, feedback=feedback, scratch=scratch,
+                          roots=roots, store=str((work / ".beads").resolve()),
+                          bd=shutil.which("bd"))
+
+
+def test_grant_resolves_the_real_store_outside_the_worktree(codex_sandbox_repo):
+    """Resolution, against a real bd store rather than a stubbed path: bd finds
+    its store from a LINKED WORKTREE by way of git, so the granted root must be
+    the checkout's `.beads` even though nothing under the worktree names it."""
+    r = codex_sandbox_repo
+    assert r.store in r.roots, r.roots
+    assert str((r.work / ".git").resolve()) in r.roots, r.roots
+    assert str(r.feedback.resolve()) in r.roots, r.roots
+    # gotcha (b), structurally: the checkout itself is never granted.
+    assert str(r.work.resolve()) not in r.roots, r.roots
+
+
+def test_bd_write_from_inside_the_worktree_succeeds_under_the_grant(codex_sandbox_repo):
+    """THE POSITIVE CONTROL. A real `bd create`, run from inside the worktree,
+    inside a real sandbox built from the production grant. This is the worker
+    contract the bead says is structurally impossible today: close-at-push,
+    issue discovery and tdd-gate evidence are all this same write."""
+    r = codex_sandbox_repo
+    got = _bwrap([r.wt, *r.roots], r.wt,
+                 [r.bd, "create", "--title=granted write", "--type=task"],
+                 r.scratch)
+    assert got.returncode == 0, f"stdout={got.stdout}\nstderr={got.stderr}"
+    assert "granted write" in got.stdout, got.stdout
+
+
+def test_bd_write_fails_when_only_the_beads_root_is_removed(codex_sandbox_repo):
+    """THE NEGATIVE CONTROL, and the reason this test proves anything at all.
+
+    Identical command, identical sandbox, ONE root removed — the beads store.
+    If this passed, the positive case above would be proving nothing but the
+    host's ambient permissions. It reproduces the live symptom exactly: the
+    failure is at `open db`, not at a mutation, which is why the bead reports
+    that even bd READS fail — embedded dolt takes a write lock to open at all,
+    so an ungranted worker is BLIND to the tracker, not merely unable to write."""
+    r = codex_sandbox_repo
+    without = [p for p in r.roots if p != r.store]
+    assert len(without) == len(r.roots) - 1, "the store must have been granted"
+
+    got = _bwrap([r.wt, *without], r.wt,
+                 [r.bd, "create", "--title=ungranted write", "--type=task"],
+                 r.scratch)
+
+    assert got.returncode != 0, f"expected denial, got: {got.stdout}"
+    assert "read-only file system" in (got.stdout + got.stderr).lower(), got.stderr
+    listed = subprocess.run([r.bd, "list"], cwd=r.work, capture_output=True, text=True)
+    assert "ungranted write" not in listed.stdout
+
+
+def test_the_grant_does_not_leak_write_access_to_the_checkout(codex_sandbox_repo):
+    """Gotcha (b) at RUNTIME, not merely in the rendered flag list. Widening the
+    grant to the repo root would make every other test in this block pass while
+    silently deleting worktree isolation — so prove the boundary still bites:
+    inside the SAME sandbox that just wrote to the tracker, a write to a tracked
+    file in the primary checkout must still be denied."""
+    r = codex_sandbox_repo
+    target = r.work / "f.txt"
+    assert target.exists(), "fixture should have a tracked file in the checkout"
+
+    got = _bwrap([r.wt, *r.roots], r.wt,
+                 ["/usr/bin/env", "bash", "-c", f"echo leaked >> {target}"],
+                 r.scratch)
+
+    assert got.returncode != 0, "the primary checkout must stay read-only"
+    assert "leaked" not in target.read_text()
 
 
 if __name__ == "__main__":
